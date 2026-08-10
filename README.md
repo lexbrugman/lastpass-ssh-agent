@@ -240,6 +240,18 @@ Create a `homebrew-tap` repository and a `TAP_TOKEN` secret with write access
 to it, and each release updates the formula there; without the secret the
 formula is just attached to the release.
 
+## Dependencies
+
+Updates come from [Renovate](https://docs.renovatebot.com) — install the app
+on the repository and `.github/renovate.json5` governs it. There is no
+dependency dashboard issue. Crate and action updates are grouped and run
+weekly, because every merge to `master` publishes a release; new versions
+have to be five days old before they are proposed.
+
+Renovate deliberately does not touch `.github/workflows/release.yml`: dist
+generates it and verifies it byte-for-byte at release time, so an edit there
+would fail the release.
+
 ## Development
 
 `./scripts/check.sh` runs the full gate, and CI enforces the same on every
