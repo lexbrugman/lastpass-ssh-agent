@@ -1,6 +1,6 @@
 [package]
 name = "lastpass-ssh-agent"
-version = "2026.810.0"
+version = "2026.810.1"
 edition = "2021"
 rust-version = "1.87"
 description = "SSH agent backed by the LastPass CLI: private keys never persist on disk, every signature is fetched, confirmed, used, and zeroized."
