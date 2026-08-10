@@ -14,6 +14,11 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # The tap key lives in this environment rather than in a repository
+    # secret: whoever can write the tap can ship a formula to everyone who
+    # installs, so restrict the environment to master and no workflow on any
+    # other branch can read it.
+    environment: release
     env:
       # A deploy key with write access to <owner>/homebrew-tap, as the secret
       # TAP_DEPLOY_KEY. A deploy key rather than a token because it is bound

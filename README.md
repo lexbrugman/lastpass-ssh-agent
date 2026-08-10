@@ -236,19 +236,28 @@ The gate runs once, in `release-on-master.yml`, before anything is committed
 or dispatched; the release cannot start without it. Dispatching `release.yml`
 by hand skips it, which is the only way to release untested code.
 
-To publish to a tap, create a `homebrew-tap` repository, add a deploy key
-with write access to it, and store that key's private half here as the
-`TAP_DEPLOY_KEY` secret:
+To publish to a tap, create a `homebrew-tap` repository and give the release
+a deploy key for it:
 
 ```sh
 ssh-keygen -t ed25519 -N "" -C "lastpass-ssh-agent tap" -f tap-deploy-key
-# public half  -> homebrew-tap → Settings → Deploy keys (tick "Allow write access")
-# private half -> this repo    → Settings → Secrets → TAP_DEPLOY_KEY
 ```
 
-A deploy key rather than a personal access token: it is bound to that one
-repository, belongs to no user account, and does not expire. Without the
-secret the formula is simply attached to each release instead.
+- public half → `homebrew-tap` → Settings → Deploy keys, with **Allow write
+  access** ticked
+- private half → this repository → Settings → Environments → **`release`** →
+  add secret `TAP_DEPLOY_KEY`, and set that environment's deployment branch
+  policy to `master`
+
+A deploy key rather than a personal access token because it is bound to that
+one repository, belongs to no user account, and does not expire. An
+*environment* secret rather than a repository secret because anything able
+to write the tap can ship a formula to everyone who installs: repository
+secrets are readable from every branch, while the `release` environment can
+be restricted to `master`. GitHub creates the environment on first use, but
+the branch restriction only applies once you set it.
+
+Without the secret the formula is simply attached to each release instead.
 
 ## Dependencies
 
