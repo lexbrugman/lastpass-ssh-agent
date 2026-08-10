@@ -21,19 +21,21 @@ jobs:
       TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
-        with:
-          path: artifacts
-          merge-multiple: true
 
       - name: Generate the formula
         id: formula
         env:
+          GH_TOKEN: ${{ github.token }}
           # via the environment, never interpolated into the script: release
           # notes in the plan can contain quotes
           PLAN: ${{ inputs.plan }}
         run: |
           version="$(printf '%s' "$PLAN" | jq -r '.announcement_tag' | sed 's/^v//')"
+          # Take the checksums from the release rather than from workflow
+          # artifacts: these are the files users actually download, and they
+          # are guaranteed to exist by the time a publish job runs.
+          mkdir -p artifacts
+          gh release download "v${version}" --pattern '*.sha256' --dir artifacts
           echo "version=$version" >> "$GITHUB_OUTPUT"
           ./packaging/homebrew/generate-formula.sh \
             "$version" "${{ github.repository }}" artifacts \

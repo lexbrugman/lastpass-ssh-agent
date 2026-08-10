@@ -22,7 +22,8 @@ sha() {
         echo "missing or empty checksum for $1: $file" >&2
         exit 1
     fi
-    tr -d "[:space:]" < "$file"
+    # the file holds "<hash> *<name>" — take only the hash
+    awk '{print $1; exit}' "$file"
 }
 
 macos_arm="$(sha aarch64-apple-darwin)"
