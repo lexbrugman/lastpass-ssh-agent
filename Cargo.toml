@@ -1,0 +1,76 @@
+[package]
+name = "lastpass-ssh-agent"
+version = "2026.810.0"
+edition = "2021"
+rust-version = "1.87"
+description = "SSH agent backed by the LastPass CLI: private keys never persist on disk, every signature is fetched, confirmed, used, and zeroized."
+license = "MIT"
+# dist needs this to build installers and release URLs — change the owner if
+# the repository lives elsewhere.
+repository = "https://github.com/lexbrugman/lastpass-ssh-agent"
+
+[dependencies]
+ssh-agent-lib = "0.6"
+async-trait = "0.1"
+# Pinned to 0.6.x: ssh-agent-lib depends on ssh-key ^0.6.
+ssh-key = { version = "0.6.7", features = ["ed25519", "rsa", "p256", "p384", "encryption"] }
+rsa = { version = "0.9", features = ["sha2"] }
+signature = "2"
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "io-util", "time", "signal"] }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+zeroize = { version = "1", features = ["std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+dirs = "6"
+libc = "0.2"
+
+[dev-dependencies]
+rand_core = "0.6"
+tempfile = "3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
+# Strict linting: everything from clippy's pedantic and nursery groups is a
+# warning, and CI runs clippy with -D warnings so any finding fails the build.
+# Allows below are deliberate, not oversights.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+[profile.release]
+strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+# musl on Linux so a published binary does not inherit the build
+# runner's glibc version and fail on older hosts
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
+# Plan jobs to run in CI
+# Publish jobs to run in CI
+publish-jobs = ["./publish-homebrew-formula"]
+# Whether to install an updater program
+install-updater = false
+# releases are started by the master-push workflow, not by pushing a tag
+dispatch-releases = true
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# the formula job attaches the formula to the release, which needs write
+# access to repository contents; unlisted permissions default to none
+[workspace.metadata.dist.github-custom-job-permissions.publish-homebrew-formula]
+contents = "write"
