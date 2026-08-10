@@ -6,7 +6,7 @@ on:
   push:
     branches: [dev]
   pull_request:
-  # release.yml runs this first: nothing ships that has not passed the gate
+  # release-on-master.yml runs this before it releases anything
   workflow_call:
 
 env:
@@ -43,18 +43,3 @@ jobs:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/test.sh
-
-  # Release artifacts are dist's job (see release.yml); this only proves the
-  # stable toolchain still builds, since the tests run on nightly.
-  build:
-    name: release build (${{ matrix.os }})
-    needs: [lint, test]
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
