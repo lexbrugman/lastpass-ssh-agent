@@ -247,6 +247,10 @@ push: `cargo fmt --check`, `cargo clippy` with the pedantic and nursery
 groups and `-D warnings`, and the test suite on macOS and Linux
 (`./scripts/test.sh`).
 
+Compiling is left to dist so it happens once. Pull requests build all four
+release targets through it (`pr-run-mode = "upload"`), which is what catches
+a cross-compilation break before merge rather than at release time.
+
 Tests always run instrumented, so "the tests pass" means every test passed
 *and* every line and branch of production code was covered — anything less
 fails. That needs a nightly toolchain for branch instrumentation
