@@ -1,0 +1,68 @@
+name: publish-homebrew-formula
+
+# dist runs this as a publish-job, after the archives are built and uploaded.
+# The formula is ours rather than dist's because dist's Homebrew template
+# cannot declare a launchd/systemd service, which is how this agent is meant
+# to be run.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      # set this secret to a token with write access to <owner>/homebrew-tap
+      # and each release updates the tap; without it the formula is only
+      # attached to the release
+      TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate the formula
+        id: formula
+        env:
+          # via the environment, never interpolated into the script: release
+          # notes in the plan can contain quotes
+          PLAN: ${{ inputs.plan }}
+        run: |
+          version="$(printf '%s' "$PLAN" | jq -r '.announcement_tag' | sed 's/^v//')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          ./packaging/homebrew/generate-formula.sh \
+            "$version" "${{ github.repository }}" artifacts \
+            > lastpass-ssh-agent.rb
+          cat lastpass-ssh-agent.rb
+
+      - name: Attach the formula to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "v${{ steps.formula.outputs.version }}" \
+            lastpass-ssh-agent.rb --clobber
+
+      - name: Update the Homebrew tap
+        if: env.TAP_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ env.TAP_TOKEN }}
+          VERSION: ${{ steps.formula.outputs.version }}
+        run: |
+          owner="${GITHUB_REPOSITORY%%/*}"
+          # the numeric id is what links the commit to the bot account;
+          # without it GitHub shows an unattributed author
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${owner}/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp lastpass-ssh-agent.rb tap/Formula/
+          cd tap
+          git add Formula/lastpass-ssh-agent.rb
+          git commit -m "lastpass-ssh-agent $VERSION"
+          git push
