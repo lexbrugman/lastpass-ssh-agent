@@ -236,9 +236,19 @@ The gate runs once, in `release-on-master.yml`, before anything is committed
 or dispatched; the release cannot start without it. Dispatching `release.yml`
 by hand skips it, which is the only way to release untested code.
 
-Create a `homebrew-tap` repository and a `TAP_TOKEN` secret with write access
-to it, and each release updates the formula there; without the secret the
-formula is just attached to the release.
+To publish to a tap, create a `homebrew-tap` repository, add a deploy key
+with write access to it, and store that key's private half here as the
+`TAP_DEPLOY_KEY` secret:
+
+```sh
+ssh-keygen -t ed25519 -N "" -C "lastpass-ssh-agent tap" -f tap-deploy-key
+# public half  -> homebrew-tap → Settings → Deploy keys (tick "Allow write access")
+# private half -> this repo    → Settings → Secrets → TAP_DEPLOY_KEY
+```
+
+A deploy key rather than a personal access token: it is bound to that one
+repository, belongs to no user account, and does not expire. Without the
+secret the formula is simply attached to each release instead.
 
 ## Dependencies
 
