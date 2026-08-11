@@ -6,15 +6,20 @@
 [advisories]
 # RUSTSEC-2023-0071 — "Marvin Attack", a timing sidechannel in `rsa`
 # (medium, 5.9). Accepted rather than fixed, because there is nothing to fix
-# to: the advisory has had no patched release in any version line since 2023,
-# and `rsa` is not a direct choice — ssh-key pulls it in for RSA key support,
-# so the only way to drop it is to stop serving RSA keys entirely.
+# to: the advisory has had no patched release in any version line since 2023.
+# This agent uses `rsa` directly because ssh-key 0.6 cannot honor the SSH
+# agent's requested RSA digest correctly; dropping it means dropping RSA key
+# support until that upstream path changes.
 #
-# Why the exposure is small here: the published attack is a timing oracle
-# against RSA *decryption*, which this agent never performs — it only signs.
-# Signing is additionally gated on a human confirmation by default, which
-# bounds how many timing samples an attacker could collect to roughly one per
-# dialog. It matters most with `confirm = "off"` on an RSA key.
+# Mitigation: every RSA signature uses the crate's randomized signing API
+# with fresh OsRng input. That enables RSA blinding around the private-key
+# operation, making repeated timings substantially harder to correlate with
+# client-chosen inputs. Signing is also gated on a human confirmation by
+# default, bounding samples to roughly one per dialog.
+#
+# Residual risk: blinding is a mitigation, not a constant-time rewrite, so
+# the advisory remains applicable and ignored explicitly rather than called
+# fixed. It matters most with `confirm = "off"` on a forwarded RSA key.
 #
 # Revisit when a fixed release appears: the audit is what will say so.
 # Every other advisory, present or future, remains a hard failure.
