@@ -9,9 +9,12 @@ FROM rust:1-slim
 # curl + ca-certificates: fetching the cargo-llvm-cov release binary below.
 # xz-utils: dist ships its installer artifacts as .tar.xz, as do this
 # project's own releases, and tar cannot unpack them without it.
+# ruby: only to syntax-check the generated Homebrew formula. It is built by
+# substituting into a template, so a broken edit produces a file that looks
+# fine and fails at `brew install`; `ruby -c` catches that in the gate.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git \
-        xz-utils \
+        ruby xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # The gate must NOT run as root. Several tests assert that the agent refuses

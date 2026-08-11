@@ -76,6 +76,39 @@ cargo build --release        # needs rustup; rust-version >= 1.87
 cp target/release/lastpass-ssh-agent /usr/local/bin/  # or anywhere on PATH
 ```
 
+### Following the dev branch
+
+The formula carries a `head` spec, so the same formula serves both tracks:
+
+```sh
+brew install --HEAD lexbrugman/tap/lastpass-ssh-agent   # dev, from scratch
+brew upgrade --fetch-HEAD lastpass-ssh-agent            # move it forward
+```
+
+Switching an existing install between the tracks is always uninstall then
+install, in both directions — `brew reinstall` has no `--HEAD` option and
+cannot move one across:
+
+```sh
+brew uninstall lastpass-ssh-agent && brew install --HEAD lastpass-ssh-agent
+brew uninstall lastpass-ssh-agent && brew install lastpass-ssh-agent
+```
+
+Two things about the dev track are easy to trip over. A HEAD install builds
+from source, so Homebrew installs a Rust toolchain as a build dependency and
+every update recompiles — a release install unpacks a prebuilt binary and
+needs no compiler. And `--fetch-HEAD` is not optional: without it Homebrew
+only re-examines the branch when a new version is released, so a plain
+`brew upgrade` leaves a dev install sitting on the commit it was built from.
+
+`brew list --versions` shows `HEAD-<sha>` for a dev install, and `--version`
+reports the real commit either way, so it is always clear what is running.
+Switching tracks replaces the binary but not the running agent, so restart the
+service afterwards; saved Keychain passphrases are keyed by key fingerprint
+and are unaffected. Beware that a config using a dev-only setting will stop an
+older release from starting at all, since unknown values are rejected rather
+than ignored.
+
 Versions are CalVer — `YYYY.MMDD.PATCH`, so `2026.810.0` is the first
 release on 10 August 2026 and `2026.810.1` a same-day fix. `--version`
 spells it out along with the exact commit:
