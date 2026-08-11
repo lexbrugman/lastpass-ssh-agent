@@ -1,0 +1,67 @@
+# The dev environment: every gate command runs inside a container built
+# from ./Dockerfile, so the host needs Docker and nothing else.
+#
+#   docker compose run --rm check   # the full local gate (what CI enforces)
+#   docker compose run --rm test    # just the instrumented test suite
+#   docker compose run --rm audit   # cargo audit (fetches the advisory db)
+#   docker compose run --rm shell   # interactive shell in the dev image
+#
+# Toolchains are baked into the image. Refresh them with:
+#
+#   docker compose build --pull --no-cache
+#
+# Both flags are needed: --pull alone only re-fetches rust:1-slim, and when
+# nightly or a cargo plugin advances without that tag moving, the cached RUN
+# layers are reused and the gate keeps running older tooling than CI does.
+
+x-dev: &dev
+  build:
+    context: .
+    # The container runs unprivileged (root would skip the permission tests
+    # and drop coverage below the required 100%). Point these at your own
+    # ids if the bind mount needs it:
+    #   DEV_UID=1001 DEV_GID=1001 docker compose build
+    # Changing them after a service has run needs the volumes below dropped
+    # too — they keep the ownership they were created with, and hide the
+    # freshly chowned image directories:
+    #   docker compose down -v
+    args:
+      DEV_UID: ${DEV_UID:-1000}
+      DEV_GID: ${DEV_GID:-1000}
+  image: lastpass-ssh-agent-dev
+  working_dir: /work
+  environment:
+    - CARGO_TERM_COLOR=always
+    # build.rs stamps the binary with the commit, reading .git directly. In a
+    # linked worktree .git is a file pointing at metadata in the main
+    # repository, which is outside the mount below, so there it would stamp
+    # "unknown" — export this and the stamp survives:
+    #   export LASTPASS_SSH_AGENT_COMMIT=$(git rev-parse --short=12 HEAD)
+    # Listed without a value on purpose: that passes the host's value through
+    # only when it is set, whereas a "${VAR:-}" default would define it as
+    # empty and build.rs takes an empty value as the stamp.
+    - LASTPASS_SSH_AGENT_COMMIT
+  volumes:
+    - .:/work
+    # Named volumes: the registry cache survives across runs, and Linux
+    # build artifacts stay out of the host's ./target.
+    - cargo-registry:/usr/local/cargo/registry
+    - target:/work/target
+
+services:
+  check:
+    <<: *dev
+    command: ./scripts/check.sh
+  test:
+    <<: *dev
+    command: ./scripts/test.sh
+  audit:
+    <<: *dev
+    command: cargo audit
+  shell:
+    <<: *dev
+    command: bash
+
+volumes:
+  cargo-registry:
+  target:

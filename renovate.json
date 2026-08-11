@@ -3,7 +3,7 @@
   "extends": [
     "config:recommended"
   ],
-  "baseBranches": [
+  "baseBranchPatterns": [
     "dev"
   ],
   "dependencyDashboard": false,
@@ -28,6 +28,24 @@
       "matchUpdateTypes": [
         "major",
         "minor"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "The dev image's base tag floats within a major (rust:1-slim picks up new minors on 'docker compose build --pull', matching how CI floats on dtolnay/rust-toolchain@stable), so only the major needs a pull request. Grouping it keeps the Dockerfile and compose file in one change.",
+      "matchManagers": [
+        "dockerfile",
+        "docker-compose"
+      ],
+      "groupName": "dev container base image"
+    },
+    {
+      "description": "compose.yaml names the locally built dev image so all four services share one build. It is not published anywhere, so there is no registry for Renovate to look it up in.",
+      "matchManagers": [
+        "docker-compose"
+      ],
+      "matchPackageNames": [
+        "lastpass-ssh-agent-dev"
       ],
       "enabled": false
     }
