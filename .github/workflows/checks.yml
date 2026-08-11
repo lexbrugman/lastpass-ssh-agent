@@ -31,8 +31,6 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo fmt --check
-      - run: ./packaging/test-archive.sh
-      - run: ./packaging/homebrew/test-generate-formula.sh
       - run: cargo clippy --all-targets -- -D warnings
 
   # Advisories are time-based rather than code-based: a dependency that was
@@ -69,4 +67,11 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2.9.2
+
+      # On both platforms, because both are release build platforms:
+      # archive.sh picks a different checksum tool per platform and tars with
+      # bsdtar on macOS against GNU tar on Linux, and the archive it writes is
+      # what users install. Same order as scripts/check.sh runs them in.
+      - run: ./packaging/test-archive.sh
+      - run: ./packaging/homebrew/test-generate-formula.sh
       - run: ./scripts/test.sh
