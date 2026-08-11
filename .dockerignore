@@ -1,0 +1,4 @@
+# The image copies nothing from the build context — the repository is
+# bind-mounted at runtime — so keep the context empty (target/ alone can be
+# gigabytes, all of it uploaded to the daemon for no reason).
+*

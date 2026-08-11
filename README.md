@@ -295,16 +295,51 @@ key. Ed25519 and ECDSA keys do not involve that crate at all.
 
 ## Development
 
-`./scripts/check.sh` runs the full gate, and CI enforces the same on every
-push: `cargo fmt --check`, `cargo clippy` with the pedantic and nursery
-groups and `-D warnings`, and the test suite on macOS and Linux
-(`./scripts/test.sh`).
+The dev environment lives in Docker Compose, so the host needs Docker and
+nothing else — no local Rust toolchain, no cargo plugins:
 
-CI adds one check the local script does not: `cargo audit` (see
+```sh
+docker compose run --rm check   # the full local gate (what CI enforces)
+docker compose run --rm test    # just the instrumented test suite
+docker compose run --rm audit   # cargo audit (fetches the advisory db)
+docker compose run --rm shell   # interactive shell in the dev image
+```
+
+The container runs unprivileged: root bypasses file permissions, which would
+make the tests asserting that the agent refuses an unreadable config or an
+unprobeable socket skip themselves and drop coverage below the required 100%.
+The gate only reads the mounted checkout, so the container's ids do not have
+to match yours — on macOS they never do and it makes no difference. If you do
+need them to line up, build with `DEV_UID=$(id -u) DEV_GID=$(id -g) docker
+compose build`, and if any service has already run, `docker compose down -v`
+first: the cache volumes keep the ownership they were created with.
+
+The first run builds the dev image. Toolchains are baked in, so refresh them
+occasionally with `docker compose build --pull --no-cache` — `--pull` alone
+only re-fetches the base image, and when nightly or a cargo plugin advances
+without that tag moving, the cached layers keep older tooling than CI
+installs.
+
+If you work in a linked git worktree, export the commit so the `--version`
+stamp survives — `.git` there points at metadata outside the mount, which the
+container cannot follow:
+
+```sh
+export LASTPASS_SSH_AGENT_COMMIT=$(git rev-parse --short=12 HEAD)
+```
+
+The gate itself is `./scripts/check.sh` (which the `check` service runs),
+and CI enforces the same on every push: `cargo fmt --check`, `cargo clippy`
+with the pedantic and nursery groups and `-D warnings`, and the test suite
+on macOS and Linux (`./scripts/test.sh`). If you do have the toolchain
+installed, the scripts run directly on the host too.
+
+CI adds one check the gate does not: `cargo audit` (see
 [Dependencies](#dependencies)). It is deliberately not in `check.sh`, which
 stays offline and hermetic — its result depends on a database fetched over
 the network and changes without the code changing, so a local run could fail
-for reasons that have nothing to do with your edit.
+for reasons that have nothing to do with your edit. The `audit` compose
+service runs it on demand.
 
 The generated dist workflow skips pull requests (`pr-run-mode = "skip"`), so
 ordinary branch pushes run only `CI`; the release workflow starts when the
