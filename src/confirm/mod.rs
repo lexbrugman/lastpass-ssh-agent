@@ -194,6 +194,7 @@ mod tests {
             name: "ctx key".into(),
             public: ssh_key::PublicKey::from_openssh(ED25519_PUB.trim()).unwrap(),
             confirm: true,
+            passphrase_fallback: crate::config::PassphraseFallback::default(),
         }
     }
 

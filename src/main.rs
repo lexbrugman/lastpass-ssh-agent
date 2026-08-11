@@ -7,9 +7,12 @@ mod confirm;
 mod error;
 mod keystore;
 mod lpass;
+mod passphrase;
 mod platform;
 mod signing;
 mod socket;
+#[cfg(test)]
+mod testutil;
 mod text;
 
 use std::path::Path;
@@ -137,7 +140,10 @@ async fn effective_keys(client: &Arc<dyn LpassClient>, config: &Config) -> Resul
         .map(|item| KeyConfig {
             id: item.id,
             name: Some(item.name),
+            // No per-key overrides for a discovered item: there is no config
+            // entry to have written one in, so both fall back to the globals.
             confirm: None,
+            passphrase_fallback: None,
         })
         .collect())
 }
@@ -155,17 +161,19 @@ async fn start(config_path: &Path) -> Result<()> {
             fingerprint = %entry.fingerprint(),
             item = %entry.item_id,
             confirm = entry.confirm,
+            passphrase_fallback = ?entry.passphrase_fallback,
             "serving key"
         );
     }
 
     let confirmer = confirm::from_config(&config)?;
+    let prompt = passphrase::from_config(&config)?;
     let socket_path = config.socket_path()?;
     let (listener, guard) = socket::bind(&socket_path)?;
     print_env(&socket_path);
 
     let factory = AgentFactory {
-        template: agent::LpassAgent::new(store, client, confirmer),
+        template: agent::LpassAgent::new(store, client, confirmer, prompt),
     };
     let result = tokio::select! {
         result = ssh_agent_lib::agent::listen(listener, factory) => {

@@ -1,7 +1,7 @@
 use ssh_key::public::KeyData;
 use ssh_key::PublicKey;
 
-use crate::config::{Config, KeyConfig};
+use crate::config::{Config, KeyConfig, PassphraseFallback};
 use crate::error::{Error, Result};
 use crate::lpass::LpassClient;
 
@@ -53,6 +53,10 @@ pub struct KeyEntry {
     pub name: String,
     pub public: PublicKey,
     pub confirm: bool,
+    /// Where this key's passphrase comes from if the item's own `Passphrase`
+    /// field turns out to be empty. Resolved from config at load time so the
+    /// signing path never has to consult it again.
+    pub passphrase_fallback: PassphraseFallback,
 }
 
 impl KeyEntry {
@@ -119,6 +123,7 @@ pub async fn inspect_keys(
                 name,
                 public,
                 confirm: config.confirm_required(key),
+                passphrase_fallback: config.passphrase_fallback(key),
             }),
             Err(issue) => KeyInspection::Unusable {
                 item_id: key.id.clone(),

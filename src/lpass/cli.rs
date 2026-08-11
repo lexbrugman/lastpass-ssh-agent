@@ -271,11 +271,7 @@ mod tests {
 
     /// Write a fake `lpass` shell script whose behavior is baked in.
     fn fake_lpass(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("lpass");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        crate::testutil::write_script(dir, "lpass", body)
     }
 
     #[tokio::test]

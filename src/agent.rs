@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 use crate::confirm::{ConfirmContext, Confirmer, Decision, PeerInfo, SessionBinding};
 use crate::keystore::{KeyEntry, KeyStore};
 use crate::lpass::LpassClient;
+use crate::passphrase::{self, PassphrasePrompt};
 use crate::signing;
 
 /// The agent proper. Holds no private-key material — only the public-key ->
@@ -21,6 +22,23 @@ pub struct LpassAgent {
     store: Arc<KeyStore>,
     lpass: Arc<dyn LpassClient>,
     confirmer: Arc<dyn Confirmer>,
+    /// Asks for a passphrase the vault does not hold. Reached only for an
+    /// encrypted key whose `Passphrase` field is empty.
+    prompt: Arc<dyn PassphrasePrompt>,
+    /// One signing request at a time, shared by every connection.
+    ///
+    /// Confirmation and passphrase entry are separate transports with separate
+    /// locks, so each only keeps *itself* from overlapping. Without this, one
+    /// request's passphrase prompt and another's confirmation prompt could own
+    /// the same terminal at once, and whichever read first would take the
+    /// answer meant for the other — with `TtyConfirmer` reading its line into
+    /// an ordinary `String`, that is a passphrase landing in memory nothing
+    /// wipes.
+    ///
+    /// Held across the whole request rather than around each prompt:
+    /// releasing in between would leave exactly the gap this closes. OpenSSH's
+    /// own agent answers requests one at a time as well.
+    interaction: Arc<tokio::sync::Mutex<()>>,
     /// pid/uid of the connected client, filled in per session.
     peer: Option<PeerInfo>,
     /// Hosts this connection has bound itself to, oldest hop first. Per
@@ -39,11 +57,14 @@ impl LpassAgent {
         store: Arc<KeyStore>,
         lpass: Arc<dyn LpassClient>,
         confirmer: Arc<dyn Confirmer>,
+        prompt: Arc<dyn PassphrasePrompt>,
     ) -> Self {
         Self {
             store,
             lpass,
             confirmer,
+            prompt,
+            interaction: Arc::new(tokio::sync::Mutex::new(())),
             peer: None,
             bindings: Vec::new(),
         }
@@ -139,21 +160,15 @@ impl LpassAgent {
 
         let mut key =
             PrivateKey::from_openssh(&*pem).map_err(|e| format!("parsing private key: {e}"))?;
+        // Only an encrypted key resolves a passphrase at all: an unencrypted
+        // one never fetches the field, never prompts, and costs nothing.
         if key.is_encrypted() {
-            let passphrase: Zeroizing<Vec<u8>> = self
-                .lpass
-                .show_field(&entry.item_id, "Passphrase")
-                .await
-                .map_err(|e| format!("fetching passphrase: {e}"))?;
-            if passphrase.is_empty() {
-                return Err(
-                    "private key is passphrase-protected but the item's Passphrase field is empty"
-                        .into(),
-                );
-            }
+            let passphrase: Zeroizing<Vec<u8>> =
+                passphrase::resolve(&*self.lpass, &*self.prompt, entry).await?;
             key = key
                 .decrypt(&*passphrase)
                 .map_err(|e| format!("decrypting private key: {e}"))?;
+            // `passphrase` zeroizes here; only the decrypted key goes on.
         }
 
         // The vault item could have been edited since startup; never sign
@@ -210,6 +225,9 @@ impl Session for LpassAgent {
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
+        // Everything below may talk to the user; see `interaction`.
+        let _one_at_a_time = self.interaction.clone().lock_owned().await;
+
         let key_data = request.credential.key_data();
         let Some(entry) = self.store.lookup(key_data) else {
             tracing::warn!("sign request for a key this agent does not hold");
@@ -254,8 +272,40 @@ mod tests {
     use crate::config::Config;
     use crate::confirm::NoConfirmer;
     use crate::lpass::mock::MockLpass;
+    use crate::passphrase::{NoPrompt, PassphraseRequest, PromptError};
     use signature::Verifier;
     use ssh_agent_lib::proto::signature as sigflag;
+
+    /// Types a fixed passphrase and counts how often it was asked, so a test
+    /// can prove the vault took precedence.
+    #[derive(Default)]
+    struct TypedPassphrase {
+        secret: Vec<u8>,
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl TypedPassphrase {
+        fn new(secret: &[u8]) -> Arc<Self> {
+            Arc::new(Self {
+                secret: secret.to_vec(),
+                calls: std::sync::Mutex::new(0),
+            })
+        }
+        fn was_asked(&self) -> bool {
+            *self.calls.lock().unwrap() > 0
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PassphrasePrompt for TypedPassphrase {
+        async fn prompt(
+            &self,
+            _request: &PassphraseRequest,
+        ) -> Result<Zeroizing<Vec<u8>>, PromptError> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(Zeroizing::new(self.secret.clone()))
+        }
+    }
 
     const ED25519: &str = include_str!("../tests/fixtures/ed25519");
     const ED25519_PUB: &str = include_str!("../tests/fixtures/ed25519.pub");
@@ -271,6 +321,15 @@ mod tests {
     }
 
     async fn agent_with(client: MockLpass, keys_toml: &str) -> LpassAgent {
+        agent_prompting(client, keys_toml, Arc::new(NoPrompt)).await
+    }
+
+    /// As `agent_with`, but with a passphrase prompt the test controls.
+    async fn agent_prompting(
+        client: MockLpass,
+        keys_toml: &str,
+        prompt: Arc<dyn PassphrasePrompt>,
+    ) -> LpassAgent {
         init_tracing();
         let config: Config = toml::from_str(keys_toml).unwrap();
         let client = Arc::new(client);
@@ -279,7 +338,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        LpassAgent::new(store, client, Arc::new(NoConfirmer))
+        LpassAgent::new(store, client, Arc::new(NoConfirmer), prompt)
     }
 
     fn sign_request(public: &str, data: &[u8], flags: u32) -> SignRequest {
@@ -391,7 +450,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let mut agent = LpassAgent::new(store, client.clone(), Arc::new(DenyAll));
+        let mut agent =
+            LpassAgent::new(store, client.clone(), Arc::new(DenyAll), Arc::new(NoPrompt));
 
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -419,7 +479,8 @@ mod tests {
                 .unwrap(),
         );
         let logged_out = Arc::new(MockLpass::default()); // logged_in: false
-        let mut agent = LpassAgent::new(store, logged_out, Arc::new(NoConfirmer));
+        let mut agent =
+            LpassAgent::new(store, logged_out, Arc::new(NoConfirmer), Arc::new(NoPrompt));
 
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -500,7 +561,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypted_key_with_missing_passphrase_fails() {
+    async fn encrypted_key_with_missing_passphrase_and_no_prompt_fails() {
         let client = MockLpass::logged_in()
             .with_field("1", "Public Key", ED25519_PW_PUB.as_bytes())
             .with_field("1", "Private Key", ED25519_PW.as_bytes());
@@ -509,6 +570,236 @@ mod tests {
             .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
             .await
             .is_err());
+    }
+
+    /// An agent serving the passphrase-protected fixture, with whatever
+    /// `Passphrase` field and config the case needs.
+    async fn pw_agent(
+        stored: Option<&[u8]>,
+        config: &str,
+        prompt: &Arc<TypedPassphrase>,
+    ) -> LpassAgent {
+        let mut client = MockLpass::logged_in()
+            .with_field("1", "Public Key", ED25519_PW_PUB.as_bytes())
+            .with_field("1", "Private Key", ED25519_PW.as_bytes());
+        if let Some(stored) = stored {
+            client = client.with_field("1", "Passphrase", stored);
+        }
+        agent_prompting(client, config, prompt.clone()).await
+    }
+
+    const PW_KEY: &str = "confirm = \"off\"\n[[keys]]\nid = \"1\"";
+
+    #[tokio::test]
+    async fn an_empty_passphrase_field_is_typed_instead_and_signs() {
+        // The point of the feature: the passphrase lives nowhere but the
+        // user's head, and the encrypted key alone sits in the vault.
+        let prompt = TypedPassphrase::new(b"fixture-passphrase");
+        let mut agent = pw_agent(None, PW_KEY, &prompt).await;
+        let sig = agent
+            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+            .await
+            .unwrap();
+        ssh_key::PublicKey::from_openssh(ED25519_PW_PUB.trim())
+            .unwrap()
+            .key_data()
+            .verify(b"payload", &sig)
+            .unwrap();
+        assert!(prompt.was_asked());
+    }
+
+    #[tokio::test]
+    async fn a_wrongly_typed_passphrase_fails_the_signature() {
+        let prompt = TypedPassphrase::new(b"not the passphrase");
+        let mut agent = pw_agent(None, PW_KEY, &prompt).await;
+        assert!(agent
+            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+            .await
+            .is_err());
+        assert!(prompt.was_asked());
+    }
+
+    #[tokio::test]
+    async fn error_mode_refuses_without_ever_asking() {
+        let prompt = TypedPassphrase::new(b"fixture-passphrase");
+        let mut agent = pw_agent(
+            None,
+            "confirm = \"off\"\npassphrase_fallback = \"error\"\n[[keys]]\nid = \"1\"",
+            &prompt,
+        )
+        .await;
+        assert!(agent
+            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+            .await
+            .is_err());
+        assert!(!prompt.was_asked(), "error mode must not prompt");
+    }
+
+    #[tokio::test]
+    async fn a_per_key_fallback_overrides_the_global_one() {
+        let prompt = TypedPassphrase::new(b"fixture-passphrase");
+        let mut agent = pw_agent(
+            None,
+            "confirm = \"off\"\npassphrase_fallback = \"prompt\"\n\
+             [[keys]]\nid = \"1\"\npassphrase_fallback = \"error\"",
+            &prompt,
+        )
+        .await;
+        assert!(agent
+            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+            .await
+            .is_err());
+        assert!(!prompt.was_asked());
+    }
+
+    #[tokio::test]
+    async fn a_populated_field_wins_over_the_prompt() {
+        // Backward compatibility: an existing user with the passphrase in the
+        // vault keeps working, and is never asked for it.
+        let prompt = TypedPassphrase::new(b"would be wrong");
+        let mut agent = pw_agent(Some(b"fixture-passphrase"), PW_KEY, &prompt).await;
+        assert!(agent
+            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+            .await
+            .is_ok());
+        assert!(!prompt.was_asked(), "the vault answered; nothing to ask");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_field_fails_rather_than_falling_through_to_the_prompt() {
+        // Fallback happens on absence, never on failure. Otherwise anything
+        // able to draw a prompt could override a passphrase the vault pins.
+        let prompt = TypedPassphrase::new(b"fixture-passphrase");
+        let mut agent = pw_agent(Some(b"wrong but present"), PW_KEY, &prompt).await;
+        assert!(agent
+            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+            .await
+            .is_err());
+        assert!(
+            !prompt.was_asked(),
+            "a wrong vault passphrase must not open a prompt"
+        );
+    }
+
+    /// Notices any two user interactions being in flight at once, whether two
+    /// confirmations or a confirmation and a passphrase entry.
+    #[derive(Default)]
+    struct ChannelWatch {
+        busy: std::sync::atomic::AtomicBool,
+        overlapped: std::sync::atomic::AtomicBool,
+    }
+
+    impl ChannelWatch {
+        async fn occupy(&self) {
+            use std::sync::atomic::Ordering;
+            if self.busy.swap(true, Ordering::SeqCst) {
+                self.overlapped.store(true, Ordering::SeqCst);
+            }
+            // long enough that a concurrent request would land inside it
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.busy.store(false, Ordering::SeqCst);
+        }
+        fn overlapped(&self) -> bool {
+            self.overlapped.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    struct WatchingConfirmer(Arc<ChannelWatch>);
+
+    #[async_trait::async_trait]
+    impl Confirmer for WatchingConfirmer {
+        async fn confirm(&self, _ctx: &ConfirmContext) -> Decision {
+            self.0.occupy().await;
+            Decision::Approve
+        }
+    }
+
+    struct WatchingPrompt(Arc<ChannelWatch>, Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl PassphrasePrompt for WatchingPrompt {
+        async fn prompt(
+            &self,
+            _request: &PassphraseRequest,
+        ) -> Result<Zeroizing<Vec<u8>>, PromptError> {
+            self.0.occupy().await;
+            Ok(Zeroizing::new(self.1.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmation_never_shares_the_channel_with_a_passphrase_prompt() {
+        // Both prompts have their own lock, so each only stops itself from
+        // overlapping. On one terminal the pair still collides, and whichever
+        // read first would take the answer meant for the other.
+        let watch = Arc::new(ChannelWatch::default());
+        let client = Arc::new(
+            MockLpass::logged_in()
+                .with_field("1", "Public Key", ED25519_PW_PUB.as_bytes())
+                .with_field("1", "Private Key", ED25519_PW.as_bytes())
+                .with_field("1", "Passphrase", b""),
+        );
+        // confirmation left on, so every request confirms *and* prompts
+        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
+        let store = Arc::new(
+            KeyStore::load(&*client, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let agent = LpassAgent::new(
+            store,
+            client,
+            Arc::new(WatchingConfirmer(watch.clone())),
+            Arc::new(WatchingPrompt(
+                watch.clone(),
+                b"fixture-passphrase".to_vec(),
+            )),
+        );
+
+        // two client connections, as separate sessions sharing the agent
+        let mut first = agent.with_peer(None);
+        let mut second = agent.with_peer(None);
+        let (a, b) = tokio::join!(
+            first.sign(sign_request(ED25519_PW_PUB, b"first", 0)),
+            second.sign(sign_request(ED25519_PW_PUB, b"second", 0)),
+        );
+        assert!(a.is_ok() && b.is_ok());
+        assert!(
+            !watch.overlapped(),
+            "two prompts were open on the same channel at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unencrypted_key_resolves_no_passphrase_at_all() {
+        let prompt = TypedPassphrase::new(b"never needed");
+        let client = Arc::new(
+            MockLpass::logged_in()
+                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+                .with_field("1", "Private Key", ED25519.as_bytes()),
+        );
+        let config: Config = toml::from_str(PW_KEY).unwrap();
+        let store = Arc::new(
+            KeyStore::load(&*client, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let mut agent =
+            LpassAgent::new(store, client.clone(), Arc::new(NoConfirmer), prompt.clone());
+        assert!(agent
+            .sign(sign_request(ED25519_PUB, b"payload", 0))
+            .await
+            .is_ok());
+        assert!(!prompt.was_asked());
+        assert!(
+            client
+                .fetch_log
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, field)| field != "Passphrase"),
+            "an unencrypted key must not even read the Passphrase field"
+        );
     }
 
     #[tokio::test]
@@ -595,7 +886,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        LpassAgent::new(store, client, confirmer)
+        LpassAgent::new(store, client, confirmer, Arc::new(NoPrompt))
     }
 
     #[tokio::test]
@@ -809,7 +1100,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let mut agent = LpassAgent::new(store, client, Arc::new(DenyAll));
+        let mut agent = LpassAgent::new(store, client, Arc::new(DenyAll), Arc::new(NoPrompt));
 
         let response = agent
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))

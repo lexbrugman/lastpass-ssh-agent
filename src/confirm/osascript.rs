@@ -129,14 +129,10 @@ impl Confirmer for OsascriptConfirmer {
 mod tests {
     use super::*;
     use crate::confirm::PeerInfo;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     fn stub(dir: &Path, body: &str) -> PathBuf {
-        let path = dir.join("osascript-stub");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        crate::testutil::write_script(dir, "osascript-stub", body)
     }
 
     fn ctx() -> ConfirmContext {

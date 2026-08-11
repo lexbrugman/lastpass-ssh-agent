@@ -17,6 +17,24 @@ pub enum ConfirmMode {
     Off,
 }
 
+/// Where an encrypted key's passphrase comes from when the `LastPass` item's
+/// own `Passphrase` field is empty.
+///
+/// This is a *fallback*: a populated `Passphrase` field always wins, and a
+/// populated-but-wrong one fails rather than falling through here. Otherwise
+/// a local prompt could talk a user into unlocking a key whose passphrase the
+/// vault already pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PassphraseFallback {
+    /// Ask for it, keeping the passphrase out of the vault entirely.
+    #[default]
+    Prompt,
+    /// Refuse to sign, which is what the agent did before this setting
+    /// existed.
+    Error,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyConfig {
@@ -30,6 +48,9 @@ pub struct KeyConfig {
     /// Per-key override of the global confirmation setting.
     #[serde(default)]
     pub confirm: Option<bool>,
+    /// Per-key override of the global passphrase fallback.
+    #[serde(default)]
+    pub passphrase_fallback: Option<PassphraseFallback>,
 }
 
 impl KeyConfig {
@@ -60,6 +81,11 @@ pub struct Config {
     #[serde(default)]
     pub askpass: Option<PathBuf>,
 
+    /// Where an encrypted key's passphrase comes from when the item's own
+    /// `Passphrase` field is empty.
+    #[serde(default)]
+    pub passphrase_fallback: PassphraseFallback,
+
     #[serde(default)]
     pub keys: Vec<KeyConfig>,
 }
@@ -88,6 +114,7 @@ impl Config {
                 confirm_timeout_secs: default_confirm_timeout(),
                 lpass_path: None,
                 askpass: None,
+                passphrase_fallback: PassphraseFallback::default(),
                 keys: Vec::new(),
             }),
             other => other,
@@ -166,6 +193,14 @@ impl Config {
     pub fn confirm_required(&self, key: &KeyConfig) -> bool {
         let enabled = self.confirm != ConfirmMode::Off;
         key.confirm.map_or(enabled, |explicit| explicit && enabled)
+    }
+
+    /// Effective passphrase fallback for one key. Unlike `confirm`, a per-key
+    /// value simply replaces the global one: neither setting is a safety
+    /// ceiling for the other, since both merely say where a passphrase the
+    /// vault does not hold should come from.
+    pub fn passphrase_fallback(&self, key: &KeyConfig) -> PassphraseFallback {
+        key.passphrase_fallback.unwrap_or(self.passphrase_fallback)
     }
 }
 
@@ -337,6 +372,71 @@ id = "1"
         assert_eq!(config.confirm, ConfirmMode::default());
         assert_eq!(config.confirm_timeout_secs, 30);
         assert!(config.confirm_required(&config.keys[0]));
+    }
+
+    #[test]
+    fn passphrase_fallback_defaults_to_prompting() {
+        let config = parse("[[keys]]\nid = \"1\"").unwrap();
+        assert_eq!(config.passphrase_fallback, PassphraseFallback::Prompt);
+        assert_eq!(
+            config.passphrase_fallback(&config.keys[0]),
+            PassphraseFallback::Prompt
+        );
+    }
+
+    #[test]
+    fn passphrase_fallback_parses_each_mode_and_rejects_others() {
+        for (text, expected) in [
+            ("prompt", PassphraseFallback::Prompt),
+            ("error", PassphraseFallback::Error),
+        ] {
+            let config = parse(&format!("passphrase_fallback = {text:?}")).unwrap();
+            assert_eq!(config.passphrase_fallback, expected);
+        }
+        // an unimplemented mode must be refused at load rather than silently
+        // behaving like something else
+        assert!(parse("passphrase_fallback = \"keychain\"").is_err());
+        assert!(parse("passphrase_fallback = \"Prompt\"").is_err());
+        assert!(parse("passphrase_fallback = true").is_err());
+    }
+
+    #[test]
+    fn per_key_passphrase_fallback_replaces_the_global_one() {
+        let config = parse(
+            r#"
+passphrase_fallback = "error"
+[[keys]]
+id = "1"
+passphrase_fallback = "prompt"
+[[keys]]
+id = "2"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.passphrase_fallback(&config.keys[0]),
+            PassphraseFallback::Prompt
+        );
+        assert_eq!(
+            config.passphrase_fallback(&config.keys[1]),
+            PassphraseFallback::Error
+        );
+
+        // and in the other direction: unlike `confirm`, neither level is a
+        // ceiling for the other
+        let config = parse(
+            r#"
+passphrase_fallback = "prompt"
+[[keys]]
+id = "1"
+passphrase_fallback = "error"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.passphrase_fallback(&config.keys[0]),
+            PassphraseFallback::Error
+        );
     }
 
     #[test]
