@@ -17,14 +17,10 @@
 x-dev: &dev
   build:
     context: .
-    # The container runs unprivileged (root would skip the permission tests
-    # and drop coverage below the required 100%). Point these at your own
-    # ids if the bind mount needs it:
-    #   DEV_UID=1001 DEV_GID=1001 docker compose build
-    # Changing them after a service has run needs the volumes below dropped
-    # too — they keep the ownership they were created with, and hide the
-    # freshly chowned image directories:
-    #   docker compose down -v
+    # Unprivileged on purpose; the Dockerfile says why. Point these at your
+    # own ids if the bind mount needs it, and drop the volumes afterwards —
+    # they keep the ownership they were created with:
+    #   DEV_UID=1001 DEV_GID=1001 docker compose build && docker compose down -v
     args:
       DEV_UID: ${DEV_UID:-1000}
       DEV_GID: ${DEV_GID:-1000}

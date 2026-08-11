@@ -30,8 +30,7 @@ pub enum PassphraseFallback {
     /// Ask for it, keeping the passphrase out of the vault entirely.
     #[default]
     Prompt,
-    /// Refuse to sign, which is what the agent did before this setting
-    /// existed.
+    /// Refuse to sign.
     Error,
     /// Remember it in the macOS Keychain, asking only when it is not there
     /// yet — or no longer works. macOS only; rejected at load elsewhere.
@@ -107,8 +106,8 @@ impl Config {
         dirs::home_dir().map(|h| h.join(".config/lastpass-ssh-agent/config.toml"))
     }
 
-    /// Like `load`, but a missing file yields the default config (no keys).
-    /// For commands that must work before any config exists (`search`).
+    /// Like `load`, but a missing file yields the default config (no keys):
+    /// running without a config file is ordinary, not an error.
     pub fn load_or_default(path: &Path) -> Result<Self> {
         match Self::load(path) {
             Err(Error::ConfigMissing(_)) => Ok(Self {
@@ -181,15 +180,14 @@ impl Config {
                 "confirm_timeout_secs must be between 1 and {MAX_CONFIRM_TIMEOUT_SECS}"
             )));
         }
-        // Rejected at load rather than at the first signature, and rejected
-        // here rather than by refusing to parse the value: the mode is a
-        // perfectly meaningful thing to write in a config shared between
-        // machines, so it deserves an answer that names the platform instead
-        // of "unknown variant".
+        // Refused at load, not at the first signature — and by validation
+        // rather than by failing to parse, because the mode is a reasonable
+        // thing to write in a config shared between machines and deserves an
+        // answer naming the platform.
         //
-        // The whole check is compiled out on macOS, where it can only ever be
-        // false. A runtime `cfg!` test would instead leave a branch that no
-        // test on either platform can take, which the coverage gate refuses.
+        // Compiled out on macOS, where it could only ever be false. A runtime
+        // `cfg!` would leave a branch no test on either platform can take,
+        // which the coverage gate refuses.
         #[cfg(not(target_os = "macos"))]
         if self.uses_keychain() {
             return Err(Error::ConfigInvalid(

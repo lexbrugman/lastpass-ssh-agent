@@ -55,9 +55,8 @@ if [ "$(grep -c 'depends_on "rust"' "$formula")" != 1 ]; then
     failed=1
 fi
 
-# `brew reinstall` takes no --HEAD: the caveats told users to run that once,
-# and it fails outright with "invalid option". Switching tracks is always
-# uninstall-then-install.
+# `brew reinstall` has no --HEAD option and fails outright with "invalid
+# option", so switching tracks is always uninstall-then-install.
 if grep -q 'reinstall .*--HEAD' "$formula"; then
     echo "the caveats advertise 'brew reinstall --HEAD', which is not a thing" >&2
     failed=1

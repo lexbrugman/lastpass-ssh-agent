@@ -89,17 +89,14 @@ impl std::fmt::Display for PromptError {
     }
 }
 
-/// A passphrase is a line somebody types, and 1 KiB is far past what anyone
-/// does. The cap is what lets every buffer holding one be allocated exactly
-/// once: a `Vec` that never grows can never leave a copy of a secret behind in
-/// freed memory, which zeroizing the final allocation would not undo. It also
-/// bounds what a misbehaving helper can make the agent allocate. The
-/// `LastPass` field reader is capped for the same two reasons.
+/// A typed line, so 1 KiB is far past anything real. The cap is what lets every
+/// buffer holding a passphrase be allocated once: a `Vec` that never grows
+/// cannot leave a copy in freed memory, which zeroizing the final allocation
+/// would not reach. It also bounds what a misbehaving helper can make the agent
+/// allocate. `MAX_FIELD_BYTES` exists for both reasons too.
 ///
-/// It counts the answer as delivered, so a helper's trailing newline comes out
-/// of the same allowance — at least 1022 bytes of passphrase always fit. The
-/// exact boundary is not worth a second length check after stripping the
-/// framing: the number is arbitrary, and no typed passphrase is near it.
+/// Counted against the answer as delivered, framing included, so at least 1022
+/// bytes of passphrase always fit.
 const MAX_PASSPHRASE_BYTES: usize = 1024;
 
 /// A prompt helper's pipe or exit could not be read.
@@ -177,24 +174,21 @@ pub trait PassphrasePrompt: Send + Sync {
     async fn prompt(&self, request: &PassphraseRequest) -> Result<Zeroizing<Vec<u8>>, PromptError>;
 }
 
-/// Somewhere a verified passphrase can be kept between signatures, keyed by
-/// the key's own fingerprint.
+/// Somewhere a verified passphrase can be kept between signatures, keyed by the
+/// key's own fingerprint.
 ///
-/// A store holds *only* passphrases. The private key never goes near it: it
-/// stays in the vault, fetched per signature, and this exists so the second
-/// signature does not have to ask the user again.
+/// Holds *only* passphrases, so the second signature need not ask again. The
+/// private key never goes near it and stays fetched per signature.
 ///
-/// Deliberately not macOS-only, even though the Keychain is the only
-/// implementation. Keeping the mechanism portable is what lets every rule
-/// around it — prefer the vault, verify before saving, re-ask when a saved
-/// passphrase stops working — be tested on any platform, leaving only the
-/// dozen lines that actually call Apple's API behind a `cfg`.
+/// Portable on purpose, though the Keychain is the only implementation: it is
+/// what keeps the rules around it — prefer the vault, verify before saving,
+/// re-ask when a saved passphrase stops working — testable on any platform,
+/// leaving only the calls into Apple's API behind a `cfg`.
 #[async_trait::async_trait]
 pub trait PassphraseStore: Send + Sync {
-    /// Where this keeps things, as a log message names it — "the macOS
-    /// Keychain". A log line saying a passphrase was kept somewhere is no use
-    /// to the reader without saying where, and worse than no use if they are
-    /// left to guess whether it means a file on disk.
+    /// How a log line names this store — "the macOS Keychain". A line saying a
+    /// passphrase was kept must say where, or the reader is left guessing
+    /// whether it means a file on disk.
     fn name(&self) -> &'static str;
     /// The passphrase remembered for this fingerprint, if there is one.
     async fn get(&self, fingerprint: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String>;
@@ -262,8 +256,7 @@ impl Unlocker {
         }
 
         match entry.passphrase_fallback {
-            // Word-for-word what the agent said before a fallback existed, so
-            // configuring this mode reproduces the old behaviour exactly.
+            // Names the field to populate: the only fix is in the vault item.
             PassphraseFallback::Error => Err(
                 "private key is passphrase-protected but the item's Passphrase field is empty"
                     .into(),
@@ -339,18 +332,14 @@ impl Unlocker {
         // is why decryption happens here and not after this function returns.
         let key = decrypt(encrypted, &typed)?;
         if let Err(e) = self.store.set(&fingerprint, &typed).await {
-            // The signature can still go ahead; failing it because the
-            // passphrase could not be kept would be worse than asking again
-            // next time.
+            // Not fatal: the signature can go ahead, and the next one asks.
             tracing::warn!(key = %fingerprint,
                 "could not store the passphrase in {}, so the next signature will ask \
                  again: {e}",
                 self.store.name());
         } else {
-            // Says what was stored, where, and — the part that matters most to
-            // anyone reading a log — what was not. "saved this key's
-            // passphrase" invited the reader to assume the key itself had been
-            // written somewhere, which is the one thing this agent never does.
+            // Says what was stored, where, and what was not: a log line about
+            // persisting a secret must not leave the private key in doubt.
             tracing::info!(key = %fingerprint,
                 "stored this key's passphrase in {} — the private key itself is never \
                  stored, and is still fetched from LastPass for every signature",

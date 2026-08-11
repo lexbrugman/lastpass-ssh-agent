@@ -9,8 +9,8 @@ edition = "2021"
 rust-version = "1.87"
 description = "SSH agent backed by the LastPass CLI: private keys never persist on disk, every signature is fetched, confirmed, used, and zeroized."
 license = "MIT"
-# dist needs this to build installers and release URLs — change the owner if
-# the repository lives elsewhere.
+# Where the project lives. The release URLs are built from the repository the
+# workflow runs in, not from here.
 repository = "https://github.com/lexbrugman/lastpass-ssh-agent"
 
 [dependencies]

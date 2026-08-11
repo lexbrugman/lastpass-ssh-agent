@@ -86,16 +86,13 @@ pub fn from_config(
     })
 }
 
-/// Human-readable description of a signing request, shared by all
-/// confirmers.
+/// Human-readable description of a signing request, shared by all confirmers.
 ///
-/// The key name (vault-controlled) and the requesting executable's path
-/// (controlled by whoever spawned the process) are untrusted. They are never
-/// passed as code — only as data (argv / dialog text) — but raw control
-/// characters would still let them redraw a TTY prompt, and a bidi override
-/// would let them reverse how the rest of the line renders. Either one
-/// spoofs which key or requester is being approved, so both are escaped
-/// here.
+/// The key name, the requester's path and the host name are all untrusted — the
+/// vault, whoever spawned the process, and `known_hosts` respectively. They only
+/// ever travel as data, but control characters could still redraw a TTY prompt
+/// and a bidi override could reverse how a line renders, either of which spoofs
+/// what is being approved. So everything interpolated here is escaped.
 pub fn describe_request(ctx: &ConfirmContext) -> String {
     use std::fmt::Write as _;
     let requester = ctx.peer.map_or_else(
@@ -126,10 +123,8 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
             .iter()
             .map(|bind| {
                 // The name when there is one: a fingerprint identifies the
-                // host exactly and tells the reader nothing, which is the
-                // wrong trade for a dialog someone has to judge in a second.
-                // It comes from the same file ssh trusts to verify the host,
-                // and the fingerprint is still in the log either way.
+                // host exactly and says nothing to the person reading it. The
+                // log keeps the fingerprint either way.
                 let mut hop =
                     escape_for_display(bind.host_name.as_ref().unwrap_or(&bind.host_fingerprint));
                 if bind.is_forwarding {
@@ -179,7 +174,8 @@ fn process_path(pid: i32) -> Option<String> {
     }
 }
 
-/// Used when confirmation is off (globally or per key).
+/// Used when `confirm = "off"` globally. A per-key override is handled by not
+/// asking at all.
 pub struct NoConfirmer;
 
 #[async_trait::async_trait]

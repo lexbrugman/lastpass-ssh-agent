@@ -40,8 +40,7 @@ impl TtyConfirmer {
 #[async_trait::async_trait]
 impl Confirmer for TtyConfirmer {
     async fn confirm(&self, ctx: &ConfirmContext) -> Decision {
-        // One prompt on the terminal at a time; queued requests each get
-        // their own full prompt + timeout once the terminal is free.
+        // One prompt at a time; see the type's documentation.
         let _one_at_a_time = self.serialize.lock().await;
 
         let message = super::describe_request(ctx);
@@ -82,9 +81,8 @@ async fn prompt_on_tty(path: &std::path::Path, message: &str) -> std::io::Result
     let prompt = format!("\n{message}\nAllow? (type 'yes' to approve, anything else denies): ");
     write_all(&tty, prompt.as_bytes()).await?;
 
-    // Read a byte at a time: in noncanonical mode the terminal reports
-    // readiness per keystroke, and a half-typed answer must not outlive the
-    // caller's deadline.
+    // A byte at a time, stopping at the newline: a larger read could swallow
+    // input typed after the answer, which belongs to whatever prompts next.
     let mut answer = String::new();
     loop {
         let mut byte = [0u8; 1];

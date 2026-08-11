@@ -1,45 +1,33 @@
 //! Putting a name to the host a session binding proves.
 //!
-//! A binding carries the far host's public key, and it is trustworthy: that
-//! host signed the session id with it. What it does not carry is a hostname —
-//! the protocol has no field for one — so a confirmation prompt can only show
-//! a fingerprint, which tells the person approving a signature almost nothing
-//! at a glance.
-//!
-//! `known_hosts` is where the name lives. Trusting it for a label is no
-//! stretch: it is the same file `ssh` consults to decide the host is who it
-//! claims to be, so anything able to forge an entry here has already defeated
-//! host verification. Names still reach the prompt escaped, because the file
-//! is user-editable text like any other.
+//! A binding carries the host's public key and a signature over the session id,
+//! but no hostname — the protocol has no field for one. `known_hosts` supplies
+//! the name, and trusting it for a label costs nothing: `ssh` already trusts it
+//! to decide the host is who it claims to be. It is still editable text, so
+//! names reach the prompt escaped.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Resolves host-key fingerprints to the names `known_hosts` records.
 ///
-/// The files are read when a name is actually wanted — once per signature, not
-/// once per binding — rather than indexed at startup. Freshness is the reason:
-/// `ssh` writes a new host into `known_hosts` while agreeing to connect to it,
-/// which is *before* it authenticates and asks for a signature. A snapshot
-/// taken when the agent started would show a bare fingerprint for exactly the
-/// connection a person is most likely to be reading carefully.
+/// Read per signature, never cached: `ssh` records a new host as it agrees to
+/// connect, which is before it asks for the signature that prompt is about, so
+/// anything older would miss a first connection.
 ///
-/// Reading happens on the blocking pool. The agent runs on one thread, and a
-/// peer on a forwarded connection can present a binding per host key it
-/// controls, so file work must never sit on the runtime.
+/// Read on the blocking pool. The agent runs on one thread and an untrusted
+/// peer chooses how many bindings to send, so file work must stay off it.
 #[derive(Debug, Clone)]
 pub struct HostNames {
     files: Vec<PathBuf>,
     deadline: std::time::Duration,
 }
 
-/// Reading a few small files takes microseconds, so anything approaching this
-/// is a filesystem that has stopped answering — a home directory on a stalled
-/// network mount, where `O_NONBLOCK` does nothing for a regular file. Giving up
-/// matters more than the names do: this is awaited before the confirmation
-/// prompt and under the one-signature-at-a-time gate, so without a deadline one
-/// hung read would stall every later signature instead of it timing out and
-/// denying.
+/// A few small files take microseconds, so anything near this is a filesystem
+/// that has stopped answering — `O_NONBLOCK` does not help for a regular file
+/// on a stalled mount. The names are worth less than the deadline: this is
+/// awaited under the one-signature-at-a-time gate, so a hung read without one
+/// would stall every later signature rather than letting it time out.
 const LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Default for HostNames {
@@ -52,11 +40,9 @@ impl Default for HostNames {
 }
 
 impl HostNames {
-    /// Tests point this at their own file, or at none at all, so a prompt's
-    /// contents never depend on whose machine the suite runs on.
-    ///
-    /// Test-only for now. If a `known_hosts` in a non-default location ever
-    /// needs supporting, this is where a configured path would arrive.
+    /// Tests point this at their own file, or at none, so a prompt's contents
+    /// never depend on whose machine the suite runs on. A configured
+    /// `known_hosts` path, if one is ever wanted, arrives here too.
     #[cfg(test)]
     pub const fn with_files(files: Vec<PathBuf>) -> Self {
         Self {
@@ -67,12 +53,11 @@ impl HostNames {
 
     /// Name each fingerprint, in the order given.
     ///
-    /// One pass over the files for the whole set: a connection may be bound to
-    /// several hosts, and re-reading per hop would multiply the work by the
-    /// number of hops an untrusted peer chooses to send.
+    /// One pass over the files for the whole set, since the number of hops is
+    /// the peer's choice.
     pub async fn names_for(&self, fingerprints: Vec<String>) -> Vec<Option<String>> {
-        // Nothing bound, nothing to name — and no file touched. This is the
-        // common case: a local tool, or any client that sends no binding.
+        // The common case — a local tool, or a client that sends no binding —
+        // touches no files at all.
         if fingerprints.is_empty() {
             return Vec::new();
         }
@@ -83,9 +68,8 @@ impl HostNames {
                 .iter()
                 .map(|fingerprint| index.name_for(fingerprint))
                 .collect();
-            // Say why, once, when hashing is the likely reason: a prompt
-            // showing a fingerprint on a machine whose known_hosts is hashed
-            // is working correctly, and that is not guessable from outside.
+            // A fingerprint shown because the file is hashed is correct
+            // behaviour, and not guessable from outside. Said once per lookup.
             if index.hashed > 0 && names.iter().any(Option::is_none) {
                 tracing::debug!(
                     hashed = index.hashed,
@@ -105,9 +89,8 @@ impl HostNames {
 
 /// The lookup outlasted its deadline, so nothing gets a name.
 ///
-/// Named for the same reason as `lookup_failed`, and excluded for a similar
-/// one: provoking it needs a filesystem that stops answering mid-read, which a
-/// test cannot arrange without being flaky about it.
+/// Excluded from coverage: provoking it needs a filesystem that stops
+/// answering mid-read, which no test can arrange without being flaky.
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(
     clippy::needless_pass_by_value,
@@ -118,12 +101,11 @@ fn deadline_expired(_: tokio::time::error::Elapsed) -> Vec<Option<String>> {
     Vec::new()
 }
 
-/// The lookup task did not finish, so nothing gets a name.
+/// The lookup task did not finish, so nothing gets a name. Never an error: a
+/// fingerprint is enough to approve a signature by.
 ///
-/// A signature is still perfectly approvable from a fingerprint, so this must
-/// never fail one. A named function rather than a closure so its body is not a
-/// line of its own in the coverage report: reaching it means `index_files`
-/// panicked, which no test can arrange.
+/// Excluded from coverage, and a named function rather than a closure so that
+/// costs a region and not a line: reaching it means `index_files` panicked.
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(
     clippy::needless_pass_by_value,
@@ -143,25 +125,21 @@ struct Index {
     names: HashMap<String, Vec<String>>,
     /// Fingerprints an `@revoked` line names, from any file.
     revoked: std::collections::HashSet<String>,
-    /// How many entries kept their hostname as a hash. Counted only to
-    /// explain a missing name: with `HashKnownHosts` on there is nothing to
-    /// read back, and a bare fingerprint is otherwise unaccountable.
+    /// Entries that kept their hostname as a hash. Counted only to explain a
+    /// missing name.
     hashed: usize,
 }
 
 impl Index {
     /// How a prompt should name this host, or `None` when nothing knows it.
     ///
-    /// Every name that matches, not the first: one key can be recorded under
-    /// several names, and a binding says nothing about which of them this
-    /// session used. Picking one by file order would state something the agent
-    /// cannot know, and would be wrong exactly when it matters — a key shared
-    /// between two hosts.
+    /// Every matching name, not the first. A binding proves the key, never
+    /// which of its names this session used, so choosing one by file order
+    /// would assert what the agent cannot know.
     fn name_for(&self, fingerprint: &str) -> Option<String> {
-        // A revoked key gets no name, whichever file or line said so. Its
-        // ordinary entry may well still be there, and dressing a revoked key
-        // in a familiar hostname is the one thing this must never do — the
-        // fingerprint is what a person needs to see then.
+        // A revoked key keeps its fingerprint, whichever file or line revoked
+        // it: an ordinary entry for it usually still exists, and a revoked key
+        // wearing a familiar name is the worst thing this could show.
         if self.revoked.contains(fingerprint) {
             return None;
         }
@@ -174,8 +152,7 @@ impl Index {
             match parse_line(line) {
                 Some(Line::Named { fingerprint, hosts }) => {
                     let names = self.names.entry(fingerprint).or_default();
-                    // The same host is commonly listed in more than one file,
-                    // and naming it twice in a prompt reads like two hosts.
+                    // One host in two files would otherwise read as two.
                     if !names.iter().any(|seen| seen == &hosts) {
                         names.push(hosts);
                     }
@@ -211,34 +188,28 @@ enum Line {
     Hashed,
 }
 
-/// Read one line.
-///
-/// Pure, so every shape of line is testable without touching a real
-/// `known_hosts`.
+/// Read one line. Pure, so every shape of line is testable directly.
 fn parse_line(line: &str) -> Option<Line> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
-    // Fields are whitespace-delimited, so the marker is read as a field rather
-    // than matched as a text prefix: `@revoked\thost` is as valid as
-    // `@revoked host`, and treating one as unmarked would drop a revocation.
+    // The marker is a field, not a text prefix: `@revoked\thost` is as valid
+    // as `@revoked host`, and reading one as unmarked would drop a revocation.
     let mut fields = line.split_whitespace();
     let first = fields.next()?;
     let (revoked, hosts) = match first {
         "@revoked" => (true, fields.next()?),
-        // A @cert-authority entry is a CA key rather than any host's own, so
-        // it names nothing. Same for any marker this does not know: better to
-        // say nothing than to guess what it meant.
+        // @cert-authority is a CA key, not a host's own. Unknown markers get
+        // the same treatment: say nothing rather than guess.
         _ if first.starts_with('@') => return None,
         _ => (false, first),
     };
-    // A hashed entry (HashKnownHosts) keeps the name only as a MAC of it,
-    // keyed by a per-entry salt: it can be tested against a hostname but never
-    // reversed, and a hostname is the thing missing here. Reported rather than
-    // dropped so a bare fingerprint can be explained. A revocation is about
-    // the key rather than the name, and the line still carries the key, so
-    // only an ordinary line stops here.
+    // `HashKnownHosts` keeps the name as a salted MAC: testable against a
+    // hostname, never reversible, and a hostname is exactly what is missing
+    // here. Reported rather than dropped so a bare fingerprint can be
+    // explained. Revocation is about the key, which the line still carries,
+    // so only an ordinary line stops here.
     if !revoked && hosts.starts_with("|1|") {
         return Some(Line::Hashed);
     }
@@ -280,19 +251,17 @@ fn default_files() -> Vec<PathBuf> {
     files
 }
 
-/// A `known_hosts` is lines of text; anything enormous is not one, and this is
-/// read while the agent is starting up.
+/// A `known_hosts` is lines of text; anything enormous is not one.
 const MAX_KNOWN_HOSTS_BYTES: u64 = 8 * 1024 * 1024;
 
 fn read_small(path: &Path) -> Option<String> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    // O_NONBLOCK, and the type checked from the handle rather than the path:
-    // opening a FIFO read-only otherwise waits for a writer that never comes,
-    // and this is awaited before the confirmation prompt while the one-request
-    // gate is held — so a `known_hosts` that was not a file would wedge every
-    // later signature instead of timing out.
+    // O_NONBLOCK, and the type read from the handle: a read-only open of a
+    // FIFO otherwise waits for a writer that never comes, and this runs under
+    // the one-signature gate, so anything but a file would wedge every later
+    // signature.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -308,10 +277,8 @@ fn read_small(path: &Path) -> Option<String> {
         return None;
     }
 
-    // Bounded again while reading, because a file can grow between the check
-    // and the read. Decoded lossily rather than rejected: one stray byte in a
-    // comment must not hide every host key in the file — the affected line
-    // simply stops parsing as a key.
+    // Bounded again: a file can grow between the check and the read. Decoded
+    // lossily so one stray byte costs its own line rather than the whole file.
     let mut bytes = Vec::new();
     file.take(MAX_KNOWN_HOSTS_BYTES)
         .read_to_end(&mut bytes)

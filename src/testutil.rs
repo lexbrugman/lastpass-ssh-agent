@@ -4,16 +4,12 @@ use std::path::{Path, PathBuf};
 
 /// Write an executable shell script and return its path.
 ///
-/// Executing a file that any process holds a write descriptor for fails with
-/// `ETXTBSY`, and these tests reach that race: they write scripts and spawn
-/// processes from many threads at once, so a fork can inherit the descriptor
-/// this function is writing through and keep the file busy until that child
-/// execs. Writing to a staging name and renaming does *not* help — the check
-/// is against the inode, which `rename` does not change.
-///
-/// So the file that gets executed is created by a separate process instead.
-/// Its write descriptor never exists in this address space, so none of our
-/// forks can inherit one, and `cp` has exited before the script is run.
+/// Created by a separate process, which looks odd and is not: executing a file
+/// any process holds a write descriptor for fails with `ETXTBSY`, and these
+/// tests write scripts while spawning processes from several threads, so a fork
+/// can inherit the descriptor and hold the file busy. Renaming does not help —
+/// the check is against the inode. Letting `cp` own the descriptor keeps it out
+/// of this address space entirely, so no fork of ours can inherit it.
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;

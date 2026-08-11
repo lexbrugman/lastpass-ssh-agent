@@ -9,10 +9,6 @@ use super::{PassphrasePrompt, PassphraseRequest, PromptError};
 /// External helper following the `SSH_ASKPASS` convention in its *password*
 /// mode: the prompt is the single argument, the secret comes back on stdout,
 /// and a nonzero exit means the user dismissed it.
-///
-/// The confirmation path deliberately sets `SSH_ASKPASS_PROMPT=confirm` to get
-/// a yes/no dialog. Here the opposite is wanted, so it is left unset — that is
-/// what makes an OpenSSH-compatible helper mask what is typed.
 pub struct AskpassPrompt {
     program: PathBuf,
     timeout: Duration,

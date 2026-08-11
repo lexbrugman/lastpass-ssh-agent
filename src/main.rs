@@ -432,6 +432,7 @@ async fn doctor(config_path: &Path, test_confirm: bool) -> Result<()> {
                 item_id: "0".into(),
                 peer: Some(confirm::PeerInfo {
                     pid: Some(std::process::id().cast_signed()),
+                    // SAFETY: getuid cannot fail and touches no memory.
                     uid: unsafe { libc::getuid() },
                 }),
                 bindings: Vec::new(),

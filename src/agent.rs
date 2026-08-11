@@ -25,24 +25,19 @@ pub struct LpassAgent {
     /// Decrypts the fetched key, resolving a passphrase the vault does not
     /// hold. Reached only for an encrypted key.
     unlocker: Arc<Unlocker>,
-    /// Puts names to the hosts a connection is bound to, read fresh when a
-    /// signature is asked for rather than cached: `ssh` records a host in
-    /// `known_hosts` as it agrees to connect, which is before the signature
-    /// this prompt is about.
+    /// Names the hosts a connection is bound to. Read per signature, since
+    /// `ssh` records a new host as it agrees to connect — before the signature
+    /// the prompt is about.
     host_names: Arc<crate::knownhosts::HostNames>,
     /// One signing request at a time, shared by every connection.
     ///
-    /// Confirmation and passphrase entry are separate transports with separate
-    /// locks, so each only keeps *itself* from overlapping. Without this, one
-    /// request's passphrase prompt and another's confirmation prompt could own
-    /// the same terminal at once, and whichever read first would take the
-    /// answer meant for the other — with `TtyConfirmer` reading its line into
-    /// an ordinary `String`, that is a passphrase landing in memory nothing
-    /// wipes.
+    /// Confirmation and passphrase entry lock only against themselves, so two
+    /// requests could otherwise hold one terminal at once and each read the
+    /// other's answer — a passphrase landing in `TtyConfirmer`'s ordinary
+    /// `String`, which nothing wipes.
     ///
-    /// Held across the whole request rather than around each prompt:
-    /// releasing in between would leave exactly the gap this closes. OpenSSH's
-    /// own agent answers requests one at a time as well.
+    /// Held for the whole request: releasing between the two prompts leaves
+    /// exactly that gap. OpenSSH's own agent is serial too.
     interaction: Arc<tokio::sync::Mutex<()>>,
     /// pid/uid of the connected client, filled in per session.
     peer: Option<PeerInfo>,
@@ -222,13 +217,11 @@ impl Session for LpassAgent {
     /// Dispatch every request ourselves.
     ///
     /// The default dispatcher signals a refusal by returning `Err`, and
-    /// ssh-agent-lib logs every `Err` at ERROR. That made two entirely
-    /// normal things look like agent malfunctions: OpenSSH probes for
-    /// vendor extensions on each connection, and a user pressing Deny is a
-    /// deliberate outcome we already log ourselves. Refusals are protocol
-    /// answers, so they are returned as such — the bytes on the wire are
-    /// unchanged (`SSH_AGENT_FAILURE` either way), and the library's own
-    /// logging stays on to report faults that really are faults.
+    /// ssh-agent-lib logs every `Err` at ERROR — but an extension probe and a
+    /// user pressing Deny are protocol answers, not faults, so they are
+    /// returned as such. The bytes on the wire are unchanged
+    /// (`SSH_AGENT_FAILURE` either way), and the library's own logging stays
+    /// on for faults that really are faults.
     async fn handle(&mut self, message: Request) -> Result<Response, AgentError> {
         Ok(match message {
             Request::RequestIdentities => {
@@ -737,8 +730,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_populated_field_wins_over_the_prompt() {
-        // Backward compatibility: an existing user with the passphrase in the
-        // vault keeps working, and is never asked for it.
+        // The vault field is authoritative: a populated one is used, and
+        // nothing is asked.
         let prompt = TypedPassphrase::new(b"would be wrong");
         let mut agent = pw_agent(Some(b"fixture-passphrase"), PW_KEY, &prompt).await;
         assert!(agent
@@ -1095,7 +1088,7 @@ mod tests {
         }
         assert_eq!(agent.bindings.len(), 1);
 
-        // distinct hops accumulate only up to the protocol limit
+        // distinct hops accumulate only up to our own cap
         for hop in 0..MAX_SESSION_BINDINGS + 4 {
             let key =
                 PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();

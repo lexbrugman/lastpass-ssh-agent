@@ -3,11 +3,10 @@ name: Build release
 # Builds the four published targets and uploads each as a workflow artifact
 # for publish-release.yml to attach to the release.
 #
-# Every target builds on a runner of its own architecture, so nothing is
-# cross-linked: the Apple targets share one macOS runner because a single SDK
-# covers both, and the musl targets each get a runner of their own. musl needs
-# no C toolchain here — the dependency tree is pure Rust, so rustc's
-# self-contained musl linking covers it.
+# The musl targets each build on a runner of their own architecture. Both Apple
+# targets build on one macOS runner, where a single SDK links either. No C
+# toolchain or cross-linker is involved anywhere: the dependency tree is pure
+# Rust, so rustc's self-contained musl linking covers it.
 on:
   workflow_call:
     inputs:
