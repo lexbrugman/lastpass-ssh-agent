@@ -111,12 +111,47 @@ vault scan) or tuning behavior:
 # socket = "~/Library/Application Support/lastpass-ssh-agent/agent.sock"
 # lpass_path = "/opt/homebrew/bin/lpass"
 
+# Where an encrypted key's passphrase comes from when the item's own
+# Passphrase field is empty. "prompt" (default) asks you, so the passphrase
+# need not be in the vault at all; "error" refuses to sign.
+# passphrase_fallback = "prompt"
+
 # Pin items (disables auto-discovery); `search` prints these snippets.
 [[keys]]
 id = "7482913650418273946"     # stable LastPass item id (names are ambiguous)
 name = "github"
 # confirm = false              # per-key override
+# passphrase_fallback = "error"  # per-key override
 ```
+
+### Keeping the passphrase out of the vault
+
+A populated `Passphrase` field is always used, and nothing else is consulted.
+Leave that field **empty** and the agent asks you for the passphrase instead,
+which is what separates the two secrets:
+
+```text
+encrypted private key -> LastPass
+passphrase            -> only ever in your head, typed per session
+```
+
+Whoever steals the vault then holds a key they cannot use. The prompt appears
+on the same channel as your confirmations (`osascript`, `tty` or `askpass`);
+with `confirm = "off"` it uses the platform default, since silencing approval
+prompts does not mean you cannot be reached. Set
+`passphrase_fallback = "error"` to keep the pre-existing behavior, where an
+encrypted key with an empty `Passphrase` field simply refuses to sign.
+
+Two properties are worth stating explicitly, because they are what stop a
+local prompt from becoming a way around the vault:
+
+- A **wrong** `Passphrase` field fails the signature. Fallback happens when
+  the field is *absent*, never when it is present and does not work —
+  otherwise anything able to draw a dialog could override a passphrase you
+  pinned in the vault.
+- Nothing is cached. Each signature fetches the key, resolves the passphrase,
+  decrypts, signs, and wipes both. A passphrase typed once is not reused for
+  the next signature.
 
 ## Run
 
@@ -411,7 +446,17 @@ justifying why it cannot be exercised.
 - **Passphrase-protected keys** work: the agent reads the item's
   `Passphrase` field and decrypts in memory. Storing key + passphrase in the
   same vault item means the passphrase adds nothing against a vault
-  compromise — it only protects the key blob in transit/backups.
+  compromise — it only protects the key blob in transit/backups. Leaving that
+  field empty is what buys the separation; see [Keeping the passphrase out of
+  the vault](#keeping-the-passphrase-out-of-the-vault).
+- **The passphrase prompt shares `confirm_timeout_secs`** (30s by default),
+  which is generous for pressing a button but tight for typing a long
+  passphrase. Raise it if entry keeps timing out.
+- **Suspending a `tty` passphrase prompt leaves the terminal with echo off.**
+  Ctrl-Z (or Ctrl-\\) does not run the cleanup that a timeout, a cancellation
+  or an error does, so the shell comes back not showing what you type, and
+  anything half-typed stays queued for it to read. `stty sane` restores the
+  terminal. Finish or cancel the prompt rather than suspending it.
 - **Certificates** are not served; plain keys only.
 - Destination constraints (`ssh-add -h`) are not applicable: this agent
   refuses key addition, and its key set comes from the vault.

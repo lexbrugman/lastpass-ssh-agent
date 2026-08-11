@@ -61,13 +61,9 @@ impl Confirmer for AskpassConfirmer {
 mod tests {
     use super::*;
     use crate::confirm::PeerInfo;
-    use std::os::unix::fs::PermissionsExt;
 
     fn helper(dir: &std::path::Path, body: &str) -> PathBuf {
-        let path = dir.join("askpass");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        crate::testutil::write_script(dir, "askpass", body)
     }
 
     fn ctx() -> ConfirmContext {

@@ -294,9 +294,7 @@ mod discovery_tests {
     fn resolve_binary_honors_explicit_path() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("lpass");
-        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = crate::testutil::write_script(dir.path(), "lpass", "");
         assert_eq!(resolve_binary(Some(&bin)), Some(bin.clone()));
 
         // configured but missing or not executable -> None, no PATH fallback
