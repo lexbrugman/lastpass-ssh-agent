@@ -9,6 +9,15 @@ on:
   # release-on-master.yml runs this before it releases anything
   workflow_call:
 
+# release-on-master.yml calls this workflow as the release gate, and a called
+# workflow runs with the caller's token — which there carries contents:write
+# and actions:write, to push the version bump and dispatch the release.
+# Nothing here needs either, and the third-party actions below would inherit
+# them, so pin it down: a called workflow may lower permissions, never raise
+# them.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -25,6 +34,23 @@ jobs:
       - run: cargo fmt --check
       - run: ./packaging/homebrew/test-generate-formula.sh
       - run: cargo clippy --all-targets -- -D warnings
+
+  # Advisories are time-based rather than code-based: a dependency that was
+  # clean yesterday can be vulnerable today without anything here changing.
+  # Running it in the gate means no release goes out under an advisory nobody
+  # has looked at, and every Renovate dependency pull request re-runs it, so
+  # a newly published one surfaces without anyone pushing code.
+  audit:
+    name: advisory audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Fails on any advisory against the locked tree except those
+      # .cargo/audit.toml accepts, each recorded there with its reasoning.
+      - run: cargo audit
 
   test:
     name: tests (${{ matrix.os }})

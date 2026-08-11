@@ -7,7 +7,7 @@ pub use osascript::OsascriptConfirmer;
 pub use tty::TtyConfirmer;
 
 use crate::keystore::KeyEntry;
-use crate::text::escape_control;
+use crate::text::escape_for_display;
 
 /// What the user is being asked to approve. Everything here may be shown in
 /// a dialog; none of it is secret. `key_name` comes from the vault/config
@@ -89,8 +89,10 @@ pub fn from_config(
 /// The key name (vault-controlled) and the requesting executable's path
 /// (controlled by whoever spawned the process) are untrusted. They are never
 /// passed as code — only as data (argv / dialog text) — but raw control
-/// characters would still let them redraw a TTY prompt and spoof which key
-/// or requester is being approved, so they are escaped here.
+/// characters would still let them redraw a TTY prompt, and a bidi override
+/// would let them reverse how the rest of the line renders. Either one
+/// spoofs which key or requester is being approved, so both are escaped
+/// here.
 pub fn describe_request(ctx: &ConfirmContext) -> String {
     use std::fmt::Write as _;
     let requester = ctx.peer.map_or_else(
@@ -100,7 +102,7 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
                 || format!("uid {}", peer.uid),
                 |pid| {
                     let process = process_path(pid)
-                        .map_or_else(|| "unknown process".to_string(), |p| escape_control(&p));
+                        .map_or_else(|| "unknown process".to_string(), |p| escape_for_display(&p));
                     format!("{process} (pid {pid}, uid {})", peer.uid)
                 },
             )
@@ -108,9 +110,9 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
     );
     let mut text = format!(
         "SSH signature request\n\nKey: {}\nFingerprint: {}\nLastPass item: {}\nRequested by: {requester}",
-        escape_control(&ctx.key_name),
-        escape_control(&ctx.fingerprint),
-        escape_control(&ctx.item_id),
+        escape_for_display(&ctx.key_name),
+        escape_for_display(&ctx.fingerprint),
+        escape_for_display(&ctx.item_id),
     );
     // Without this, a request relayed from a machine you ran `ssh -A` to is
     // indistinguishable from one you made yourself: both name the local ssh
@@ -120,7 +122,7 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
             .bindings
             .iter()
             .map(|bind| {
-                let mut hop = escape_control(&bind.host_fingerprint);
+                let mut hop = escape_for_display(&bind.host_fingerprint);
                 if bind.is_forwarding {
                     hop.push_str(" (forwarding the agent onward)");
                 }
@@ -268,6 +270,13 @@ mod tests {
         assert!(
             describe_request(&ConfirmContext::new(&c1, None, Vec::new())).contains("csi\\x9b2J")
         );
+        // A right-to-left override renders everything after it in reverse,
+        // so an unescaped one could make the dialog show a different key
+        // name than the request it is approving.
+        let mut bidi = entry();
+        bidi.name = "github\u{202e}yek-live".to_string();
+        let text = describe_request(&ConfirmContext::new(&bidi, None, Vec::new()));
+        assert!(text.contains("github\\u{202e}yek-live"), "{text}");
         // ordinary text is untouched
         assert!(
             describe_request(&ConfirmContext::new(&entry(), None, Vec::new())).contains("ctx key")

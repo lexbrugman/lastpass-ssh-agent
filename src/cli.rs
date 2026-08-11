@@ -31,14 +31,32 @@ fn release_date(version: &str) -> String {
         return UNKNOWN.into();
     };
     let (month, day) = (month_day / 100, month_day % 100);
-    if year.len() != 4
-        || !year.bytes().all(|b| b.is_ascii_digit())
-        || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-    {
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) || !(1..=12).contains(&month) {
+        return UNKNOWN.into();
+    }
+    // Four ASCII digits by the check above, so this cannot overflow and
+    // needs no fallible parse.
+    let year_number = year
+        .bytes()
+        .fold(0u32, |acc, b| acc * 10 + u32::from(b - b'0'));
+    // Per-month, so an impossible date is reported as one rather than
+    // rendered: 2026.231.0 is not "2026-02-31".
+    if !(1..=days_in_month(year_number, month)).contains(&day) {
         return UNKNOWN.into();
     }
     format!("{year}-{month:02}-{day:02}")
+}
+
+const fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        // month is 1..=12 by the time we get here, so this is February
+        _ if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        _ => 28,
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -100,6 +118,53 @@ mod tests {
         assert_eq!(release_date("2026.1310.0"), "unknown date", "month 13");
         assert_eq!(release_date("2026.832.0"), "unknown date", "day 32");
         assert_eq!(release_date("2026.800.0"), "unknown date", "day 0");
+    }
+
+    #[test]
+    fn a_day_the_month_does_not_have_is_not_a_date() {
+        // the whole point: 2026.231.0 must not render as "2026-02-31"
+        assert_eq!(release_date("2026.231.0"), "unknown date", "February 31");
+        assert_eq!(release_date("2026.431.0"), "unknown date", "April 31");
+        assert_eq!(release_date("2026.430.0"), "2026-04-30");
+
+        // February follows the leap rule, including both century cases
+        assert_eq!(
+            release_date("2026.229.0"),
+            "unknown date",
+            "not a leap year"
+        );
+        assert_eq!(release_date("2028.229.0"), "2028-02-29", "divisible by 4");
+        assert_eq!(
+            release_date("2100.229.0"),
+            "unknown date",
+            "century, not 400"
+        );
+        assert_eq!(release_date("2000.229.0"), "2000-02-29", "divisible by 400");
+    }
+
+    #[test]
+    fn every_month_has_its_own_length() {
+        // covers each arm of the month table rather than a sample of it
+        for (month, days) in [
+            (1, 31),
+            (2, 28),
+            (3, 31),
+            (4, 30),
+            (5, 31),
+            (6, 30),
+            (7, 31),
+            (8, 31),
+            (9, 30),
+            (10, 31),
+            (11, 30),
+            (12, 31),
+        ] {
+            assert_eq!(days_in_month(2026, month), days, "month {month}");
+            let last = format!("2026.{}.0", month * 100 + days);
+            assert_eq!(release_date(&last), format!("2026-{month:02}-{days:02}"));
+            let past_end = format!("2026.{}.0", month * 100 + days + 1);
+            assert_eq!(release_date(&past_end), "unknown date", "month {month}");
+        }
     }
 
     #[test]

@@ -12,11 +12,18 @@ use super::{ConfirmContext, Confirmer, Decision};
 ///   there is no GUI session (e.g. SSH'd into this machine) — is Deny
 /// - untrusted text (key names come from the vault) is passed as argv to
 ///   `on run argv`, never interpolated into `AppleScript` source
+///
+/// Prompts are shown one at a time. Concurrent signing requests would
+/// otherwise stack identical-looking dialogs, and approving the frontmost
+/// one would approve whichever request happened to be on top rather than
+/// the one just read. Each queued request gets its own dialog and its own
+/// full timeout once the screen is free.
 pub struct OsascriptConfirmer {
     timeout: Duration,
     /// Extra slack past the dialog's own give-up before we kill osascript.
     grace: Duration,
     program: std::path::PathBuf,
+    serialize: tokio::sync::Mutex<()>,
 }
 
 const DIALOG_SCRIPT: &str = r#"
@@ -34,24 +41,20 @@ end run
 
 impl OsascriptConfirmer {
     pub fn new(timeout: Duration) -> Self {
-        Self {
+        Self::with_program(
+            "/usr/bin/osascript".into(),
             timeout,
-            grace: Duration::from_secs(10),
-            program: "/usr/bin/osascript".into(),
-        }
+            Duration::from_secs(10),
+        )
     }
 
     /// Tests stub out osascript with a script and shrink the kill backstop.
-    #[cfg(test)]
-    pub const fn with_program(
-        program: std::path::PathBuf,
-        timeout: Duration,
-        grace: Duration,
-    ) -> Self {
+    pub fn with_program(program: std::path::PathBuf, timeout: Duration, grace: Duration) -> Self {
         Self {
             timeout,
             grace,
             program,
+            serialize: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -59,6 +62,9 @@ impl OsascriptConfirmer {
 #[async_trait::async_trait]
 impl Confirmer for OsascriptConfirmer {
     async fn confirm(&self, ctx: &ConfirmContext) -> Decision {
+        // One dialog on screen at a time; see the type's documentation.
+        let _one_at_a_time = self.serialize.lock().await;
+
         let message = super::describe_request(ctx);
         let give_up = self.timeout.as_secs().max(1).to_string();
 
@@ -214,6 +220,45 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(c.confirm(&ctx()).await, Decision::Deny);
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn dialogs_do_not_stack() {
+        // Two requests arrive at once. Without serialization both dialogs
+        // are up together and a single click answers whichever is on top;
+        // the second must not start until the first is done.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("order.txt");
+        let confirmer = std::sync::Arc::new(OsascriptConfirmer::with_program(
+            stub(
+                dir.path(),
+                &format!(
+                    "printf 'open\\n' >> {log}; sleep 0.3; printf 'close\\n' >> {log}; \
+                     echo 'button returned:Allow'",
+                    log = log.display()
+                ),
+            ),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        ));
+
+        let (a, b) = tokio::join!(
+            {
+                let c = confirmer.clone();
+                async move { c.confirm(&ctx()).await }
+            },
+            {
+                let c = confirmer.clone();
+                async move { c.confirm(&ctx()).await }
+            },
+        );
+        assert_eq!(a, Decision::Approve);
+        assert_eq!(b, Decision::Approve);
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "open\nclose\nopen\nclose\n",
+            "the second dialog opened before the first closed"
+        );
     }
 
     #[tokio::test]

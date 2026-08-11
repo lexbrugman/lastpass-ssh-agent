@@ -1,0 +1,21 @@
+# Configuration for `cargo audit`, which CI runs against Cargo.lock. Kept in
+# the repository rather than passed as a CI flag so a local `cargo audit`
+# gives the same answer as the gate, and so every accepted advisory carries
+# its reasoning where a reviewer will find it.
+
+[advisories]
+# RUSTSEC-2023-0071 — "Marvin Attack", a timing sidechannel in `rsa`
+# (medium, 5.9). Accepted rather than fixed, because there is nothing to fix
+# to: the advisory has had no patched release in any version line since 2023,
+# and `rsa` is not a direct choice — ssh-key pulls it in for RSA key support,
+# so the only way to drop it is to stop serving RSA keys entirely.
+#
+# Why the exposure is small here: the published attack is a timing oracle
+# against RSA *decryption*, which this agent never performs — it only signs.
+# Signing is additionally gated on a human confirmation by default, which
+# bounds how many timing samples an attacker could collect to roughly one per
+# dialog. It matters most with `confirm = "off"` on an RSA key.
+#
+# Revisit when a fixed release appears: the audit is what will say so.
+# Every other advisory, present or future, remains a hard failure.
+ignore = ["RUSTSEC-2023-0071"]
