@@ -21,8 +21,14 @@ pub enum KeyIssue {
     #[error("this agent cannot sign with {0} keys")]
     Unsupported(String),
 
+    // Rendered by `start` as its own fatal error and by `doctor` as a
+    // finding, so it states the problem and the remedy without predicting
+    // what either command will do. The remedy has to fit both modes: with
+    // [[keys]] pinned the user drops one entry, and under auto-discovery
+    // there is no config listing them to remove from in the first place.
     #[error(
-        "same public key as item {other_item} — signing would be ambiguous; start will refuse this"
+        "same public key as item {other_item} — signing would be ambiguous; \
+         keep one and pin it with [[keys]]"
     )]
     Duplicate { other_item: String },
 }
