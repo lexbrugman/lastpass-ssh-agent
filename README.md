@@ -286,11 +286,12 @@ an advisory nobody has looked at. Accepted advisories live in
 listed there fails.
 
 One is accepted today: **RUSTSEC-2023-0071**, a timing sidechannel in `rsa`
-that has no patched release in any version line. The published attack
-targets RSA decryption, which this agent never performs — it only signs, and
-by default only after you approve each signature. It is worth knowing about
-if you serve an RSA key with `confirm = "off"`; ed25519 and ECDSA keys do
-not involve that crate at all.
+that has no patched release in any version line. Every RSA signature uses
+fresh OS randomness to enable the crate's RSA blinding mitigation, and by
+default only runs after you approve the request. Blinding is not the same as
+a constant-time implementation, so the advisory remains explicitly accepted;
+the residual risk matters most with `confirm = "off"` on a forwarded RSA
+key. Ed25519 and ECDSA keys do not involve that crate at all.
 
 ## Development
 

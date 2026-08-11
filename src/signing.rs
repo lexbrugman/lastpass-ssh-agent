@@ -1,6 +1,6 @@
 use rsa::pkcs1v15::SigningKey;
 use rsa::sha2::{Sha256, Sha512};
-use signature::{SignatureEncoding, Signer};
+use signature::{RandomizedSigner, SignatureEncoding, Signer};
 use ssh_agent_lib::proto::signature as sigflag;
 use ssh_key::private::KeypairData;
 use ssh_key::{Algorithm, EcdsaCurve, PrivateKey, Signature};
@@ -86,8 +86,15 @@ fn sign_rsa<D>(private: rsa::RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>, Sign
 where
     D: rsa::sha2::Digest + rsa::pkcs8::AssociatedOid,
 {
+    // rsa 0.9 is not constant-time (RUSTSEC-2023-0071). Supplying fresh OS
+    // randomness makes its PKCS#1 v1.5 signer blind the private-key
+    // operation, making repeated timings substantially harder to correlate
+    // with the client's chosen input. This mitigates the advisory; it does
+    // not make the dependency a constant-time implementation, which is why
+    // the audit exception and its residual-risk documentation remain.
+    let mut rng = rand_core::OsRng;
     let signature = SigningKey::<D>::new(private)
-        .try_sign(data)
+        .try_sign_with_rng(&mut rng, data)
         .map_err(crypto_err)?;
     Ok(signature.to_vec())
 }
