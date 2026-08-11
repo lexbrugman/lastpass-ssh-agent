@@ -3,9 +3,10 @@
 #
 #   generate-formula.sh <version> <owner/repo> <dir-with-release-artifacts>
 #
-# The artifact directory must hold the .sha256 files dist produces beside
-# each archive. dist builds and publishes everything else; only the formula
-# is ours, because its template cannot declare a launchd/systemd service.
+# The artifact directory must hold the .sha256 file build-release.yml writes
+# beside each archive. Run after the release is published: publish-homebrew-
+# formula.yml downloads those checksums from the release itself, so the hashes
+# in the formula are of the files users actually fetch.
 set -eu
 
 version="$1"
@@ -175,8 +176,9 @@ class LastpassSshAgent < Formula
     # A release install must report exactly the version the formula claims —
     # a mismatch there means the formula and the binary came from different
     # builds. A head install cannot: brew calls it HEAD-<sha> while the binary
-    # reports the CalVer from Cargo.toml, so check the name instead. Decided
-    # from `version` rather than `build`, which is not dependable in a test.
+    # describes itself against the newest release tag it can see, so check the
+    # name instead. Decided from `version` rather than `build`, which is not
+    # dependable in a test.
     expected = if version.to_s.start_with?("HEAD")
       "lastpass-ssh-agent"
     else

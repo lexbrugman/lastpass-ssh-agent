@@ -1,8 +1,8 @@
 #!/bin/sh
 # Checks generate-formula.sh against checksum files shaped exactly like the
-# ones dist publishes: "<hash> *<name>", not a bare hash. Getting this wrong
-# produces a formula Homebrew rejects, and a fixture holding only a hash
-# would not catch it.
+# ones build-release.yml writes: "<hash> *<name>", not a bare hash. Getting
+# this wrong produces a formula Homebrew rejects, and a fixture holding only
+# a hash would not catch it.
 set -eu
 cd "$(dirname "$0")"
 

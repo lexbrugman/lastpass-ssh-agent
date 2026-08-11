@@ -213,12 +213,56 @@ Renovate targets `dev`. Crates keep caret ranges with a committed `Cargo.lock`
 the transitive tree; actions are pinned to exact releases, since a floating
 major tag never produces a pull request. Digests are deliberately not pinned.
 
-Two versions are declared twice and must move together — `cargo-dist-version`
-in `Cargo.toml` and `CARGO_DIST_VERSION` in the `Dockerfile`. One Renovate
-custom manager matches both so a single pull request bumps them.
+## Releasing
 
-A dist bump is only half an upgrade: `release.yml` is generated and verified
-byte-for-byte, so it needs regenerating and committing on the same branch.
+Work happens on `dev`; `master` releases. **No release ever commits anything**,
+which is the property that keeps the two branches from diverging — `master` and
+`dev` differ only by real work, and merging one into the other is always a
+fast-forward away from a conflict nobody introduced.
+
+The version therefore lives in the git tag and nowhere else. `[package] version`
+in `Cargo.toml` is a permanent `0.0.0` placeholder; `build.rs` resolves what
+`--version` prints, in this order:
+
+1. `LASTPASS_SSH_AGENT_VERSION`, which `build-release.yml` sets to the version
+   being released.
+2. `git describe --tags --match "v[0-9]*"`, so a build off `dev` reports
+   `2026.811.2-5-gabc123def456` — the release it follows, and by how much.
+3. `dev`, for a tree with neither.
+
+Reading `CARGO_PKG_VERSION` anywhere is a bug: it is the placeholder.
+
+One push to `master` is one CI run, and the release is the tail of it:
+
+```
+ci.yml                          on: push, branches only
+├── resolve-release.yml         master → the next CalVer; anything else → ""
+├── checks.yml                  the gate, on every branch
+├── build-release.yml           4 targets, only when the version is non-empty
+├── publish-release.yml         draft → assets → publish (this creates the tag)
+└── publish-homebrew-formula.yml
+```
+
+Four invariants hold it together, and each is load-bearing:
+
+- **`resolve-release.yml` is the only place that decides.** Nothing else tests
+  the branch; every release job gates on `version != ''`. Adding a second
+  `github.ref` check somewhere downstream is how the two get out of step.
+- **The tag is created by publishing the release**, not pushed. That is what
+  keeps the built-in `GITHUB_TOKEN` sufficient: a token-pushed tag cannot
+  trigger a workflow, so anything that needed a tag *event* would need a
+  GitHub App or a deploy key. Nothing does. `ci.yml` listens on branches only,
+  so the new tag cannot re-enter the pipeline either.
+- **The release is drafted, filled, then published.** A draft holds no tag, so
+  a run that dies partway leaves something discardable rather than a tag
+  pointing at a release that was never finished. `resolve-release.yml` counts
+  drafts for exactly this reason.
+- **The formula is published last.** It points at the release's download URLs,
+  which do not resolve until the release leaves draft.
+
+The one credential is `TAP_DEPLOY_KEY`, and only because the tap is a different
+repository — `GITHUB_TOKEN` cannot write to one. Without it a release still
+publishes and the formula is still attached to it; only the tap goes unupdated.
 
 ## Commits
 

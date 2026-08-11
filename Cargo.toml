@@ -1,6 +1,10 @@
 [package]
 name = "lastpass-ssh-agent"
-version = "2026.810.1"
+# A placeholder, and deliberately not a version anyone ships. Releases are
+# CalVer, decided by the pipeline that publishes them and recorded in the git
+# tag — never committed, so this line cannot drift out of step with what is
+# released. `--version` reports the stamp build.rs resolves, not this.
+version = "0.0.0"
 edition = "2021"
 rust-version = "1.87"
 description = "SSH agent backed by the LastPass CLI: private keys never persist on disk, every signature is fetched, confirmed, used, and zeroized."
@@ -50,39 +54,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 
+# Released binaries are built with this profile, so a local `cargo build
+# --release` produces what CI ships rather than something close to it.
 [profile.release]
 strip = true
-
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
 lto = "thin"
-
-# Config for 'dist'
-[workspace.metadata.dist]
-# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.32.0"
-# CI backends to support
-ci = "github"
-# The installers to generate for each app
-installers = ["shell"]
-# Target platforms to build apps for (Rust target-triple syntax)
-# musl on Linux so a published binary does not inherit the build
-# runner's glibc version and fail on older hosts
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
-# Plan jobs to run in CI
-# Publish jobs to run in CI
-publish-jobs = ["./publish-homebrew-formula"]
-# Whether to install an updater program
-install-updater = false
-# releases are started by the master-push workflow, not by pushing a tag
-dispatch-releases = true
-# dev pushes already run the full CI gate; do not start the separately named
-# release workflow for pull requests
-pr-run-mode = "skip"
-# Path that installers should place binaries in
-install-path = "CARGO_HOME"
-# the formula job attaches the formula to the release, which needs write
-# access to repository contents; unlisted permissions default to none
-[workspace.metadata.dist.github-custom-job-permissions.publish-homebrew-formula]
-contents = "write"

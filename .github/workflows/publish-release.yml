@@ -1,0 +1,62 @@
+name: Publish release
+
+# Turns the built archives into the GitHub release.
+#
+# The release is created as a draft, filled, and only then published. A draft
+# carries no tag — GitHub creates it at the moment of publishing — so a run
+# that dies partway leaves a discardable draft and no tag pointing at a
+# release that does not exist. That is also why resolve-release.yml counts
+# drafts when it picks the next number.
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: release-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Verify the archives against their checksums
+        working-directory: dist
+        run: |
+          ls -l
+          # The checksums were computed on the build runners; these are the
+          # files users download. Checking them here is what makes the two the
+          # same bytes, rather than assuming the artifact round-trip was clean.
+          sha256sum -c ./*.sha256
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # --target pins the tag to the commit this run was triggered by, so
+          # the release names the tree it was built from even if master has
+          # moved on by the time it is published.
+          gh release create "v${VERSION}" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "v${VERSION}" \
+              --generate-notes \
+              dist/*
+
+      - name: Publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Creates the tag. Everything downstream — the formula's download
+          # URLs above all — needs the assets reachable, which they are not
+          # while the release is a draft.
+          gh release edit "v${VERSION}" --draft=false

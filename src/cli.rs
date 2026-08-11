@@ -5,13 +5,17 @@ use clap::{Parser, Subcommand};
 /// Renders `2026.810.0 (2026-08-10, commit abc123def456)`. The version is
 /// calendar-based, so it says how old a build is on sight; the commit pins
 /// exactly which build it is.
+///
+/// Both come from `build.rs`, not from `CARGO_PKG_VERSION`: the released
+/// version lives in the release that publishes it and is never committed, so
+/// the manifest holds a placeholder that would be a lie to print.
 fn version() -> &'static str {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     VERSION.get_or_init(|| {
         format!(
             "{} ({}, commit {})",
-            env!("CARGO_PKG_VERSION"),
-            release_date(env!("CARGO_PKG_VERSION")),
+            env!("LASTPASS_SSH_AGENT_VERSION"),
+            release_date(env!("LASTPASS_SSH_AGENT_VERSION")),
             env!("LASTPASS_SSH_AGENT_COMMIT"),
         )
     })
@@ -104,7 +108,18 @@ mod tests {
     }
 
     #[test]
+    fn a_build_between_releases_dates_from_the_one_it_follows() {
+        // what `git describe` gives a build off dev: the newest release, then
+        // the distance past it. The date is that release's, which is the point
+        // — it says how old the code underneath is.
+        assert_eq!(release_date("2026.811.2-5-gabc123def456"), "2026-08-11");
+        assert_eq!(release_date("2026.1225.0-1-g0000000"), "2026-12-25");
+    }
+
+    #[test]
     fn a_version_that_is_not_calver_says_so() {
+        // the placeholder a build with neither an environment nor a tag gets
+        assert_eq!(release_date("dev"), "unknown date");
         assert_eq!(release_date("0.1.0-dev"), "unknown date");
         assert_eq!(release_date("2026"), "unknown date");
         assert_eq!(release_date(""), "unknown date");
@@ -170,7 +185,7 @@ mod tests {
     #[test]
     fn version_string_names_the_build() {
         let text = version();
-        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        assert!(text.contains(env!("LASTPASS_SSH_AGENT_VERSION")), "{text}");
         assert!(text.contains("commit "), "{text}");
         // built twice, same answer (it is cached)
         assert_eq!(text, version());

@@ -7,8 +7,8 @@ FROM rust:1-slim
 
 # git: build.rs stamps the binary with the current commit.
 # curl + ca-certificates: fetching the cargo-llvm-cov release binary below.
-# xz-utils: dist ships its installer artifacts as .tar.xz, as do this
-# project's own releases, and tar cannot unpack them without it.
+# xz-utils: this project's releases are .tar.xz, and tar cannot unpack one
+# without it — for inspecting a published archive from the dev shell.
 # ruby: only to syntax-check the generated Homebrew formula. It is built by
 # substituting into a template, so a broken edit produces a file that looks
 # fine and fails at `brew install`; `ruby -c` catches that in the gate.
@@ -71,28 +71,5 @@ RUN set -eux; \
         "https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-${host}.tar.gz" \
         | tar -xzf - -C "${CARGO_HOME}/bin"; \
     cargo install --locked cargo-audit
-
-# dist regenerates .github/workflows/release.yml, and has to be the exact
-# version [workspace.metadata.dist] names: release.yml installs that same
-# version, and dist verifies the file byte-for-byte at release time, so a
-# mismatch here would generate a workflow that fails the next release. This
-# uses the installer release.yml itself uses, at the same version, which is
-# why the two are never a different build of dist.
-#
-# Keep this in step with cargo-dist-version in Cargo.toml. Renovate treats
-# both as the same dependency and bumps them in one pull request, so they
-# cannot drift apart by neglect.
-ARG CARGO_DIST_VERSION=0.32.0
-# Downloaded to a file rather than piped straight into sh: a pipeline reports
-# only its last command's status, and sh succeeds on empty input, so a failed
-# download would otherwise bake — and cache — an image with no dist in it.
-# `dist --version` then proves the binary landed and is on PATH.
-RUN set -eux; \
-    base=https://github.com/axodotdev/cargo-dist/releases/download; \
-    curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/dist-installer.sh \
-        "${base}/v${CARGO_DIST_VERSION}/cargo-dist-installer.sh"; \
-    sh /tmp/dist-installer.sh; \
-    rm /tmp/dist-installer.sh; \
-    dist --version
 
 WORKDIR /work
