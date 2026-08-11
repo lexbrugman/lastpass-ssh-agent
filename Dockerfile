@@ -7,8 +7,9 @@ FROM rust:1-slim
 
 # git: build.rs stamps the binary with the current commit.
 # curl + ca-certificates: fetching the cargo-llvm-cov release binary below.
-# xz-utils: this project's releases are .tar.xz, and tar cannot unpack one
-# without it — for inspecting a published archive from the dev shell.
+# xz-utils: releases are .tar.xz and tar cannot write or read one without it.
+# packaging/test-archive.sh builds a real archive in the gate, so this is not
+# optional here.
 # ruby: only to syntax-check the generated Homebrew formula. It is built by
 # substituting into a template, so a broken edit produces a file that looks
 # fine and fails at `brew install`; `ruby -c` catches that in the gate.

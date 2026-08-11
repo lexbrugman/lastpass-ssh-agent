@@ -9,6 +9,8 @@ echo "== rustfmt"
 cargo fmt --check
 echo "== clippy (pedantic + nursery, warnings are errors)"
 cargo clippy --all-targets -- -D warnings
+echo "== release archive"
+./packaging/test-archive.sh
 echo "== homebrew formula generator"
 ./packaging/homebrew/test-generate-formula.sh
 echo "== tests (instrumented; 100% line+branch coverage required)"

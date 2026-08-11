@@ -259,6 +259,11 @@ Four invariants hold it together, and each is load-bearing:
   drafts for exactly this reason.
 - **The formula is published last.** It points at the release's download URLs,
   which do not resolve until the release leaves draft.
+- **The archive's shape is a contract**, and one nothing notices breaking until
+  an install fails: files at the root with no wrapping directory, and a
+  `<hash> *<name>` checksum beside each. Both live in `packaging/archive.sh`
+  with `test-archive.sh` in the gate, rather than in workflow steps that only
+  ever run during a release.
 
 The one credential is `TAP_DEPLOY_KEY`, and only because the tap is a different
 repository — `GITHUB_TOKEN` cannot write to one. Without it a release still

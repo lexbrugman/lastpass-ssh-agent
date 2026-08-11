@@ -54,25 +54,14 @@ jobs:
           LASTPASS_SSH_AGENT_VERSION: ${{ inputs.version }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # Layout and checksum format are what the formula and the publish step
+      # depend on, and neither shows up as wrong until an install fails, so
+      # the rules live in a script the gate exercises rather than here.
       - name: Package
         run: |
-          archive="lastpass-ssh-agent-${{ matrix.target }}.tar.xz"
-          staging="$(mktemp -d)"
-          cp "target/${{ matrix.target }}/release/lastpass-ssh-agent" "$staging/"
-          cp README.md "$staging/"
-          mkdir -p dist
-          # entries at the archive root, no wrapping directory: the formula
-          # installs the binary straight out of the staged extraction
-          tar -cJf "dist/$archive" -C "$staging" lastpass-ssh-agent README.md
-          cd dist
-          # "<hash> *<name>" — the shape generate-formula.sh parses and
-          # `sha256sum -c` accepts. The two platforms ship different tools.
-          if command -v sha256sum > /dev/null; then
-              sha256sum -b "$archive" > "$archive.sha256"
-          else
-              shasum -a 256 -b "$archive" > "$archive.sha256"
-          fi
-          cat "$archive.sha256"
+          ./packaging/archive.sh "${{ matrix.target }}" dist \
+              "target/${{ matrix.target }}/release/lastpass-ssh-agent" \
+              README.md
 
       - uses: actions/upload-artifact@v7.0.1
         with:
