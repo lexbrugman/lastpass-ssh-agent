@@ -261,15 +261,21 @@ Without the secret the formula is simply attached to each release instead.
 
 ## Dependencies
 
-Updates come from [Renovate](https://docs.renovatebot.com) — install the app
-on the repository and `.github/renovate.json5` governs it. There is no
-dependency dashboard issue. Crate and action updates are grouped and run
-weekly, because every merge to `master` publishes a release; new versions
-have to be five days old before they are proposed.
+Updates come from [Renovate](https://docs.renovatebot.com); install the app
+on the repository and `renovate.json` governs it. That file is plain JSON and
+cannot explain itself, so its two exclusions are documented here:
 
-Renovate deliberately does not touch `.github/workflows/release.yml`: dist
-generates it and verifies it byte-for-byte at release time, so an edit there
-would fail the release.
+- **`.github/workflows/release.yml` is off-limits.** dist generates that file
+  and verifies it byte-for-byte at release time, so a bumped action version
+  there fails every release until it is regenerated.
+- **`ssh-key` major and minor updates are off.** It is pinned to 0.6.x
+  because `ssh-agent-lib` depends on `^0.6`; a 0.7 pull request cannot build
+  until that moves first, so Renovate would only reopen a failing one.
+
+Renovate targets `dev` (`"baseBranches"`), not `master`. That matters here:
+every merge to `master` publishes a release, so pointing it at `master`
+would ship a release per dependency bump. Updates instead accumulate on
+`dev` and go out when you promote it.
 
 ## Development
 
