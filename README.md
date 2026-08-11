@@ -306,9 +306,9 @@ stays offline and hermetic — its result depends on a database fetched over
 the network and changes without the code changing, so a local run could fail
 for reasons that have nothing to do with your edit.
 
-Compiling is left to dist so it happens once. Pull requests build all four
-release targets through it (`pr-run-mode = "upload"`), which is what catches
-a cross-compilation break before merge rather than at release time.
+The generated dist workflow skips pull requests (`pr-run-mode = "skip"`), so
+ordinary branch pushes run only `CI`; the release workflow starts when the
+master gate explicitly dispatches it.
 
 Tests always run instrumented, so "the tests pass" means every test passed
 *and* every line and branch of production code was covered — anything less
