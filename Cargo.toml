@@ -20,7 +20,7 @@ rsa = { version = "0.9", features = ["sha2"] }
 # would otherwise compile only because ssh-key's own feature set happens to
 # turn it on, which is no basis for a security mitigation.
 rand_core = { version = "0.6", features = ["getrandom"] }
-signature = "2"
+signature = "3"
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "io-util", "time", "signal"] }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
