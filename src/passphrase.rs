@@ -11,6 +11,13 @@
 //! `Zeroizing` buffers and are wiped when the signature is done.
 
 mod askpass;
+// Excluded from coverage as a whole, which is the point of it being this
+// small: every line in it talks to the real Keychain of whoever runs the
+// tests, and the suite must never do that. The rules around these calls are
+// covered through `PassphraseStore` fakes on every platform.
+#[cfg(target_os = "macos")]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod keychain;
 mod osascript;
 mod tty;
 
@@ -170,45 +177,203 @@ pub trait PassphrasePrompt: Send + Sync {
     async fn prompt(&self, request: &PassphraseRequest) -> Result<Zeroizing<Vec<u8>>, PromptError>;
 }
 
-/// The `Passphrase` field first, the configured fallback only if it is empty.
+/// Somewhere a verified passphrase can be kept between signatures, keyed by
+/// the key's own fingerprint.
 ///
-/// Returns the error text the signing path reports; it never contains key
-/// material.
-pub async fn resolve(
-    lpass: &dyn LpassClient,
-    prompt: &dyn PassphrasePrompt,
-    entry: &KeyEntry,
-) -> Result<Zeroizing<Vec<u8>>, String> {
-    let stored: Zeroizing<Vec<u8>> = lpass
-        .show_field(&entry.item_id, "Passphrase")
-        .await
-        .map_err(|e| format!("fetching passphrase: {e}"))?;
+/// A store holds *only* passphrases. The private key never goes near it: it
+/// stays in the vault, fetched per signature, and this exists so the second
+/// signature does not have to ask the user again.
+///
+/// Deliberately not macOS-only, even though the Keychain is the only
+/// implementation. Keeping the mechanism portable is what lets every rule
+/// around it — prefer the vault, verify before saving, re-ask when a saved
+/// passphrase stops working — be tested on any platform, leaving only the
+/// dozen lines that actually call Apple's API behind a `cfg`.
+#[async_trait::async_trait]
+pub trait PassphraseStore: Send + Sync {
+    /// The passphrase saved for this fingerprint, if there is one.
+    async fn get(&self, fingerprint: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String>;
+    /// Save (or replace) the passphrase for this fingerprint.
+    async fn set(&self, fingerprint: &str, secret: &[u8]) -> Result<(), String>;
+}
 
-    // Not trimmed: a passphrase may legitimately begin or end with a space,
-    // and trimming one to nothing would silently divert to the fallback.
-    if !stored.is_empty() {
-        tracing::debug!(item = %entry.item_id, source = "lastpass", "passphrase resolved");
-        return Ok(stored);
+/// Turns the encrypted key the vault handed over into one that can sign.
+///
+/// Owning the decryption is the point: "is this passphrase right?" is the same
+/// question as "did the key decrypt?", and a saved passphrase must never be
+/// written before that question is answered.
+pub struct Unlocker {
+    lpass: std::sync::Arc<dyn LpassClient>,
+    prompt: std::sync::Arc<dyn PassphrasePrompt>,
+    store: std::sync::Arc<dyn PassphraseStore>,
+}
+
+impl Unlocker {
+    pub fn new(
+        lpass: std::sync::Arc<dyn LpassClient>,
+        prompt: std::sync::Arc<dyn PassphrasePrompt>,
+    ) -> Self {
+        Self::with_store(lpass, prompt, default_store())
     }
 
-    match entry.passphrase_fallback {
-        // Word-for-word what the agent said before a fallback existed, so
-        // configuring this mode reproduces the old behaviour exactly.
-        PassphraseFallback::Error => Err(
-            "private key is passphrase-protected but the item's Passphrase field is empty".into(),
-        ),
-        PassphraseFallback::Prompt => {
-            let request = PassphraseRequest::new(entry);
-            let typed = prompt.prompt(&request).await.map_err(|e| format!("{e}"))?;
-            if typed.is_empty() {
-                // An encrypted key cannot have an empty passphrase, so this
-                // is a stray return keypress rather than an answer. Saying so
-                // beats a bare "decrypting private key failed".
-                return Err("no passphrase entered".into());
-            }
-            tracing::debug!(item = %entry.item_id, source = "prompt", "passphrase resolved");
-            Ok(typed)
+    /// Tests substitute an in-memory store for the platform's real one.
+    pub fn with_store(
+        lpass: std::sync::Arc<dyn LpassClient>,
+        prompt: std::sync::Arc<dyn PassphrasePrompt>,
+        store: std::sync::Arc<dyn PassphraseStore>,
+    ) -> Self {
+        Self {
+            lpass,
+            prompt,
+            store,
         }
+    }
+
+    /// Decrypt `encrypted`, taking the passphrase from the vault if it is
+    /// there and from the configured fallback if it is not.
+    ///
+    /// The error text is what the signing path reports; it never contains key
+    /// material.
+    pub async fn unlock(
+        &self,
+        entry: &KeyEntry,
+        encrypted: &ssh_key::PrivateKey,
+    ) -> Result<ssh_key::PrivateKey, String> {
+        let stored: Zeroizing<Vec<u8>> = self
+            .lpass
+            .show_field(&entry.item_id, "Passphrase")
+            .await
+            .map_err(|e| format!("fetching passphrase: {e}"))?;
+
+        // Not trimmed: a passphrase may legitimately begin or end with a
+        // space, and trimming one to nothing would silently divert to the
+        // fallback.
+        if !stored.is_empty() {
+            tracing::debug!(item = %entry.item_id, source = "lastpass", "passphrase resolved");
+            // Authoritative. A wrong value fails the signature here rather
+            // than falling through, or anything able to draw a prompt could
+            // override a passphrase the vault pins.
+            return decrypt(encrypted, &stored);
+        }
+
+        match entry.passphrase_fallback {
+            // Word-for-word what the agent said before a fallback existed, so
+            // configuring this mode reproduces the old behaviour exactly.
+            PassphraseFallback::Error => Err(
+                "private key is passphrase-protected but the item's Passphrase field is empty"
+                    .into(),
+            ),
+            PassphraseFallback::Prompt => {
+                let typed = self.ask(entry).await?;
+                decrypt(encrypted, &typed)
+            }
+            PassphraseFallback::Keychain => self.unlock_from_store(entry, encrypted).await,
+        }
+    }
+
+    /// Ask the user, rejecting an answer that cannot be a passphrase.
+    async fn ask(&self, entry: &KeyEntry) -> Result<Zeroizing<Vec<u8>>, String> {
+        let typed = self
+            .prompt
+            .prompt(&PassphraseRequest::new(entry))
+            .await
+            .map_err(|e| format!("{e}"))?;
+        if typed.is_empty() {
+            // An encrypted key cannot have an empty passphrase, so this is a
+            // stray return keypress rather than an answer. Saying so beats a
+            // bare "decrypting private key failed".
+            return Err("no passphrase entered".into());
+        }
+        tracing::debug!(item = %entry.item_id, source = "prompt", "passphrase resolved");
+        Ok(typed)
+    }
+
+    /// Try what was saved for this key; ask, verify and save if that fails.
+    async fn unlock_from_store(
+        &self,
+        entry: &KeyEntry,
+        encrypted: &ssh_key::PrivateKey,
+    ) -> Result<ssh_key::PrivateKey, String> {
+        let fingerprint = entry.fingerprint();
+        match self.store.get(&fingerprint).await {
+            // Nothing this agent saved can be over the cap, so a value that is
+            // did not come from here. Refused rather than used — and the cap is
+            // enforced on this side because a store is an outside system whose
+            // contents are not ours to trust.
+            Ok(Some(saved)) if saved.len() > MAX_PASSPHRASE_BYTES => {
+                tracing::warn!(key = %fingerprint,
+                    "the saved passphrase is longer than a passphrase can be — ignoring it");
+            }
+            Ok(Some(saved)) => {
+                if let Ok(key) = encrypted.decrypt(&*saved) {
+                    tracing::debug!(item = %entry.item_id, source = "store",
+                        "passphrase resolved");
+                    return Ok(key);
+                }
+                // The key was replaced, or this entry belongs to an older one.
+                // Asking again is the only way out: retrying a value that
+                // cannot work would lock the key permanently.
+                tracing::info!(key = %fingerprint,
+                    "the saved passphrase no longer decrypts this key — asking again");
+            }
+            Ok(None) => {
+                tracing::debug!(key = %fingerprint, "no passphrase saved for this key yet");
+            }
+            // A store that cannot be read is not a reason to refuse the
+            // signature: asking is always available as a way through.
+            Err(e) => tracing::warn!(key = %fingerprint, "cannot read the saved passphrase: {e}"),
+        }
+
+        let typed = self.ask(entry).await?;
+        // Verified first. A typo must never become a saved credential, which
+        // is why decryption happens here and not after this function returns.
+        let key = decrypt(encrypted, &typed)?;
+        if let Err(e) = self.store.set(&fingerprint, &typed).await {
+            // The signature can still go ahead; failing it because the
+            // passphrase could not be remembered would be worse than asking
+            // again next time.
+            tracing::warn!(key = %fingerprint, "cannot save the passphrase: {e}");
+        } else {
+            tracing::info!(key = %fingerprint, "saved this key's passphrase");
+        }
+        Ok(key)
+    }
+}
+
+fn decrypt(encrypted: &ssh_key::PrivateKey, secret: &[u8]) -> Result<ssh_key::PrivateKey, String> {
+    encrypted
+        .decrypt(secret)
+        .map_err(|e| format!("decrypting private key: {e}"))
+}
+
+/// The platform's passphrase store.
+#[cfg(target_os = "macos")]
+fn default_store() -> std::sync::Arc<dyn PassphraseStore> {
+    std::sync::Arc::new(keychain::Keychain)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_store() -> std::sync::Arc<dyn PassphraseStore> {
+    std::sync::Arc::new(NoStore)
+}
+
+/// There is nowhere to save a passphrase off macOS.
+///
+/// A running agent never reaches this: `passphrase_fallback = "keychain"` is
+/// refused at config load on these platforms. It exists because an unreadable
+/// store already means "ask instead", so the portable rules stay honest here
+/// rather than depending on a store that cannot fail.
+#[cfg(not(target_os = "macos"))]
+struct NoStore;
+
+#[cfg(not(target_os = "macos"))]
+#[async_trait::async_trait]
+impl PassphraseStore for NoStore {
+    async fn get(&self, _fingerprint: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+        Err("this platform has no passphrase store".into())
+    }
+    async fn set(&self, _fingerprint: &str, _secret: &[u8]) -> Result<(), String> {
+        Err("this platform has no passphrase store".into())
     }
 }
 
@@ -277,18 +442,29 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::lpass::mock::MockLpass;
-    use std::sync::Mutex;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
-    const ED25519_PUB: &str = include_str!("../tests/fixtures/ed25519.pub");
+    const ED25519_PW: &str = include_str!("../tests/fixtures/ed25519_pw");
+    const ED25519_PW_PUB: &str = include_str!("../tests/fixtures/ed25519_pw.pub");
+    const RIGHT: &[u8] = b"fixture-passphrase";
+    const WRONG: &[u8] = b"not the passphrase";
 
     fn entry(fallback: PassphraseFallback) -> KeyEntry {
         KeyEntry {
             item_id: "1".into(),
             name: "pw key".into(),
-            public: ssh_key::PublicKey::from_openssh(ED25519_PUB.trim()).unwrap(),
+            public: ssh_key::PublicKey::from_openssh(ED25519_PW_PUB.trim()).unwrap(),
             confirm: false,
             passphrase_fallback: fallback,
         }
+    }
+
+    /// The encrypted key as the vault hands it over.
+    fn encrypted() -> ssh_key::PrivateKey {
+        let key = ssh_key::PrivateKey::from_openssh(ED25519_PW).unwrap();
+        assert!(key.is_encrypted(), "the fixture must be encrypted");
+        key
     }
 
     /// An item whose `Passphrase` field exists but holds nothing — the one
@@ -297,8 +473,11 @@ mod tests {
         MockLpass::logged_in().with_field("1", "Passphrase", b"")
     }
 
-    /// Answers with a fixed secret and records every call, so a test can
-    /// prove the prompt was or was not consulted.
+    fn vault_holding(secret: &[u8]) -> MockLpass {
+        MockLpass::logged_in().with_field("1", "Passphrase", secret)
+    }
+
+    /// Answers with a fixed secret and counts how often it was asked.
     #[derive(Default)]
     struct FakePrompt {
         answer: Option<Vec<u8>>,
@@ -307,19 +486,22 @@ mod tests {
     }
 
     impl FakePrompt {
-        fn answering(secret: &[u8]) -> Self {
-            Self {
+        fn answering(secret: &[u8]) -> Arc<Self> {
+            Arc::new(Self {
                 answer: Some(secret.to_vec()),
                 ..Self::default()
-            }
+            })
         }
-        fn failing(error: PromptError) -> Self {
-            Self {
+        fn failing(error: PromptError) -> Arc<Self> {
+            Arc::new(Self {
                 error: Some(error),
                 ..Self::default()
-            }
+            })
         }
-        fn call_count(&self) -> usize {
+        fn silent() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+        fn calls(&self) -> usize {
             self.calls.lock().unwrap().len()
         }
     }
@@ -340,94 +522,248 @@ mod tests {
         }
     }
 
+    /// An in-memory stand-in for the Keychain, so no test touches the real one.
+    #[derive(Default)]
+    struct FakeStore {
+        saved: Mutex<HashMap<String, Vec<u8>>>,
+        fail_get: bool,
+        fail_set: bool,
+        reads: Mutex<usize>,
+        writes: Mutex<usize>,
+    }
+
+    impl FakeStore {
+        fn empty() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+        fn holding(secret: &[u8]) -> Arc<Self> {
+            let store = Self::default();
+            store.saved.lock().unwrap().insert(
+                entry(PassphraseFallback::Keychain).fingerprint(),
+                secret.to_vec(),
+            );
+            Arc::new(store)
+        }
+        fn unreadable() -> Arc<Self> {
+            Arc::new(Self {
+                fail_get: true,
+                ..Self::default()
+            })
+        }
+        fn unwritable() -> Arc<Self> {
+            Arc::new(Self {
+                fail_set: true,
+                ..Self::default()
+            })
+        }
+        fn contents(&self) -> Option<Vec<u8>> {
+            self.saved
+                .lock()
+                .unwrap()
+                .get(&entry(PassphraseFallback::Keychain).fingerprint())
+                .cloned()
+        }
+        fn writes(&self) -> usize {
+            *self.writes.lock().unwrap()
+        }
+        fn reads(&self) -> usize {
+            *self.reads.lock().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PassphraseStore for FakeStore {
+        async fn get(&self, fingerprint: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+            *self.reads.lock().unwrap() += 1;
+            if self.fail_get {
+                return Err("keychain unavailable".into());
+            }
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .get(fingerprint)
+                .map(|secret| Zeroizing::new(secret.clone())))
+        }
+        async fn set(&self, fingerprint: &str, secret: &[u8]) -> Result<(), String> {
+            *self.writes.lock().unwrap() += 1;
+            if self.fail_set {
+                return Err("keychain is locked".into());
+            }
+            self.saved
+                .lock()
+                .unwrap()
+                .insert(fingerprint.to_string(), secret.to_vec());
+            Ok(())
+        }
+    }
+
+    fn unlocker(lpass: MockLpass, prompt: Arc<FakePrompt>, store: Arc<FakeStore>) -> Unlocker {
+        Unlocker::with_store(Arc::new(lpass), prompt, store)
+    }
+
+    /// The decrypted key must be the one the fixture's public half names.
+    fn assert_unlocked(key: &ssh_key::PrivateKey) {
+        assert!(!key.is_encrypted());
+        assert_eq!(
+            key.public_key().key_data(),
+            ssh_key::PublicKey::from_openssh(ED25519_PW_PUB.trim())
+                .unwrap()
+                .key_data()
+        );
+    }
+
     #[tokio::test]
-    async fn a_populated_field_wins_and_never_prompts() {
-        // The precedence rule: LastPass is authoritative, so no fallback runs.
-        for fallback in [PassphraseFallback::Prompt, PassphraseFallback::Error] {
-            let lpass = MockLpass::logged_in().with_field("1", "Passphrase", b"from-vault");
-            let prompt = FakePrompt::answering(b"from-prompt");
-            let resolved = resolve(&lpass, &prompt, &entry(fallback)).await.unwrap();
-            assert_eq!(&*resolved, b"from-vault");
-            assert_eq!(prompt.call_count(), 0, "{fallback:?} must not prompt");
+    async fn a_populated_field_wins_and_no_fallback_runs() {
+        // The precedence rule, for every mode: LastPass is authoritative, so
+        // neither the prompt nor the store is consulted at all.
+        for fallback in [
+            PassphraseFallback::Prompt,
+            PassphraseFallback::Error,
+            PassphraseFallback::Keychain,
+        ] {
+            let prompt = FakePrompt::answering(WRONG);
+            let store = FakeStore::holding(WRONG);
+            let unlocker = unlocker(vault_holding(RIGHT), prompt.clone(), store.clone());
+            let key = unlocker
+                .unlock(&entry(fallback), &encrypted())
+                .await
+                .unwrap();
+            assert_unlocked(&key);
+            assert_eq!(prompt.calls(), 0, "{fallback:?} must not prompt");
+            assert_eq!(store.reads(), 0, "{fallback:?} must not read the store");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_field_fails_without_reaching_any_fallback() {
+        // Fallback happens on absence, never on failure. Otherwise a local
+        // prompt or a planted store entry could override what the vault pins.
+        for fallback in [PassphraseFallback::Prompt, PassphraseFallback::Keychain] {
+            let prompt = FakePrompt::answering(RIGHT);
+            let store = FakeStore::holding(RIGHT);
+            let unlocker = unlocker(vault_holding(WRONG), prompt.clone(), store.clone());
+            let error = unlocker
+                .unlock(&entry(fallback), &encrypted())
+                .await
+                .unwrap_err();
+            assert!(error.starts_with("decrypting private key:"), "{error}");
+            assert_eq!(prompt.calls(), 0, "{fallback:?}");
+            assert_eq!(store.reads(), 0, "{fallback:?}");
         }
     }
 
     #[tokio::test]
     async fn a_field_of_only_spaces_is_a_passphrase_not_an_absence() {
         // Trimming would divert a legitimate passphrase to the fallback.
-        let lpass = MockLpass::logged_in().with_field("1", "Passphrase", b"  ");
-        let prompt = FakePrompt::answering(b"from-prompt");
-        let resolved = resolve(&lpass, &prompt, &entry(PassphraseFallback::Prompt))
+        let prompt = FakePrompt::answering(RIGHT);
+        let unlocker = unlocker(vault_holding(b"  "), prompt.clone(), FakeStore::empty());
+        // wrong passphrase, so it fails — but as a decryption failure, which
+        // proves the field was used rather than skipped
+        let error = unlocker
+            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
             .await
-            .unwrap();
-        assert_eq!(&*resolved, b"  ");
-        assert_eq!(prompt.call_count(), 0);
+            .unwrap_err();
+        assert!(error.starts_with("decrypting private key:"), "{error}");
+        assert_eq!(prompt.calls(), 0);
     }
 
     #[tokio::test]
-    async fn an_empty_field_with_error_mode_keeps_the_original_message() {
-        let lpass = empty_field();
-        let prompt = FakePrompt::answering(b"from-prompt");
-        let error = resolve(&lpass, &prompt, &entry(PassphraseFallback::Error))
+    async fn error_mode_keeps_the_original_message() {
+        let prompt = FakePrompt::answering(RIGHT);
+        let unlocker = unlocker(empty_field(), prompt.clone(), FakeStore::empty());
+        let error = unlocker
+            .unlock(&entry(PassphraseFallback::Error), &encrypted())
             .await
             .unwrap_err();
         assert_eq!(
             error,
             "private key is passphrase-protected but the item's Passphrase field is empty"
         );
-        assert_eq!(prompt.call_count(), 0);
+        assert_eq!(prompt.calls(), 0);
     }
 
     #[tokio::test]
-    async fn an_empty_field_with_prompt_mode_asks_and_shows_which_key() {
-        let lpass = empty_field();
-        let prompt = FakePrompt::answering(b"typed");
-        let resolved = resolve(&lpass, &prompt, &entry(PassphraseFallback::Prompt))
+    async fn prompt_mode_asks_shows_the_key_and_unlocks() {
+        let prompt = FakePrompt::answering(RIGHT);
+        let unlocker = unlocker(empty_field(), prompt.clone(), FakeStore::empty());
+        let key = unlocker
+            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
             .await
             .unwrap();
-        assert_eq!(&*resolved, b"typed");
+        assert_unlocked(&key);
         let shown = &prompt.calls.lock().unwrap()[0];
         assert!(shown.contains("pw key"), "{shown}");
         assert!(shown.contains("SHA256:"), "{shown}");
     }
 
     #[tokio::test]
-    async fn a_cancelled_prompt_and_an_unavailable_one_report_differently() {
-        let lpass = empty_field();
-        let cancelled = resolve(
-            &lpass,
-            &FakePrompt::failing(PromptError::Cancelled),
-            &entry(PassphraseFallback::Prompt),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(cancelled, "passphrase entry cancelled");
+    async fn prompt_mode_never_saves_what_was_typed() {
+        let store = FakeStore::empty();
+        let unlocker = unlocker(empty_field(), FakePrompt::answering(RIGHT), store.clone());
+        unlocker
+            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+            .await
+            .unwrap();
+        assert_eq!(store.writes(), 0, "prompt mode persists nothing");
+    }
 
-        let unavailable = resolve(
-            &lpass,
-            &FakePrompt::failing(PromptError::Unavailable("no tty".into())),
-            &entry(PassphraseFallback::Prompt),
-        )
-        .await
-        .unwrap_err();
-        assert!(unavailable.contains("no interactive passphrase prompt"));
-        assert!(unavailable.contains("no tty"));
+    #[tokio::test]
+    async fn a_wrongly_typed_passphrase_fails() {
+        let unlocker = unlocker(
+            empty_field(),
+            FakePrompt::answering(WRONG),
+            FakeStore::empty(),
+        );
+        let error = unlocker
+            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("decrypting private key:"), "{error}");
+    }
 
-        let too_long = resolve(
-            &lpass,
-            &FakePrompt::failing(PromptError::TooLong(1024)),
-            &entry(PassphraseFallback::Prompt),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(too_long, "passphrase longer than 1024 bytes, refused");
+    #[tokio::test]
+    async fn each_way_a_prompt_can_fail_reports_differently() {
+        for (error, expected) in [
+            (PromptError::Cancelled, "passphrase entry cancelled"),
+            (
+                PromptError::TooLong(1024),
+                "passphrase longer than 1024 bytes, refused",
+            ),
+        ] {
+            let unlocker = unlocker(
+                empty_field(),
+                FakePrompt::failing(error),
+                FakeStore::empty(),
+            );
+            let reported = unlocker
+                .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+                .await
+                .unwrap_err();
+            assert_eq!(reported, expected);
+        }
+
+        let unlocker = unlocker(
+            empty_field(),
+            FakePrompt::failing(PromptError::Unavailable("no tty".into())),
+            FakeStore::empty(),
+        );
+        let reported = unlocker
+            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+            .await
+            .unwrap_err();
+        assert!(
+            reported.contains("no interactive passphrase prompt"),
+            "{reported}"
+        );
+        assert!(reported.contains("no tty"), "{reported}");
     }
 
     #[tokio::test]
     async fn an_empty_answer_is_rejected_rather_than_attempted() {
-        let lpass = empty_field();
-        let prompt = FakePrompt::default(); // answers with nothing
-        let error = resolve(&lpass, &prompt, &entry(PassphraseFallback::Prompt))
+        let unlocker = unlocker(empty_field(), FakePrompt::silent(), FakeStore::empty());
+        let error = unlocker
+            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
             .await
             .unwrap_err();
         assert_eq!(error, "no passphrase entered");
@@ -435,24 +771,174 @@ mod tests {
 
     #[tokio::test]
     async fn a_broken_field_fetch_fails_without_falling_back() {
-        // A vault that cannot answer is not the same as a vault that answers
-        // "empty" — only the latter hands over to the fallback.
+        // A vault that cannot answer is not a vault that answered "empty".
+        let prompt = FakePrompt::answering(RIGHT);
         let lpass = MockLpass::logged_in().with_broken_field("1", "Passphrase");
-        let prompt = FakePrompt::answering(b"typed");
-        let error = resolve(&lpass, &prompt, &entry(PassphraseFallback::Prompt))
+        let unlocker = unlocker(lpass, prompt.clone(), FakeStore::empty());
+        let error = unlocker
+            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
             .await
             .unwrap_err();
         assert!(error.starts_with("fetching passphrase:"), "{error}");
-        assert_eq!(prompt.call_count(), 0);
+        assert_eq!(prompt.calls(), 0);
     }
 
     #[tokio::test]
-    async fn no_prompt_refuses_every_request() {
-        let error = NoPrompt
-            .prompt(&PassphraseRequest::new(&entry(PassphraseFallback::Prompt)))
+    async fn a_saved_passphrase_unlocks_without_asking() {
+        // The whole point of the store: the second signature is silent.
+        let prompt = FakePrompt::answering(RIGHT);
+        let store = FakeStore::holding(RIGHT);
+        let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
+        let key = unlocker
+            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
             .await
-            .unwrap_err();
-        assert!(matches!(error, PromptError::Unavailable(_)));
+            .unwrap();
+        assert_unlocked(&key);
+        assert_eq!(prompt.calls(), 0, "a saved passphrase must not prompt");
+        assert_eq!(store.writes(), 0, "nothing changed, nothing to write");
+    }
+
+    #[tokio::test]
+    async fn nothing_saved_yet_asks_verifies_and_saves() {
+        let prompt = FakePrompt::answering(RIGHT);
+        let store = FakeStore::empty();
+        let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
+        let key = unlocker
+            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .await
+            .unwrap();
+        assert_unlocked(&key);
+        assert_eq!(prompt.calls(), 1);
+        assert_eq!(store.contents().as_deref(), Some(RIGHT));
+    }
+
+    #[tokio::test]
+    async fn a_typo_never_becomes_a_saved_passphrase() {
+        // Verify before persisting: the wrong answer must not be remembered,
+        // or the key would be locked behind it until someone cleared it.
+        let store = FakeStore::empty();
+        let unlocker = unlocker(empty_field(), FakePrompt::answering(WRONG), store.clone());
+        assert!(unlocker
+            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .await
+            .is_err());
+        assert_eq!(store.writes(), 0, "an unverified passphrase was saved");
+        assert_eq!(store.contents(), None);
+    }
+
+    #[tokio::test]
+    async fn a_saved_passphrase_that_stops_working_is_replaced() {
+        // A stale entry must not lock the key permanently: it is retried once,
+        // the user corrects it, and the correction overwrites it.
+        let prompt = FakePrompt::answering(RIGHT);
+        let store = FakeStore::holding(WRONG);
+        let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
+        let key = unlocker
+            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .await
+            .unwrap();
+        assert_unlocked(&key);
+        assert_eq!(prompt.calls(), 1, "a stale entry must ask, once");
+        assert_eq!(store.contents().as_deref(), Some(RIGHT), "not replaced");
+    }
+
+    #[tokio::test]
+    async fn a_stale_entry_with_no_correction_leaves_it_alone() {
+        let store = FakeStore::holding(WRONG);
+        let unlocker = unlocker(
+            empty_field(),
+            FakePrompt::failing(PromptError::Cancelled),
+            store.clone(),
+        );
+        assert_eq!(
+            unlocker
+                .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+                .await
+                .unwrap_err(),
+            "passphrase entry cancelled"
+        );
+        assert_eq!(store.contents().as_deref(), Some(WRONG), "left as it was");
+        assert_eq!(store.writes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_saved_value_too_long_to_be_a_passphrase_is_ignored() {
+        // Nothing this agent saves can exceed the cap, so a longer value was
+        // put there by something else and is not used.
+        let prompt = FakePrompt::answering(RIGHT);
+        let store = FakeStore::holding(&vec![b'x'; MAX_PASSPHRASE_BYTES + 1]);
+        let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
+        let key = unlocker
+            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .await
+            .unwrap();
+        assert_unlocked(&key);
+        assert_eq!(prompt.calls(), 1, "it must ask instead");
+        assert_eq!(store.contents().as_deref(), Some(RIGHT), "and replace it");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_store_asks_instead_of_refusing() {
+        // Losing the saved passphrase is an inconvenience, not a reason to
+        // refuse a signature the user can still authorise by typing it.
+        let prompt = FakePrompt::answering(RIGHT);
+        let store = FakeStore::unreadable();
+        let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
+        let key = unlocker
+            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .await
+            .unwrap();
+        assert_unlocked(&key);
+        assert_eq!(prompt.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_be_written_still_signs() {
+        let prompt = FakePrompt::answering(RIGHT);
+        let store = FakeStore::unwritable();
+        let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
+        let key = unlocker
+            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .await
+            .unwrap();
+        assert_unlocked(&key);
+        assert_eq!(store.writes(), 1, "it tried");
+        assert_eq!(store.contents(), None, "and failed");
+    }
+
+    #[tokio::test]
+    async fn the_stored_key_is_the_fingerprint_not_the_item() {
+        // So renaming the vault item, moving it, or recreating it still finds
+        // the same passphrase.
+        let store = FakeStore::empty();
+        // the same key, now living in a different item under a different name
+        let moved = MockLpass::logged_in().with_field("9999", "Passphrase", b"");
+        let unlocker = unlocker(moved, FakePrompt::answering(RIGHT), store.clone());
+        let mut renamed = entry(PassphraseFallback::Keychain);
+        renamed.name = "renamed since".into();
+        renamed.item_id = "9999".into();
+        unlocker.unlock(&renamed, &encrypted()).await.unwrap();
+        assert_eq!(
+            store.contents().as_deref(),
+            Some(RIGHT),
+            "the entry is keyed by fingerprint, so a rename finds it"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn without_a_platform_store_keychain_mode_falls_back_to_asking() {
+        // Config validation refuses this mode off macOS, so a running agent
+        // never gets here — but the default store must still behave, and an
+        // unreadable one means "ask".
+        let prompt = FakePrompt::answering(RIGHT);
+        let unlocker = Unlocker::new(Arc::new(empty_field()), prompt.clone());
+        let key = unlocker
+            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .await
+            .unwrap();
+        assert_unlocked(&key);
+        assert_eq!(prompt.calls(), 1);
     }
 
     #[test]

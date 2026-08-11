@@ -56,6 +56,68 @@ Platform-specific behaviour must use `#[cfg(...)]`, never a runtime
 each platform, so it can never be covered — while `#[cfg]` means the other
 platform has no such code to cover.
 
+## Keep the logic portable, gate only the adapter
+
+Whatever a platform makes different should be pushed to the smallest possible
+edge — a value to look up, an API to call — with every decision taken in code
+that compiles and runs everywhere.
+
+This is not only tidiness. Tests only ever run on the platform they are
+executed on, so anything behind a `cfg` is tested by one CI job and unverifiable
+from the other; a developer without a Mac cannot even compile macOS-gated code,
+let alone run it. Logic hidden behind a `cfg` is therefore logic that gets
+reviewed less, tested less, and broken more easily.
+
+The code already works this way, and these are the patterns to copy:
+
+- `platform::socket_dir_from` takes the runtime and home directories as
+  arguments and is pure, so both of its paths are exercised on every platform.
+  Only *which directory* to look in is `cfg`-selected.
+- `confirm::process_path` is a per-OS lookup of one string behind a portable
+  caller, so the prompt-building logic around it is tested everywhere.
+- `PassphraseStore` is a portable trait. Preferring the vault, verifying a
+  passphrase before saving it, and asking again when a saved one stops working
+  are all portable and fully tested; the macOS Keychain implementation behind
+  it is two calls and no decisions.
+
+If a `cfg` block contains a branch, a loop, or an error decision, it is
+probably in the wrong place.
+
+## Writing tests
+
+Stay on the built-in test runner. Parameterized cases are written as a shared
+body plus one named test per case, which keeps each case a single line while
+still giving it a name, an independent result, and a `cargo test <name>` filter:
+
+```rust
+async fn expect_answer(printed: &str, expected: &[u8]) {
+    …
+    assert_eq!(&*secret, expected, "helper ran `{printed}`");
+}
+
+#[tokio::test]
+async fn a_crlf_helper_does_not_leak_the_carriage_return() {
+    expect_answer("printf 'secret\r\n'", b"secret").await;
+}
+```
+
+That is the whole of what `rstest` or `test-case` would add, minus the
+dependency — and the diagnostics are better than a loop's, because a failing
+case is named rather than merely being the point where the loop stopped. (For
+the record: `test-case`'s last release was 2023, which is its own argument.)
+
+A `for` loop over a table is still right where the cases are cheap, pure and
+numerous — rejecting a list of malformed ids, escaping a list of strings. Name
+the case in the assertion message there, since a loop cannot.
+
+Keep a case out of either form when it exercises a different mechanism rather
+than a different input: a timeout, a crashed helper and a missing helper each
+deserve their own test even though all three "fail".
+
+Derive nothing from the input to build the expectation. A computed expected
+value is a second implementation of the thing under test, and it will agree
+with the bug — write both sides out literally.
+
 ## Test determinism
 
 Two races are easy to reintroduce, and both were flaky in CI before being
@@ -84,6 +146,15 @@ Private keys and passphrases follow the same discipline.
   capped and preallocated (`MAX_FIELD_BYTES`, `MAX_PASSPHRASE_BYTES`) and
   refuses oversized input rather than growing to fit it. A cap also bounds what
   a misbehaving subprocess can make the agent allocate.
+- The rule above governs **buffers this code allocates**. A dependency handing
+  back a secret in its own allocation (`security-framework` copies out of a
+  CoreFoundation buffer, for instance) is wrapped in `Zeroizing` at the
+  boundary and no further: reaching inside to wipe a library's intermediates
+  means hand-rolled FFI in exactly the place that is hardest to test. Zeroizing
+  shortens a secret's lifetime; it was never a defence against an attacker who
+  can already read this process's memory, and the threat model says so.
+- A value arriving *from* a store or a subprocess is checked against the cap on
+  our side, because its contents are not ours to trust.
 - A secret never appears in a log, a tracing field, argv, an environment
   variable, a temporary file, or an error message. Fingerprints, item ids and
   key names are safe context; prefer them.

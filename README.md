@@ -112,8 +112,8 @@ vault scan) or tuning behavior:
 # lpass_path = "/opt/homebrew/bin/lpass"
 
 # Where an encrypted key's passphrase comes from when the item's own
-# Passphrase field is empty. "prompt" (default) asks you, so the passphrase
-# need not be in the vault at all; "error" refuses to sign.
+# Passphrase field is empty. "prompt" (default) asks you every time;
+# "keychain" (macOS) asks once and remembers; "error" refuses to sign.
 # passphrase_fallback = "prompt"
 
 # Pin items (disables auto-discovery); `search` prints these snippets.
@@ -141,6 +141,31 @@ with `confirm = "off"` it uses the platform default, since silencing approval
 prompts does not mean you cannot be reached. Set
 `passphrase_fallback = "error"` to keep the pre-existing behavior, where an
 encrypted key with an empty `Passphrase` field simply refuses to sign.
+
+On macOS, `passphrase_fallback = "keychain"` asks once and remembers the
+answer, so the separation costs one prompt per key rather than one per
+session:
+
+```toml
+passphrase_fallback = "keychain"
+```
+
+The vault keeps the encrypted key; the Keychain keeps only the passphrase.
+Neither store holds both, so compromising either one alone yields nothing
+usable. It is stored as a generic-password item under the service
+`lastpass-ssh-agent`, with the key's SHA-256 fingerprint as the account — the
+fingerprint identifies the key itself, so renaming the vault item, moving it
+between folders or recreating it all still find the same passphrase. It is
+saved only *after* it has decrypted the key, so a typo never becomes a stored
+credential, and a stored passphrase that stops working prompts you to correct
+it rather than locking the key. The item uses the login keychain's ordinary
+protection, deliberately without a per-signature authorization dialog: the
+agent already asks you to approve each signature, and a second system prompt
+on top of that would make normal SSH use impractical.
+
+This mode is macOS-only and rejected at startup elsewhere. It never caches the
+private key — every signature still fetches, decrypts and discards it; the
+Keychain is a passphrase store, not a key store.
 
 Two properties are worth stating explicitly, because they are what stop a
 local prompt from becoming a way around the vault:

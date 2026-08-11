@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 use crate::confirm::{ConfirmContext, Confirmer, Decision, PeerInfo, SessionBinding};
 use crate::keystore::{KeyEntry, KeyStore};
 use crate::lpass::LpassClient;
-use crate::passphrase::{self, PassphrasePrompt};
+use crate::passphrase::Unlocker;
 use crate::signing;
 
 /// The agent proper. Holds no private-key material — only the public-key ->
@@ -22,9 +22,9 @@ pub struct LpassAgent {
     store: Arc<KeyStore>,
     lpass: Arc<dyn LpassClient>,
     confirmer: Arc<dyn Confirmer>,
-    /// Asks for a passphrase the vault does not hold. Reached only for an
-    /// encrypted key whose `Passphrase` field is empty.
-    prompt: Arc<dyn PassphrasePrompt>,
+    /// Decrypts the fetched key, resolving a passphrase the vault does not
+    /// hold. Reached only for an encrypted key.
+    unlocker: Arc<Unlocker>,
     /// One signing request at a time, shared by every connection.
     ///
     /// Confirmation and passphrase entry are separate transports with separate
@@ -57,13 +57,13 @@ impl LpassAgent {
         store: Arc<KeyStore>,
         lpass: Arc<dyn LpassClient>,
         confirmer: Arc<dyn Confirmer>,
-        prompt: Arc<dyn PassphrasePrompt>,
+        unlocker: Arc<Unlocker>,
     ) -> Self {
         Self {
             store,
             lpass,
             confirmer,
-            prompt,
+            unlocker,
             interaction: Arc::new(tokio::sync::Mutex::new(())),
             peer: None,
             bindings: Vec::new(),
@@ -160,21 +160,27 @@ impl LpassAgent {
 
         let mut key =
             PrivateKey::from_openssh(&*pem).map_err(|e| format!("parsing private key: {e}"))?;
+
+        // The vault item could have been edited since startup; never sign with
+        // a key other than the one we advertised.
+        //
+        // Checked before unlocking, which an OpenSSH key allows because it
+        // carries its public half in the clear even while encrypted. Doing it
+        // afterwards would mean asking for the passphrase of a replacement key
+        // this request is going to refuse anyway — and in `keychain` mode,
+        // saving that passphrase over the one belonging to the key still being
+        // advertised.
+        if key.public_key().key_data() != entry.public.key_data() {
+            return Err("private key does not match the advertised public key — vault item changed since startup?".into());
+        }
+
         // Only an encrypted key resolves a passphrase at all: an unencrypted
         // one never fetches the field, never prompts, and costs nothing.
         if key.is_encrypted() {
-            let passphrase: Zeroizing<Vec<u8>> =
-                passphrase::resolve(&*self.lpass, &*self.prompt, entry).await?;
-            key = key
-                .decrypt(&*passphrase)
-                .map_err(|e| format!("decrypting private key: {e}"))?;
-            // `passphrase` zeroizes here; only the decrypted key goes on.
-        }
-
-        // The vault item could have been edited since startup; never sign
-        // with a key other than the one we advertised.
-        if key.public_key().key_data() != entry.public.key_data() {
-            return Err("private key does not match the advertised public key — vault item changed since startup?".into());
+            // Decryption lives with the passphrase, because "is this the right
+            // passphrase?" and "did it decrypt?" are the same question — and a
+            // passphrase is only ever saved once that question is answered.
+            key = self.unlocker.unlock(entry, &key).await?;
         }
 
         signing::sign_with_key(&key, data, flags).map_err(|e| e.to_string())
@@ -272,7 +278,7 @@ mod tests {
     use crate::config::Config;
     use crate::confirm::NoConfirmer;
     use crate::lpass::mock::MockLpass;
-    use crate::passphrase::{NoPrompt, PassphraseRequest, PromptError};
+    use crate::passphrase::{NoPrompt, PassphrasePrompt, PassphraseRequest, PromptError};
     use signature::Verifier;
     use ssh_agent_lib::proto::signature as sigflag;
 
@@ -338,7 +344,14 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        LpassAgent::new(store, client, Arc::new(NoConfirmer), prompt)
+        let unlocker = Arc::new(Unlocker::new(client.clone(), prompt));
+        LpassAgent::new(store, client, Arc::new(NoConfirmer), unlocker)
+    }
+
+    /// The passphrase machinery wired to one prompt, for the direct
+    /// `LpassAgent::new` call sites.
+    fn unlocking(client: &Arc<MockLpass>, prompt: Arc<dyn PassphrasePrompt>) -> Arc<Unlocker> {
+        Arc::new(Unlocker::new(client.clone(), prompt))
     }
 
     fn sign_request(public: &str, data: &[u8], flags: u32) -> SignRequest {
@@ -450,8 +463,12 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let mut agent =
-            LpassAgent::new(store, client.clone(), Arc::new(DenyAll), Arc::new(NoPrompt));
+        let mut agent = LpassAgent::new(
+            store,
+            client.clone(),
+            Arc::new(DenyAll),
+            unlocking(&client, Arc::new(NoPrompt)),
+        );
 
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -479,8 +496,12 @@ mod tests {
                 .unwrap(),
         );
         let logged_out = Arc::new(MockLpass::default()); // logged_in: false
-        let mut agent =
-            LpassAgent::new(store, logged_out, Arc::new(NoConfirmer), Arc::new(NoPrompt));
+        let mut agent = LpassAgent::new(
+            store,
+            logged_out.clone(),
+            Arc::new(NoConfirmer),
+            unlocking(&logged_out, Arc::new(NoPrompt)),
+        );
 
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -491,17 +512,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatched_private_key_is_refused() {
+    async fn mismatched_private_key_is_refused_before_any_passphrase_is_asked_for() {
         // Vault item advertises the ed25519_pw public key but returns a
         // different private key (item edited after startup).
+        //
+        // The mismatch is caught before unlocking, which matters beyond
+        // tidiness: asking for the replacement key's passphrase would be a
+        // prompt for a signature that is refused regardless, and in `keychain`
+        // mode saving it would overwrite the passphrase of the key still being
+        // advertised.
+        let prompt = TypedPassphrase::new(b"fixture-passphrase");
         let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PW_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
-        let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
+            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            // encrypted, and a different key from the advertised one
+            .with_field("1", "Private Key", ED25519_PW.as_bytes());
+        let mut agent = agent_prompting(
+            client,
+            "confirm = \"off\"\n[[keys]]\nid = \"1\"",
+            prompt.clone(),
+        )
+        .await;
         assert!(agent
-            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+            .sign(sign_request(ED25519_PUB, b"payload", 0))
             .await
             .is_err());
+        assert!(
+            !prompt.was_asked(),
+            "a key we will not sign with must not be unlocked"
+        );
     }
 
     #[tokio::test]
@@ -746,14 +784,18 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let agent = LpassAgent::new(
-            store,
-            client,
-            Arc::new(WatchingConfirmer(watch.clone())),
+        let unlocker = unlocking(
+            &client,
             Arc::new(WatchingPrompt(
                 watch.clone(),
                 b"fixture-passphrase".to_vec(),
             )),
+        );
+        let agent = LpassAgent::new(
+            store,
+            client,
+            Arc::new(WatchingConfirmer(watch.clone())),
+            unlocker,
         );
 
         // two client connections, as separate sessions sharing the agent
@@ -784,8 +826,12 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let mut agent =
-            LpassAgent::new(store, client.clone(), Arc::new(NoConfirmer), prompt.clone());
+        let mut agent = LpassAgent::new(
+            store,
+            client.clone(),
+            Arc::new(NoConfirmer),
+            unlocking(&client, prompt.clone()),
+        );
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
             .await
@@ -886,7 +932,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        LpassAgent::new(store, client, confirmer, Arc::new(NoPrompt))
+        let unlocker = unlocking(&client, Arc::new(NoPrompt));
+        LpassAgent::new(store, client, confirmer, unlocker)
     }
 
     #[tokio::test]
@@ -1100,7 +1147,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let mut agent = LpassAgent::new(store, client, Arc::new(DenyAll), Arc::new(NoPrompt));
+        let unlocker = unlocking(&client, Arc::new(NoPrompt));
+        let mut agent = LpassAgent::new(store, client, Arc::new(DenyAll), unlocker);
 
         let response = agent
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))

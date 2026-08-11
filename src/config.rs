@@ -33,6 +33,9 @@ pub enum PassphraseFallback {
     /// Refuse to sign, which is what the agent did before this setting
     /// existed.
     Error,
+    /// Remember it in the macOS Keychain, asking only when it is not there
+    /// yet — or no longer works. macOS only; rejected at load elsewhere.
+    Keychain,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -178,7 +181,39 @@ impl Config {
                 "confirm_timeout_secs must be between 1 and {MAX_CONFIRM_TIMEOUT_SECS}"
             )));
         }
+        // Rejected at load rather than at the first signature, and rejected
+        // here rather than by refusing to parse the value: the mode is a
+        // perfectly meaningful thing to write in a config shared between
+        // machines, so it deserves an answer that names the platform instead
+        // of "unknown variant".
+        //
+        // The whole check is compiled out on macOS, where it can only ever be
+        // false. A runtime `cfg!` test would instead leave a branch that no
+        // test on either platform can take, which the coverage gate refuses.
+        #[cfg(not(target_os = "macos"))]
+        if self.uses_keychain() {
+            return Err(Error::ConfigInvalid(
+                "passphrase_fallback = \"keychain\" is only supported on macOS".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Whether any key would actually reach for the Keychain.
+    #[cfg(not(target_os = "macos"))]
+    fn uses_keychain(&self) -> bool {
+        // With no [[keys]] the agent discovers items and every one of them
+        // inherits the global setting, so that setting decides on its own.
+        if self.keys.is_empty() {
+            return self.passphrase_fallback == PassphraseFallback::Keychain;
+        }
+        // Otherwise only the effective per-key values matter: a global value
+        // every key overrides is never used, and rejecting a config for
+        // naming a mode it never reaches would be wrong — these settings
+        // replace rather than cap each other.
+        self.keys
+            .iter()
+            .any(|key| self.passphrase_fallback(key) == PassphraseFallback::Keychain)
     }
 
     /// Resolved socket path (config override or platform default).
@@ -393,11 +428,44 @@ id = "1"
             let config = parse(&format!("passphrase_fallback = {text:?}")).unwrap();
             assert_eq!(config.passphrase_fallback, expected);
         }
-        // an unimplemented mode must be refused at load rather than silently
-        // behaving like something else
-        assert!(parse("passphrase_fallback = \"keychain\"").is_err());
         assert!(parse("passphrase_fallback = \"Prompt\"").is_err());
         assert!(parse("passphrase_fallback = true").is_err());
+    }
+
+    /// `keychain` parses everywhere — it is a reasonable thing to write in a
+    /// config shared between machines — and is accepted or refused by platform
+    /// at load, never at the first signature.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn keychain_is_accepted_here() {
+        let config = parse("passphrase_fallback = \"keychain\"").unwrap();
+        assert_eq!(config.passphrase_fallback, PassphraseFallback::Keychain);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn keychain_is_refused_here_with_a_reason() {
+        // Globally, and per key, and per key even when the global setting is
+        // something this platform can do.
+        for text in [
+            "passphrase_fallback = \"keychain\"",
+            "passphrase_fallback = \"keychain\"\n[[keys]]\nid = \"1\"",
+            "[[keys]]\nid = \"1\"\npassphrase_fallback = \"keychain\"",
+            "passphrase_fallback = \"prompt\"\n[[keys]]\nid = \"1\"\npassphrase_fallback = \"keychain\"",
+        ] {
+            let error = parse(text).unwrap_err().to_string();
+            assert!(error.contains("only supported on macOS"), "{text}: {error}");
+        }
+        // and a config that never asks for it is unaffected
+        assert!(parse("passphrase_fallback = \"prompt\"\n[[keys]]\nid = \"1\"").is_ok());
+        // A global value every pinned key overrides is never reached, so it is
+        // not grounds for refusing the config.
+        assert!(parse(
+            "passphrase_fallback = \"keychain\"\n\
+             [[keys]]\nid = \"1\"\npassphrase_fallback = \"prompt\"\n\
+             [[keys]]\nid = \"2\"\npassphrase_fallback = \"error\""
+        )
+        .is_ok());
     }
 
     #[test]

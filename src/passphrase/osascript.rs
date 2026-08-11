@@ -173,49 +173,54 @@ mod tests {
         }
     }
 
+    /// Shared body, so each case below is one line and still named.
+    async fn expect_answer(printed: &str, expected: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = prompt_with(dir.path(), printed);
+        let secret = prompt.prompt(&request()).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&secret),
+            expected,
+            "stub ran `{printed}`"
+        );
+    }
+
     #[tokio::test]
     async fn the_typed_text_comes_back_without_its_newline() {
-        let dir = tempfile::tempdir().unwrap();
-        let prompt = prompt_with(dir.path(), "echo 'dialog secret'");
-        assert_eq!(&*prompt.prompt(&request()).await.unwrap(), b"dialog secret");
+        expect_answer("echo 'dialog secret'", "dialog secret").await;
     }
 
     #[tokio::test]
     async fn a_passphrase_containing_the_record_separator_survives() {
         // The reason the script returns only `text returned`: parsing a whole
         // dialog record would cut this passphrase in half.
+        expect_answer("echo 'a, text returned:b'", "a, text returned:b").await;
+    }
+
+    #[tokio::test]
+    async fn spaces_around_a_passphrase_belong_to_it() {
+        expect_answer("printf '  padded  \\n'", "  padded  ").await;
+    }
+
+    /// Both dismissals osascript reports, which arrive as the same -128.
+    async fn expect_cancelled(stderr: &str) {
         let dir = tempfile::tempdir().unwrap();
-        let prompt = prompt_with(dir.path(), "echo 'a, text returned:b'");
+        let prompt = prompt_with(dir.path(), &format!("echo '{stderr}' >&2; exit 1"));
         assert_eq!(
-            &*prompt.prompt(&request()).await.unwrap(),
-            b"a, text returned:b"
+            prompt.prompt(&request()).await.unwrap_err(),
+            PromptError::Cancelled,
+            "{stderr}"
         );
     }
 
     #[tokio::test]
     async fn the_cancel_button_is_a_cancellation() {
-        let dir = tempfile::tempdir().unwrap();
-        let prompt = prompt_with(
-            dir.path(),
-            "echo 'execution error: User canceled. (-128)' >&2; exit 1",
-        );
-        assert_eq!(
-            prompt.prompt(&request()).await.unwrap_err(),
-            PromptError::Cancelled
-        );
+        expect_cancelled("execution error: User canceled. (-128)").await;
     }
 
     #[tokio::test]
-    async fn giving_up_is_a_cancellation_too() {
-        let dir = tempfile::tempdir().unwrap();
-        let prompt = prompt_with(
-            dir.path(),
-            "echo 'execution error: passphrase entry timed out (-128)' >&2; exit 1",
-        );
-        assert_eq!(
-            prompt.prompt(&request()).await.unwrap_err(),
-            PromptError::Cancelled
-        );
+    async fn the_dialog_giving_up_is_a_cancellation_too() {
+        expect_cancelled("execution error: passphrase entry timed out (-128)").await;
     }
 
     #[tokio::test]

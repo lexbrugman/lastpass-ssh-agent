@@ -106,48 +106,43 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn stdout_is_the_passphrase_with_its_newline_stripped() {
+    /// Shared body for the cases below, so each stays one line and still gets
+    /// its own name in the test output.
+    async fn expect_answer(printed: &str, expected: &[u8]) {
         let dir = tempfile::tempdir().unwrap();
-        let prompt = AskpassPrompt::new(
-            helper(dir.path(), "echo 'typed secret'"),
-            Duration::from_secs(5),
-        );
+        let prompt = AskpassPrompt::new(helper(dir.path(), printed), Duration::from_secs(5));
         let secret = prompt.prompt(&request()).await.unwrap();
-        assert_eq!(&*secret, b"typed secret");
+        assert_eq!(
+            &*secret,
+            expected,
+            "helper ran `{printed}`, got {:?}",
+            String::from_utf8_lossy(&secret)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_trailing_newline_is_framing_not_passphrase() {
+        expect_answer("echo 'typed secret'", b"typed secret").await;
     }
 
     #[tokio::test]
     async fn a_crlf_helper_does_not_leak_the_carriage_return() {
-        let dir = tempfile::tempdir().unwrap();
-        let prompt = AskpassPrompt::new(
-            helper(dir.path(), "printf 'secret\\r\\n'"),
-            Duration::from_secs(5),
-        );
-        assert_eq!(&*prompt.prompt(&request()).await.unwrap(), b"secret");
+        expect_answer("printf 'secret\\r\\n'", b"secret").await;
     }
 
     #[tokio::test]
     async fn a_helper_that_prints_no_newline_is_taken_as_is() {
-        let dir = tempfile::tempdir().unwrap();
-        let prompt = AskpassPrompt::new(
-            helper(dir.path(), "printf 'no trailing newline'"),
-            Duration::from_secs(5),
-        );
-        assert_eq!(
-            &*prompt.prompt(&request()).await.unwrap(),
-            b"no trailing newline"
-        );
+        expect_answer("printf 'no trailing newline'", b"no trailing newline").await;
     }
 
     #[tokio::test]
-    async fn a_passphrase_with_inner_spaces_survives() {
-        let dir = tempfile::tempdir().unwrap();
-        let prompt = AskpassPrompt::new(
-            helper(dir.path(), "printf 'two words \\n'"),
-            Duration::from_secs(5),
-        );
-        assert_eq!(&*prompt.prompt(&request()).await.unwrap(), b"two words ");
+    async fn spaces_around_a_passphrase_belong_to_it() {
+        expect_answer("printf 'two words \\n'", b"two words ").await;
+    }
+
+    #[tokio::test]
+    async fn only_one_line_ending_is_ever_removed() {
+        expect_answer("printf 'secret\\n\\n'", b"secret\n").await;
     }
 
     #[tokio::test]

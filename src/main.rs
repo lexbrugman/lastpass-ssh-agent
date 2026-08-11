@@ -167,13 +167,16 @@ async fn start(config_path: &Path) -> Result<()> {
     }
 
     let confirmer = confirm::from_config(&config)?;
-    let prompt = passphrase::from_config(&config)?;
+    let unlocker = Arc::new(passphrase::Unlocker::new(
+        client.clone(),
+        passphrase::from_config(&config)?,
+    ));
     let socket_path = config.socket_path()?;
     let (listener, guard) = socket::bind(&socket_path)?;
     print_env(&socket_path);
 
     let factory = AgentFactory {
-        template: agent::LpassAgent::new(store, client, confirmer, prompt),
+        template: agent::LpassAgent::new(store, client, confirmer, unlocker),
     };
     let result = tokio::select! {
         result = ssh_agent_lib::agent::listen(listener, factory) => {
