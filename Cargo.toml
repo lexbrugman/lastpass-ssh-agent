@@ -15,7 +15,11 @@ async-trait = "0.1"
 # Pinned to 0.6.x: ssh-agent-lib depends on ssh-key ^0.6.
 ssh-key = { version = "0.6.7", features = ["ed25519", "rsa", "p256", "p384", "encryption"] }
 rsa = { version = "0.9", features = ["sha2"] }
-rand_core = "0.6"
+# `getrandom` is what defines OsRng, which signing.rs uses to blind the RSA
+# private-key operation. rand_core does not enable it by default — the build
+# would otherwise compile only because ssh-key's own feature set happens to
+# turn it on, which is no basis for a security mitigation.
+rand_core = { version = "0.6", features = ["getrandom"] }
 signature = "2"
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "io-util", "time", "signal"] }
 clap = { version = "4.5", features = ["derive"] }
