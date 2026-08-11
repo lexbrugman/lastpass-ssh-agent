@@ -1,11 +1,12 @@
 name: CI
 
 on:
-  # master is covered by release-on-master.yml, which gates the release on
-  # this same workflow
+  # Every branch except master, which release-on-master.yml covers by calling
+  # this workflow as its gate. Pushes rather than pull requests: a branch is
+  # pushed before any pull request exists for it, and checks attach to the
+  # commit, so they still show up on the pull request that follows.
   push:
-    branches: [dev]
-  pull_request:
+    branches-ignore: [master]
   # release-on-master.yml runs this before it releases anything
   workflow_call:
 
