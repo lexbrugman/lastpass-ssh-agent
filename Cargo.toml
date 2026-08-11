@@ -72,9 +72,9 @@ publish-jobs = ["./publish-homebrew-formula"]
 install-updater = false
 # releases are started by the master-push workflow, not by pushing a tag
 dispatch-releases = true
-# build every target on pull requests too, without publishing anything: a
-# cross-compilation break then shows up before merge rather than at release
-pr-run-mode = "upload"
+# dev pushes already run the full CI gate; do not start the separately named
+# release workflow for pull requests
+pr-run-mode = "skip"
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # the formula job attaches the formula to the release, which needs write
