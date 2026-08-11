@@ -210,7 +210,14 @@ Neither store holds both, so compromising either one alone yields nothing
 usable. It is stored as a generic-password item under the service
 `lastpass-ssh-agent`, with the key's SHA-256 fingerprint as the account — the
 fingerprint identifies the key itself, so renaming the vault item, moving it
-between folders or recreating it all still find the same passphrase. It is
+between folders or recreating it all still find the same passphrase.
+
+Every key gets its own item, keyed by its own fingerprint: several
+passphrase-protected keys can be remembered at once, each asked for once, and
+nothing about one key reaches another's entry. In Keychain Access they appear
+as separate `lastpass-ssh-agent` entries distinguished by account, so a single
+key's passphrase can be revoked by deleting just that one — the next signature
+with it asks again. It is
 saved only *after* it has decrypted the key, so a typo never becomes a stored
 credential, and a stored passphrase that stops working prompts you to correct
 it rather than locking the key. The item uses the login keychain's ordinary

@@ -33,6 +33,10 @@ pub struct Keychain;
 
 #[async_trait::async_trait]
 impl PassphraseStore for Keychain {
+    fn name(&self) -> &'static str {
+        "the macOS Keychain"
+    }
+
     async fn get(&self, fingerprint: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
         let account = fingerprint.to_string();
         // On the blocking pool, not the runtime: the agent runs on a single

@@ -191,9 +191,14 @@ pub trait PassphrasePrompt: Send + Sync {
 /// dozen lines that actually call Apple's API behind a `cfg`.
 #[async_trait::async_trait]
 pub trait PassphraseStore: Send + Sync {
-    /// The passphrase saved for this fingerprint, if there is one.
+    /// Where this keeps things, as a log message names it — "the macOS
+    /// Keychain". A log line saying a passphrase was kept somewhere is no use
+    /// to the reader without saying where, and worse than no use if they are
+    /// left to guess whether it means a file on disk.
+    fn name(&self) -> &'static str;
+    /// The passphrase remembered for this fingerprint, if there is one.
     async fn get(&self, fingerprint: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String>;
-    /// Save (or replace) the passphrase for this fingerprint.
+    /// Remember (or replace) the passphrase for this fingerprint.
     async fn set(&self, fingerprint: &str, secret: &[u8]) -> Result<(), String>;
 }
 
@@ -302,11 +307,12 @@ impl Unlocker {
             // contents are not ours to trust.
             Ok(Some(saved)) if saved.len() > MAX_PASSPHRASE_BYTES => {
                 tracing::warn!(key = %fingerprint,
-                    "the saved passphrase is longer than a passphrase can be — ignoring it");
+                    "ignoring a value in {} too long to be a passphrase",
+                    self.store.name());
             }
             Ok(Some(saved)) => {
                 if let Ok(key) = encrypted.decrypt(&*saved) {
-                    tracing::debug!(item = %entry.item_id, source = "store",
+                    tracing::debug!(item = %entry.item_id, source = self.store.name(),
                         "passphrase resolved");
                     return Ok(key);
                 }
@@ -314,27 +320,41 @@ impl Unlocker {
                 // Asking again is the only way out: retrying a value that
                 // cannot work would lock the key permanently.
                 tracing::info!(key = %fingerprint,
-                    "the saved passphrase no longer decrypts this key — asking again");
+                    "the passphrase in {} no longer decrypts this key — asking again",
+                    self.store.name());
             }
             Ok(None) => {
-                tracing::debug!(key = %fingerprint, "no passphrase saved for this key yet");
+                tracing::debug!(key = %fingerprint,
+                    "no passphrase stored in {} for this key yet", self.store.name());
             }
             // A store that cannot be read is not a reason to refuse the
             // signature: asking is always available as a way through.
-            Err(e) => tracing::warn!(key = %fingerprint, "cannot read the saved passphrase: {e}"),
+            Err(e) => tracing::warn!(key = %fingerprint,
+                "cannot read the passphrase from {}, asking instead: {e}",
+                self.store.name()),
         }
 
         let typed = self.ask(entry).await?;
-        // Verified first. A typo must never become a saved credential, which
+        // Verified first. A typo must never become a stored credential, which
         // is why decryption happens here and not after this function returns.
         let key = decrypt(encrypted, &typed)?;
         if let Err(e) = self.store.set(&fingerprint, &typed).await {
             // The signature can still go ahead; failing it because the
-            // passphrase could not be remembered would be worse than asking
-            // again next time.
-            tracing::warn!(key = %fingerprint, "cannot save the passphrase: {e}");
+            // passphrase could not be kept would be worse than asking again
+            // next time.
+            tracing::warn!(key = %fingerprint,
+                "could not store the passphrase in {}, so the next signature will ask \
+                 again: {e}",
+                self.store.name());
         } else {
-            tracing::info!(key = %fingerprint, "saved this key's passphrase");
+            // Says what was stored, where, and — the part that matters most to
+            // anyone reading a log — what was not. "saved this key's
+            // passphrase" invited the reader to assume the key itself had been
+            // written somewhere, which is the one thing this agent never does.
+            tracing::info!(key = %fingerprint,
+                "stored this key's passphrase in {} — the private key itself is never \
+                 stored, and is still fetched from LastPass for every signature",
+                self.store.name());
         }
         Ok(key)
     }
@@ -369,6 +389,10 @@ struct NoStore;
 #[cfg(not(target_os = "macos"))]
 #[async_trait::async_trait]
 impl PassphraseStore for NoStore {
+    fn name(&self) -> &'static str {
+        "no passphrase store"
+    }
+
     async fn get(&self, _fingerprint: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
         Err("this platform has no passphrase store".into())
     }
@@ -557,11 +581,13 @@ mod tests {
             })
         }
         fn contents(&self) -> Option<Vec<u8>> {
-            self.saved
-                .lock()
-                .unwrap()
-                .get(&entry(PassphraseFallback::Keychain).fingerprint())
-                .cloned()
+            self.saved_for(&entry(PassphraseFallback::Keychain).fingerprint())
+        }
+        fn saved_for(&self, fingerprint: &str) -> Option<Vec<u8>> {
+            self.saved.lock().unwrap().get(fingerprint).cloned()
+        }
+        fn entries(&self) -> usize {
+            self.saved.lock().unwrap().len()
         }
         fn writes(&self) -> usize {
             *self.writes.lock().unwrap()
@@ -573,6 +599,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PassphraseStore for FakeStore {
+        fn name(&self) -> &'static str {
+            "a test store"
+        }
+
         async fn get(&self, fingerprint: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
             *self.reads.lock().unwrap() += 1;
             if self.fail_get {
@@ -859,6 +889,72 @@ mod tests {
         );
         assert_eq!(store.contents().as_deref(), Some(WRONG), "left as it was");
         assert_eq!(store.writes(), 0);
+    }
+
+    /// Two keys keep two passphrases, each under its own fingerprint.
+    ///
+    /// The account a store is keyed by is the fingerprint, so nothing about one
+    /// key can reach another's entry. Worth pinning down: keying by item id or
+    /// by name instead would still pass every other test here while quietly
+    /// letting the second key overwrite the first's passphrase.
+    #[tokio::test]
+    async fn every_key_keeps_its_own_passphrase() {
+        let store = FakeStore::empty();
+        let mut keys = Vec::new();
+        for (item, secret) in [("1", &b"first-passphrase"[..]), ("2", b"second-passphrase")] {
+            let plain =
+                ssh_key::PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519)
+                    .unwrap();
+            let locked = plain.encrypt(&mut rand_core::OsRng, secret).unwrap();
+            let entry = KeyEntry {
+                item_id: item.into(),
+                name: format!("key {item}"),
+                public: plain.public_key().clone(),
+                confirm: false,
+                passphrase_fallback: PassphraseFallback::Keychain,
+            };
+            keys.push((entry, locked, secret.to_vec()));
+        }
+        assert_ne!(
+            keys[0].0.fingerprint(),
+            keys[1].0.fingerprint(),
+            "the fixtures must be different keys"
+        );
+
+        // Each is asked for once and unlocks with its own answer.
+        for (entry, locked, secret) in &keys {
+            let lpass = MockLpass::logged_in().with_field(&entry.item_id, "Passphrase", b"");
+            let prompt = FakePrompt::answering(secret);
+            let unlocker = Unlocker::with_store(Arc::new(lpass), prompt.clone(), store.clone());
+            assert!(unlocker.unlock(entry, locked).await.is_ok());
+            assert_eq!(prompt.calls(), 1, "item {}", entry.item_id);
+        }
+
+        // Both are kept, separately, with the right value under each.
+        assert_eq!(store.entries(), 2, "one key's entry replaced the other's");
+        for (entry, _, secret) in &keys {
+            assert_eq!(
+                store.saved_for(&entry.fingerprint()).as_deref(),
+                Some(&secret[..]),
+                "wrong passphrase stored for item {}",
+                entry.item_id
+            );
+        }
+
+        // And each is found again without asking — proving the lookup matched
+        // that key rather than merely finding *something*.
+        for (entry, locked, _) in &keys {
+            let lpass = MockLpass::logged_in().with_field(&entry.item_id, "Passphrase", b"");
+            // any prompt at all would fail this unlock
+            let prompt = FakePrompt::failing(PromptError::Cancelled);
+            let unlocker = Unlocker::with_store(Arc::new(lpass), prompt.clone(), store.clone());
+            assert!(
+                unlocker.unlock(entry, locked).await.is_ok(),
+                "item {} was not found again",
+                entry.item_id
+            );
+            assert_eq!(prompt.calls(), 0, "item {}", entry.item_id);
+        }
     }
 
     #[tokio::test]
