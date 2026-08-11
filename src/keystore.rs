@@ -43,7 +43,7 @@ impl KeyStore {
         for key in keys {
             let public = match client.show_field(&key.id, "Public Key").await {
                 Ok(raw) if raw.is_empty() => {
-                    tracing::warn!(item = %key.id, name = %crate::text::escape_control(key.display_name()),
+                    tracing::warn!(item = %key.id, name = %crate::text::escape_for_display(key.display_name()),
                         "skipping: item has an empty Public Key field");
                     continue;
                 }
@@ -53,21 +53,21 @@ impl KeyStore {
                         Ok(public) if !crate::signing::can_sign(&public.algorithm()) => {
                             // advertising it would mean offering an identity
                             // every signing request then refuses
-                            tracing::warn!(item = %key.id, name = %crate::text::escape_control(key.display_name()),
-                                "skipping: {} keys cannot be signed with by this agent",
+                            tracing::warn!(item = %key.id, name = %crate::text::escape_for_display(key.display_name()),
+                                "skipping: this agent cannot sign with {} keys",
                                 public.algorithm());
                             continue;
                         }
                         Ok(public) => public,
                         Err(e) => {
-                            tracing::warn!(item = %key.id, name = %crate::text::escape_control(key.display_name()),
+                            tracing::warn!(item = %key.id, name = %crate::text::escape_for_display(key.display_name()),
                                 "skipping: Public Key field does not parse as an OpenSSH public key: {e}");
                             continue;
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(item = %key.id, name = %crate::text::escape_control(key.display_name()),
+                    tracing::warn!(item = %key.id, name = %crate::text::escape_for_display(key.display_name()),
                         "skipping: {e}");
                     continue;
                 }
@@ -86,7 +86,7 @@ impl KeyStore {
             entries.push(KeyEntry {
                 item_id: key.id.clone(),
                 // vault-controlled: rendered by ssh-add, dialogs and logs
-                name: crate::text::escape_control(key.display_name()),
+                name: crate::text::escape_for_display(key.display_name()),
                 public,
                 confirm: config.confirm_required(key),
             });

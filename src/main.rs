@@ -239,7 +239,11 @@ async fn search(client: &Arc<dyn LpassClient>, query: Option<&str>) -> Result<()
     }
 
     for item in &found {
-        println!("✓ {}  [id: {}]", text::escape_control(&item.name), item.id);
+        println!(
+            "✓ {}  [id: {}]",
+            text::escape_for_display(&item.name),
+            item.id
+        );
     }
     println!(
         "\nthe agent serves all of these automatically; to pin a subset, add to \
@@ -361,7 +365,7 @@ async fn doctor(config_path: &Path, test_confirm: bool) -> Result<()> {
         for key in &keys {
             let label = format!(
                 "key {} [id: {}]",
-                text::escape_control(key.display_name()),
+                text::escape_for_display(key.display_name()),
                 key.id
             );
             match client.show_field(&key.id, "Public Key").await {
@@ -375,10 +379,7 @@ async fn doctor(config_path: &Path, test_confirm: bool) -> Result<()> {
                     Ok(public) if !signing::can_sign(&public.algorithm()) => check(
                         false,
                         &label,
-                        format!(
-                            "{} keys cannot be signed with by this agent",
-                            public.algorithm()
-                        ),
+                        format!("this agent cannot sign with {} keys", public.algorithm()),
                     ),
                     Ok(public) => {
                         let fingerprint = public.fingerprint(ssh_key::HashAlg::Sha256).to_string();

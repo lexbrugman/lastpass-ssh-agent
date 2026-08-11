@@ -6,7 +6,12 @@ use zeroize::Zeroizing;
 
 use super::{ItemSummary, LoginStatus, LpassClient, LpassError};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A `show` against the local vault cache takes 100–500 ms, but the first
+/// one after a while can trigger a full vault sync, and on a slow link that
+/// is the case that matters: failing a signature there costs the user a
+/// retry, while waiting costs a pause. Still bounded, so a wedged lpass
+/// cannot hang a signing request indefinitely.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Real lpass subprocess client.
 ///

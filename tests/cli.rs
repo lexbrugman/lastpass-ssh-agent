@@ -309,7 +309,7 @@ esac"#,
     let output = run(&s, &["doctor"]);
     assert!(!output.status.success());
     assert!(
-        stdout(&output).contains("cannot be signed with"),
+        stdout(&output).contains("cannot sign with"),
         "{}",
         stdout(&output)
     );

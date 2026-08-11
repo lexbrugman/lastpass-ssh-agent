@@ -277,12 +277,33 @@ every merge to `master` publishes a release, so pointing it at `master`
 would ship a release per dependency bump. Updates instead accumulate on
 `dev` and go out when you promote it.
 
+Renovate only proposes upgrades, so it is silent about a vulnerability with
+no fixed version — the one case where you most want to know. `cargo audit`
+covers that gap from the other side: CI checks the locked tree against the
+[RustSec](https://rustsec.org) database, and a release cannot go out under
+an advisory nobody has looked at. Accepted advisories live in
+`.cargo/audit.toml`, each with the reasoning for accepting it; anything not
+listed there fails.
+
+One is accepted today: **RUSTSEC-2023-0071**, a timing sidechannel in `rsa`
+that has no patched release in any version line. The published attack
+targets RSA decryption, which this agent never performs — it only signs, and
+by default only after you approve each signature. It is worth knowing about
+if you serve an RSA key with `confirm = "off"`; ed25519 and ECDSA keys do
+not involve that crate at all.
+
 ## Development
 
 `./scripts/check.sh` runs the full gate, and CI enforces the same on every
 push: `cargo fmt --check`, `cargo clippy` with the pedantic and nursery
 groups and `-D warnings`, and the test suite on macOS and Linux
 (`./scripts/test.sh`).
+
+CI adds one check the local script does not: `cargo audit` (see
+[Dependencies](#dependencies)). It is deliberately not in `check.sh`, which
+stays offline and hermetic — its result depends on a database fetched over
+the network and changes without the code changing, so a local run could fail
+for reasons that have nothing to do with your edit.
 
 Compiling is left to dist so it happens once. Pull requests build all four
 release targets through it (`pr-run-mode = "upload"`), which is what catches
