@@ -1,0 +1,72 @@
+name: Checks
+
+# The gate: formatting, lints, advisories, and the tests at 100% coverage on
+# both platforms. ci.yml runs it on every branch, and nothing is released
+# until it passes.
+on:
+  workflow_call:
+
+# Read-only, and declared here rather than left to the caller: a called
+# workflow may lower the caller's permissions but never raise them, so
+# whatever ci.yml grants elsewhere, the third-party actions below run with
+# nothing but read access.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Actions are pinned to exact releases rather than floating major tags, so
+# Renovate raises a pull request for every patch; @v7 would stay silent until
+# v8. The toolchain actions are the exception — `stable` and `nightly` are
+# branch references, and resolving them fresh is the whole point.
+jobs:
+  lint:
+    name: fmt + clippy (check only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo fmt --check
+      - run: ./packaging/test-archive.sh
+      - run: ./packaging/homebrew/test-generate-formula.sh
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # Advisories are time-based rather than code-based: a dependency that was
+  # clean yesterday can be vulnerable today without anything here changing.
+  # Running it in the gate means no release goes out under an advisory nobody
+  # has looked at, and every Renovate dependency pull request re-runs it, so
+  # a newly published one surfaces without anyone pushing code.
+  audit:
+    name: advisory audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: taiki-e/install-action@v2.85.11
+        with:
+          tool: cargo-audit
+      # Fails on any advisory against the locked tree except those
+      # .cargo/audit.toml accepts, each recorded there with its reasoning.
+      - run: cargo audit
+
+  test:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      # the tests run instrumented, which requires nightly for branch coverage
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2.85.11
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: ./scripts/test.sh

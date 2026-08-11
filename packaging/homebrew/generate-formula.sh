@@ -3,9 +3,10 @@
 #
 #   generate-formula.sh <version> <owner/repo> <dir-with-release-artifacts>
 #
-# The artifact directory must hold the .sha256 files dist produces beside
-# each archive. dist builds and publishes everything else; only the formula
-# is ours, because its template cannot declare a launchd/systemd service.
+# The artifact directory must hold the .sha256 file build-release.yml writes
+# beside each archive. Run after the release is published: publish-homebrew-
+# formula.yml downloads those checksums from the release itself, so the hashes
+# in the formula are of the files users actually fetch.
 set -eu
 
 version="$1"
@@ -51,6 +52,14 @@ class LastpassSshAgent < Formula
 
   depends_on "lastpass-cli"
 
+  # The dev track. `brew install --HEAD` builds the dev branch from source,
+  # which is why rust is a build dependency here and nowhere else: a release
+  # install unpacks a prebuilt binary and needs no compiler.
+  head do
+    url "https://github.com/@REPO@.git", branch: "dev"
+    depends_on "rust" => :build
+  end
+
   on_macos do
     on_arm do
       url "@BASE@/lastpass-ssh-agent-aarch64-apple-darwin.tar.xz"
@@ -74,7 +83,11 @@ class LastpassSshAgent < Formula
   end
 
   def install
-    bin.install "lastpass-ssh-agent"
+    if build.head?
+      system "cargo", "install", *std_cargo_args
+    else
+      bin.install "lastpass-ssh-agent"
+    end
   end
 
   # `brew services start lastpass-ssh-agent` installs this as a launchd user
@@ -133,11 +146,45 @@ class LastpassSshAgent < Formula
             IdentityAgent "<the path printed above>"
 
       Note that IdentityAgent overrides SSH_AUTH_SOCK for the hosts it matches.
+
+      To follow the dev branch instead of releases, replace the install. It
+      builds from source, so this pulls in a Rust toolchain:
+
+        brew uninstall lastpass-ssh-agent
+        brew install --HEAD lastpass-ssh-agent
+
+      Switching tracks is always uninstall-then-install: `brew reinstall` has
+      no --HEAD option, and cannot move an install between the two.
+
+      A HEAD install does NOT move forward on a plain `brew upgrade` — brew
+      only checks whether the branch advanced when asked to:
+
+        brew upgrade --fetch-HEAD lastpass-ssh-agent
+
+      And back to the latest release:
+
+        brew uninstall lastpass-ssh-agent
+        brew install lastpass-ssh-agent
+
+      Either switch replaces the binary, not the running agent, so restart the
+      service afterwards. Saved Keychain passphrases are keyed by SSH key
+      fingerprint and survive the switch.
     EOS
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/lastpass-ssh-agent --version")
+    # A release install must report exactly the version the formula claims —
+    # a mismatch there means the formula and the binary came from different
+    # builds. A head install cannot: brew calls it HEAD-<sha> while the binary
+    # describes itself against the newest release tag it can see, so check the
+    # name instead. Decided from `version` rather than `build`, which is not
+    # dependable in a test.
+    expected = if version.to_s.start_with?("HEAD")
+      "lastpass-ssh-agent"
+    else
+      version.to_s
+    end
+    assert_match expected, shell_output("#{bin}/lastpass-ssh-agent --version")
     # doctor exits nonzero without a LastPass login, but must still run
     assert_match "lpass", shell_output("#{bin}/lastpass-ssh-agent doctor 2>&1", 1)
   end

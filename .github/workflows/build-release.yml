@@ -1,0 +1,70 @@
+name: Build release
+
+# Builds the four published targets and uploads each as a workflow artifact
+# for publish-release.yml to attach to the release.
+#
+# Every target builds on a runner of its own architecture, so nothing is
+# cross-linked: the Apple targets share one macOS runner because a single SDK
+# covers both, and the musl targets each get a runner of their own. musl needs
+# no C toolchain here — the dependency tree is pure Rust, so rustc's
+# self-contained musl linking covers it.
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          # What `--version` reports. build.rs would otherwise describe the
+          # checkout against the newest tag, and the tag for this release does
+          # not exist yet — it is created when the release is published.
+          LASTPASS_SSH_AGENT_VERSION: ${{ inputs.version }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Layout and checksum format are what the formula and the publish step
+      # depend on, and neither shows up as wrong until an install fails, so
+      # the rules live in a script the gate exercises rather than here.
+      - name: Package
+        run: |
+          ./packaging/archive.sh "${{ matrix.target }}" dist \
+              "target/${{ matrix.target }}/release/lastpass-ssh-agent" \
+              README.md
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
