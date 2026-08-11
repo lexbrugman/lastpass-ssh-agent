@@ -25,6 +25,11 @@ pub struct LpassAgent {
     /// Decrypts the fetched key, resolving a passphrase the vault does not
     /// hold. Reached only for an encrypted key.
     unlocker: Arc<Unlocker>,
+    /// Puts names to the hosts a connection is bound to, read fresh when a
+    /// signature is asked for rather than cached: `ssh` records a host in
+    /// `known_hosts` as it agrees to connect, which is before the signature
+    /// this prompt is about.
+    host_names: Arc<crate::knownhosts::HostNames>,
     /// One signing request at a time, shared by every connection.
     ///
     /// Confirmation and passphrase entry are separate transports with separate
@@ -58,12 +63,14 @@ impl LpassAgent {
         lpass: Arc<dyn LpassClient>,
         confirmer: Arc<dyn Confirmer>,
         unlocker: Arc<Unlocker>,
+        host_names: Arc<crate::knownhosts::HostNames>,
     ) -> Self {
         Self {
             store,
             lpass,
             confirmer,
             unlocker,
+            host_names,
             interaction: Arc::new(tokio::sync::Mutex::new(())),
             peer: None,
             bindings: Vec::new(),
@@ -137,9 +144,31 @@ impl LpassAgent {
             "session bound");
         self.bindings.push(SessionBinding {
             host_fingerprint,
+            // Named when a signature is actually asked for; see `host_names`.
+            host_name: None,
             is_forwarding: bind.is_forwarding,
         });
         Response::Success
+    }
+
+    /// This connection's bindings, each with the name `known_hosts` gives its
+    /// host key, so the prompt can say "github.com" instead of 43 characters
+    /// of base64.
+    async fn named_bindings(&self) -> Vec<SessionBinding> {
+        let mut bindings = self.bindings.clone();
+        let fingerprints = bindings
+            .iter()
+            .map(|bind| bind.host_fingerprint.clone())
+            .collect();
+        // Fewer names than bindings if the lookup gave up; zip stops at the
+        // shorter side and the rest keep their fingerprints.
+        for (bind, name) in bindings
+            .iter_mut()
+            .zip(self.host_names.names_for(fingerprints).await)
+        {
+            bind.host_name = name;
+        }
+        bindings
     }
 
     /// Everything that touches the private key, in one place.
@@ -241,7 +270,7 @@ impl Session for LpassAgent {
         };
 
         if entry.confirm {
-            let ctx = ConfirmContext::new(entry, self.peer, self.bindings.clone());
+            let ctx = ConfirmContext::new(entry, self.peer, self.named_bindings().await);
             match self.confirmer.confirm(&ctx).await {
                 Decision::Approve => {}
                 Decision::Deny => {
@@ -345,7 +374,21 @@ mod tests {
                 .unwrap(),
         );
         let unlocker = Arc::new(Unlocker::new(client.clone(), prompt));
-        LpassAgent::new(store, client, Arc::new(NoConfirmer), unlocker)
+        LpassAgent::new(
+            store,
+            client,
+            Arc::new(NoConfirmer),
+            unlocker,
+            no_host_names(),
+        )
+    }
+
+    /// No `known_hosts` at all. Every binding then shows its fingerprint, so
+    /// these tests read the same on any machine — with the real files, a
+    /// fixture key that happened to be in someone's `~/.ssh/known_hosts`
+    /// would change what the prompt says.
+    fn no_host_names() -> Arc<crate::knownhosts::HostNames> {
+        Arc::new(crate::knownhosts::HostNames::with_files(Vec::new()))
     }
 
     /// The passphrase machinery wired to one prompt, for the direct
@@ -468,6 +511,7 @@ mod tests {
             client.clone(),
             Arc::new(DenyAll),
             unlocking(&client, Arc::new(NoPrompt)),
+            no_host_names(),
         );
 
         assert!(agent
@@ -501,6 +545,7 @@ mod tests {
             logged_out.clone(),
             Arc::new(NoConfirmer),
             unlocking(&logged_out, Arc::new(NoPrompt)),
+            no_host_names(),
         );
 
         assert!(agent
@@ -796,6 +841,7 @@ mod tests {
             client,
             Arc::new(WatchingConfirmer(watch.clone())),
             unlocker,
+            no_host_names(),
         );
 
         // two client connections, as separate sessions sharing the agent
@@ -831,6 +877,7 @@ mod tests {
             client.clone(),
             Arc::new(NoConfirmer),
             unlocking(&client, prompt.clone()),
+            no_host_names(),
         );
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -933,7 +980,7 @@ mod tests {
                 .unwrap(),
         );
         let unlocker = unlocking(&client, Arc::new(NoPrompt));
-        LpassAgent::new(store, client, confirmer, unlocker)
+        LpassAgent::new(store, client, confirmer, unlocker, no_host_names())
     }
 
     #[tokio::test]
@@ -1148,7 +1195,8 @@ mod tests {
                 .unwrap(),
         );
         let unlocker = unlocking(&client, Arc::new(NoPrompt));
-        let mut agent = LpassAgent::new(store, client, Arc::new(DenyAll), unlocker);
+        let mut agent =
+            LpassAgent::new(store, client, Arc::new(DenyAll), unlocker, no_host_names());
 
         let response = agent
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
