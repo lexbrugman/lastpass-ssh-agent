@@ -1,14 +1,11 @@
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::io::AsRawFd as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::io::unix::AsyncFd;
-use tokio::io::Interest;
 use zeroize::Zeroizing;
 
 use super::{PassphrasePrompt, PassphraseRequest, PromptError};
+use crate::tty;
 
 /// Read a passphrase from the controlling terminal with echo disabled.
 ///
@@ -161,28 +158,20 @@ async fn read_passphrase(
     message: &str,
     max_bytes: usize,
 ) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
-    // Our own open file description, so O_NONBLOCK cannot affect anything
-    // else sharing this terminal.
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)?;
-
-    let tty = AsyncFd::new(tty)?;
+    let terminal = tty::open(path)?;
 
     // Anything typed before the prompt appeared was meant for something else.
     // Left queued it would be read as the passphrase — and with echo off the
     // user would never see that it had been.
-    discard_pending_input(tty.get_ref());
+    tty::discard_pending_input(&terminal);
 
-    // Declared *after* `tty` on purpose: locals drop in reverse order, so the
-    // guard restores the terminal while the descriptor is still open. Built
+    // Declared *after* `terminal` on purpose: locals drop in reverse order, so
+    // the guard restores the terminal while the descriptor is still open. Built
     // first, it would restore through a closed fd and silently do nothing.
-    let hidden = TerminalMode::hide_input(tty.get_ref())?;
+    let hidden = TerminalMode::hide_input(terminal.get_ref())?;
 
     let prompt = format!("\n{message}\nPassphrase (not echoed): ");
-    write_all(&tty, prompt.as_bytes()).await?;
+    tty::write_all(&terminal, prompt.as_bytes()).await?;
 
     // Allocated once, up front: growing this buffer would copy the bytes
     // typed so far into a new allocation and free the old one unwiped,
@@ -192,7 +181,7 @@ async fn read_passphrase(
     let mut too_long = false;
     loop {
         let mut byte = Zeroizing::new([0u8; 1]);
-        read_once(&tty, &mut byte[..]).await?;
+        tty::read_once(&terminal, &mut byte[..]).await?;
         if byte[0] == b'\n' {
             break;
         }
@@ -206,7 +195,7 @@ async fn read_passphrase(
         secret.push(byte[0]);
     }
     // Echo is off, so the user's Enter never moved the cursor.
-    write_all(&tty, b"\n").await?;
+    tty::write_all(&terminal, b"\n").await?;
     let mut hidden = hidden;
     hidden.keep_queued_input();
     drop(hidden);
@@ -217,43 +206,13 @@ async fn read_passphrase(
     Ok((!too_long).then_some(secret))
 }
 
-/// Drop anything typed before the prompt was shown. Best effort: a target
-/// that is not a terminal has no queue to flush.
-fn discard_pending_input(tty: &std::fs::File) {
-    // SAFETY: tcflush only acts on the descriptor it is given.
-    unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) };
-}
-
-/// A zero-length read means the terminal hung up, which ends entry. Excluded
-/// from coverage for the same reason as the confirmer's equivalent: platforms
-/// disagree on how a hangup surfaces, so no single test reaches it on both.
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn read_once(tty: &AsyncFd<std::fs::File>, buf: &mut [u8]) -> std::io::Result<()> {
-    let read = tty
-        .async_io(Interest::READABLE, |mut inner| inner.read(buf))
-        .await?;
-    if read == 0 {
-        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
-    }
-    Ok(())
-}
-
-async fn write_all(tty: &AsyncFd<std::fs::File>, mut buf: &[u8]) -> std::io::Result<()> {
-    while !buf.is_empty() {
-        let written = tty
-            .async_io(Interest::WRITABLE, |mut inner| inner.write(buf))
-            .await?;
-        buf = &buf[written..];
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::testutil::open_pty;
     use std::fs::File;
-    use std::os::unix::io::FromRawFd;
+    use std::io::{Read as _, Write as _};
     use std::path::Path;
     use std::time::Instant;
 
@@ -281,35 +240,6 @@ mod tests {
             seen.extend_from_slice(&buf[..read]);
         }
         master.write_all(answer).unwrap();
-    }
-
-    /// Open a pty pair; return the master, a keepalive slave handle (a master
-    /// errors with EIO when no slave is open), and the slave's path.
-    fn open_pty() -> (File, File, PathBuf) {
-        let mut master: libc::c_int = 0;
-        let mut slave: libc::c_int = 0;
-        // SAFETY: openpty writes two fds; name/termios/winsize may be null.
-        let rc = unsafe {
-            libc::openpty(
-                &raw mut master,
-                &raw mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty failed");
-        // SAFETY: ptsname on a fresh valid master fd.
-        let name = unsafe { libc::ptsname(master) };
-        assert!(!name.is_null());
-        let path = PathBuf::from(
-            unsafe { std::ffi::CStr::from_ptr(name) }
-                .to_string_lossy()
-                .to_string(),
-        );
-        // SAFETY: both are valid fds we own; File takes ownership.
-        let (master, keepalive) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
-        (master, keepalive, path)
     }
 
     fn echo_is_on(file: &File) -> bool {

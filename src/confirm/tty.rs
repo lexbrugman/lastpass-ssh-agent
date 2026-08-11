@@ -1,12 +1,8 @@
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::io::unix::AsyncFd;
-use tokio::io::Interest;
-
 use super::{ConfirmContext, Confirmer, Decision};
+use crate::tty;
 
 /// Prompt on the agent's controlling terminal (`/dev/tty`). Useful when the
 /// agent runs in a foreground terminal, and as the default on Linux.
@@ -68,25 +64,20 @@ impl Confirmer for TtyConfirmer {
 /// deadline by dropping this future, which is why every wait here is a
 /// cancellation point rather than a blocking call.
 async fn prompt_on_tty(path: &std::path::Path, message: &str) -> std::io::Result<bool> {
-    // Our own open file description, so O_NONBLOCK is ours alone and cannot
-    // change the behaviour of anything else sharing this terminal.
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)?;
-    discard_pending_input(&tty);
-    let tty = AsyncFd::new(tty)?;
+    let terminal = tty::open(path)?;
+    // A stale `yes` left over from a prompt that timed out must not approve
+    // this request, which the user has not read yet.
+    tty::discard_pending_input(&terminal);
 
     let prompt = format!("\n{message}\nAllow? (type 'yes' to approve, anything else denies): ");
-    write_all(&tty, prompt.as_bytes()).await?;
+    tty::write_all(&terminal, prompt.as_bytes()).await?;
 
     // A byte at a time, stopping at the newline: a larger read could swallow
     // input typed after the answer, which belongs to whatever prompts next.
     let mut answer = String::new();
     loop {
         let mut byte = [0u8; 1];
-        read_once(&tty, &mut byte).await?;
+        tty::read_once(&terminal, &mut byte).await?;
         if byte[0] == b'\n' {
             break;
         }
@@ -95,55 +86,13 @@ async fn prompt_on_tty(path: &std::path::Path, message: &str) -> std::io::Result
     Ok(answer.trim() == "yes")
 }
 
-/// Drop anything already typed before showing a prompt.
-///
-/// Terminal input is queued in the terminal, not in our file description, so
-/// a line finished after an earlier prompt timed out would still be sitting
-/// there. Without this, that stale `yes` would answer the *next* signing
-/// request — approving something the user never saw. Best effort: a target
-/// that is not a terminal has no queue to flush.
-fn discard_pending_input(tty: &std::fs::File) {
-    use std::os::unix::io::AsRawFd as _;
-    // SAFETY: tcflush only acts on the descriptor it is given.
-    unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) };
-}
-
-/// `async_io` owns the readiness dance, including the retry a spurious
-/// wakeup demands — there is no reason to hand-roll that loop.
-///
-/// A zero-length read means the terminal hung up, which ends the exchange
-/// as a refusal. That edge is excluded from coverage because platforms
-/// disagree on how a hangup surfaces — macOS reports `EIO` on a closed pty
-/// and will not even register `/dev/null` with kqueue — so no single test
-/// reaches it on both.
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn read_once(tty: &AsyncFd<std::fs::File>, buf: &mut [u8]) -> std::io::Result<()> {
-    let read = tty
-        .async_io(Interest::READABLE, |mut inner| inner.read(buf))
-        .await?;
-    if read == 0 {
-        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
-    }
-    Ok(())
-}
-
-async fn write_all(tty: &AsyncFd<std::fs::File>, mut buf: &[u8]) -> std::io::Result<()> {
-    while !buf.is_empty() {
-        let written = tty
-            .async_io(Interest::WRITABLE, |mut inner| inner.write(buf))
-            .await?;
-        buf = &buf[written..];
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::confirm::PeerInfo;
-    use std::fs::File;
-    use std::os::unix::io::FromRawFd;
+    use crate::testutil::open_pty;
+    use std::io::Write as _;
     use std::time::Instant;
 
     fn ctx() -> ConfirmContext {
@@ -157,35 +106,6 @@ mod tests {
             }),
             bindings: Vec::new(),
         }
-    }
-
-    /// Open a pty pair; return the master, a keepalive slave handle (a pty
-    /// master errors with EIO when no slave is open), and the slave's path.
-    fn open_pty() -> (File, File, PathBuf) {
-        let mut master: libc::c_int = 0;
-        let mut slave: libc::c_int = 0;
-        // SAFETY: openpty writes two fds; name/termios/winsize may be null.
-        let rc = unsafe {
-            libc::openpty(
-                &raw mut master,
-                &raw mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty failed");
-        // SAFETY: ptsname on a fresh valid master fd.
-        let name = unsafe { libc::ptsname(master) };
-        assert!(!name.is_null());
-        let path = PathBuf::from(
-            unsafe { std::ffi::CStr::from_ptr(name) }
-                .to_string_lossy()
-                .to_string(),
-        );
-        // SAFETY: master and slave are valid fds we own; File takes ownership.
-        let (master, keepalive) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
-        (master, keepalive, path)
     }
 
     #[tokio::test]

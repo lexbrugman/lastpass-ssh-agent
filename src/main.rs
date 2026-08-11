@@ -15,6 +15,7 @@ mod socket;
 #[cfg(test)]
 mod testutil;
 mod text;
+mod tty;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -288,165 +289,76 @@ fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "a linear checklist; splitting it would hurt readability"
-)]
+/// One line of the `doctor` checklist.
+struct Check {
+    ok: bool,
+    label: String,
+    detail: String,
+}
+
+impl Check {
+    fn passed(label: &str, detail: String) -> Self {
+        Self {
+            ok: true,
+            label: label.to_string(),
+            detail,
+        }
+    }
+
+    fn failed(label: &str, detail: String) -> Self {
+        Self {
+            ok: false,
+            label: label.to_string(),
+            detail,
+        }
+    }
+}
+
+/// Run every check the setup allows, reporting each as it is made.
+///
+/// A check is skipped rather than failed when what it needs is already missing:
+/// there is no login to test without an lpass binary, and no keys to inspect
+/// without a login. The failure is already on the checklist, and repeating it
+/// under another label would suggest two problems where there is one.
 async fn doctor(config_path: &Path, test_confirm: bool) -> Result<()> {
+    // Printed as each check finishes rather than collected and printed at the
+    // end: the vault checks can take seconds, and a checklist that appears all
+    // at once reads as a hang.
     let mut ok = true;
-    let mut check = |good: bool, label: &str, detail: String| {
-        println!("{} {label}: {detail}", if good { "✓" } else { "✗" });
-        ok &= good;
-    };
-
-    let config = match Config::load(config_path) {
-        Ok(config) => {
-            check(
-                true,
-                "config",
-                format!(
-                    "{} ({})",
-                    config_path.display(),
-                    if config.keys.is_empty() {
-                        "no [[keys]] — auto-discovery".to_string()
-                    } else {
-                        format!("{} pinned key(s)", config.keys.len())
-                    }
-                ),
-            );
-            Some(config)
-        }
-        Err(Error::ConfigMissing(_)) => {
-            check(
-                true,
-                "config",
-                format!(
-                    "no file at {} — using defaults + auto-discovery",
-                    config_path.display()
-                ),
-            );
-            Config::load_or_default(config_path).ok()
-        }
-        Err(e) => {
-            check(false, "config", e.to_string());
-            None
-        }
-    };
-
-    let configured = config.as_ref().and_then(|c| c.lpass_path.as_deref());
-    let client: Option<Arc<dyn LpassClient>> = if let Some(path) = lpass::resolve_binary(configured)
-    {
-        check(true, "lpass binary", path.display().to_string());
-        Some(Arc::new(lpass::LpassCli::new(path)))
-    } else {
-        check(
-            false,
-            "lpass binary",
-            "not found on PATH (brew install lastpass-cli, or set `lpass_path`)".into(),
+    let mut report = |check: Check| {
+        println!(
+            "{} {}: {}",
+            if check.ok { "✓" } else { "✗" },
+            check.label,
+            check.detail
         );
-        None
+        ok &= check.ok;
     };
 
-    let logged_in = match &client {
-        Some(client) => match client.status().await {
-            Ok(lpass::LoginStatus::LoggedIn(user)) => {
-                check(true, "lpass login", user);
-                true
-            }
-            Ok(lpass::LoginStatus::NotLoggedIn) => {
-                check(
-                    false,
-                    "lpass login",
-                    "not logged in — run `lpass login <email>`".into(),
-                );
-                false
-            }
-            Err(e) => {
-                check(false, "lpass login", e.to_string());
-                false
-            }
-        },
-        None => false,
-    };
+    let (check, config) = check_config(config_path);
+    report(check);
+
+    let (check, client) = check_lpass_binary(config.as_ref());
+    report(check);
+
+    let (login, logged_in) = check_login(client.as_ref()).await;
+    if let Some(check) = login {
+        report(check);
+    }
 
     if let (Some(config), Some(client), true) = (&config, &client, logged_in) {
-        let keys = match effective_keys(client, config).await {
-            Ok(keys) => keys,
-            Err(e) => {
-                check(false, "keys", e.to_string());
-                Vec::new()
-            }
-        };
-        for inspection in keystore::inspect_keys(client.as_ref(), &keys, config).await {
-            match inspection {
-                keystore::KeyInspection::Usable(entry) => check(
-                    true,
-                    &format!("key {} [id: {}]", entry.name, entry.item_id),
-                    format!("{} {}", entry.public.algorithm(), entry.fingerprint()),
-                ),
-                keystore::KeyInspection::Unusable {
-                    item_id,
-                    name,
-                    issue,
-                } => check(
-                    false,
-                    &format!("key {name} [id: {item_id}]"),
-                    issue.to_string(),
-                ),
-            }
+        for check in check_keys(client, config).await {
+            report(check);
         }
     }
 
     if let Some(config) = &config {
-        // Same invariants `start` enforces; a not-yet-existing directory
-        // passes because `start` creates it correctly.
-        let socket_check = config.socket_path().and_then(|path| {
-            path.parent()
-                .filter(|d| !d.as_os_str().is_empty())
-                .map_or_else(
-                    || Err(Error::Socket("socket path has no parent directory".into())),
-                    socket::validate_dir,
-                )
-                .map(|()| path)
-        });
-        match socket_check {
-            Ok(path) => check(true, "socket path", path.display().to_string()),
-            Err(e) => check(false, "socket path", e.to_string()),
-        }
+        report(check_socket(config));
     }
 
     if test_confirm {
         if let Some(config) = &config {
-            if config.confirm == config::ConfirmMode::Off {
-                check(
-                    false,
-                    "confirmation",
-                    "confirm = \"off\" — nothing to test; enable a confirm mode first".into(),
-                );
-                return Err(Error::DoctorFailed);
-            }
-            let confirmer = confirm::from_config(config)?;
-            let ctx = confirm::ConfirmContext {
-                key_name: "doctor test (no real key)".into(),
-                fingerprint: "SHA256:this-is-only-a-test".into(),
-                item_id: "0".into(),
-                peer: Some(confirm::PeerInfo {
-                    pid: Some(std::process::id().cast_signed()),
-                    // SAFETY: getuid cannot fail and touches no memory.
-                    uid: unsafe { libc::getuid() },
-                }),
-                bindings: Vec::new(),
-            };
-            match confirmer.confirm(&ctx).await {
-                confirm::Decision::Approve => {
-                    check(true, "confirmation", "user approved the test prompt".into());
-                }
-                confirm::Decision::Deny => check(
-                    false,
-                    "confirmation",
-                    "denied/timed out (fail-closed works, but approve to pass this check)".into(),
-                ),
-            }
+            report(check_confirmation(config).await?);
         }
     }
 
@@ -455,6 +367,155 @@ async fn doctor(config_path: &Path, test_confirm: bool) -> Result<()> {
     } else {
         Err(Error::DoctorFailed)
     }
+}
+
+/// The config file, and the config every later check runs against.
+///
+/// A missing file passes: running without one is ordinary, and the agent falls
+/// back to defaults plus auto-discovery.
+fn check_config(config_path: &Path) -> (Check, Option<Config>) {
+    match Config::load(config_path) {
+        Ok(config) => {
+            let keys = if config.keys.is_empty() {
+                "no [[keys]] — auto-discovery".to_string()
+            } else {
+                format!("{} pinned key(s)", config.keys.len())
+            };
+            let detail = format!("{} ({keys})", config_path.display());
+            (Check::passed("config", detail), Some(config))
+        }
+        Err(Error::ConfigMissing(_)) => (
+            Check::passed(
+                "config",
+                format!(
+                    "no file at {} — using defaults + auto-discovery",
+                    config_path.display()
+                ),
+            ),
+            Config::load_or_default(config_path).ok(),
+        ),
+        Err(e) => (Check::failed("config", e.to_string()), None),
+    }
+}
+
+/// The lpass binary, and a client that talks to it.
+fn check_lpass_binary(config: Option<&Config>) -> (Check, Option<Arc<dyn LpassClient>>) {
+    let configured = config.and_then(|c| c.lpass_path.as_deref());
+    lpass::resolve_binary(configured).map_or_else(no_lpass_binary, |path| {
+        let check = Check::passed("lpass binary", path.display().to_string());
+        let client: Arc<dyn LpassClient> = Arc::new(lpass::LpassCli::new(path));
+        (check, Some(client))
+    })
+}
+
+/// Named rather than written inline, so `map_or_else` reads as the two answers
+/// it is choosing between rather than as one buried in its arguments.
+fn no_lpass_binary() -> (Check, Option<Arc<dyn LpassClient>>) {
+    (
+        Check::failed(
+            "lpass binary",
+            "not found on PATH (brew install lastpass-cli, or set `lpass_path`)".into(),
+        ),
+        None,
+    )
+}
+
+/// Whether the vault is unlocked, and who it belongs to.
+///
+/// No check at all without a binary to ask with: that failure is already
+/// reported, and a second line about it would only repeat it.
+async fn check_login(client: Option<&Arc<dyn LpassClient>>) -> (Option<Check>, bool) {
+    let Some(client) = client else {
+        return (None, false);
+    };
+    match client.status().await {
+        Ok(lpass::LoginStatus::LoggedIn(user)) => (Some(Check::passed("lpass login", user)), true),
+        Ok(lpass::LoginStatus::NotLoggedIn) => (
+            Some(Check::failed(
+                "lpass login",
+                "not logged in — run `lpass login <email>`".into(),
+            )),
+            false,
+        ),
+        Err(e) => (Some(Check::failed("lpass login", e.to_string())), false),
+    }
+}
+
+/// One line per key the agent would serve, or one for why there are none.
+///
+/// The policy itself lives in `keystore::inspect_keys`, which `start` uses too,
+/// so what `doctor` reports cannot drift from what the agent does.
+async fn check_keys(client: &Arc<dyn LpassClient>, config: &Config) -> Vec<Check> {
+    let keys = match effective_keys(client, config).await {
+        Ok(keys) => keys,
+        Err(e) => return vec![Check::failed("keys", e.to_string())],
+    };
+    keystore::inspect_keys(client.as_ref(), &keys, config)
+        .await
+        .into_iter()
+        .map(|inspection| match inspection {
+            keystore::KeyInspection::Usable(entry) => Check::passed(
+                &format!("key {} [id: {}]", entry.name, entry.item_id),
+                format!("{} {}", entry.public.algorithm(), entry.fingerprint()),
+            ),
+            keystore::KeyInspection::Unusable {
+                item_id,
+                name,
+                issue,
+            } => Check::failed(&format!("key {name} [id: {item_id}]"), issue.to_string()),
+        })
+        .collect()
+}
+
+/// The same invariants `start` enforces on the socket directory. A directory
+/// that does not exist yet passes, because `start` creates it correctly.
+fn check_socket(config: &Config) -> Check {
+    let resolved = config.socket_path().and_then(|path| {
+        path.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map_or_else(
+                || Err(Error::Socket("socket path has no parent directory".into())),
+                socket::validate_dir,
+            )
+            .map(|()| path)
+    });
+    match resolved {
+        Ok(path) => Check::passed("socket path", path.display().to_string()),
+        Err(e) => Check::failed("socket path", e.to_string()),
+    }
+}
+
+/// Pop the configured prompt once, for `--test-confirm`.
+async fn check_confirmation(config: &Config) -> Result<Check> {
+    if config.confirm == config::ConfirmMode::Off {
+        // `from_config` hands back the confirmer that approves everything here,
+        // so going ahead would report an approval nobody was asked for.
+        return Ok(Check::failed(
+            "confirmation",
+            "confirm = \"off\" — nothing to test; enable a confirm mode first".into(),
+        ));
+    }
+    let confirmer = confirm::from_config(config)?;
+    let ctx = confirm::ConfirmContext {
+        key_name: "doctor test (no real key)".into(),
+        fingerprint: "SHA256:this-is-only-a-test".into(),
+        item_id: "0".into(),
+        peer: Some(confirm::PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            // SAFETY: getuid cannot fail and touches no memory.
+            uid: unsafe { libc::getuid() },
+        }),
+        bindings: Vec::new(),
+    };
+    Ok(match confirmer.confirm(&ctx).await {
+        confirm::Decision::Approve => {
+            Check::passed("confirmation", "user approved the test prompt".into())
+        }
+        confirm::Decision::Deny => Check::failed(
+            "confirmation",
+            "denied/timed out (fail-closed works, but approve to pass this check)".into(),
+        ),
+    })
 }
 
 #[cfg(test)]
