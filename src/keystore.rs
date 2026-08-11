@@ -5,6 +5,40 @@ use crate::config::{Config, KeyConfig};
 use crate::error::{Error, Result};
 use crate::lpass::LpassClient;
 
+/// Why a configured/discovered item cannot be served. Shared by startup and
+/// `doctor` so the diagnostic command cannot drift from the real policy.
+#[derive(Debug, thiserror::Error)]
+pub enum KeyIssue {
+    #[error("{0}")]
+    Fetch(#[from] crate::lpass::LpassError),
+
+    #[error("item has an empty Public Key field")]
+    Empty,
+
+    #[error("Public Key field does not parse as an OpenSSH public key: {0}")]
+    Malformed(String),
+
+    #[error("this agent cannot sign with {0} keys")]
+    Unsupported(String),
+
+    #[error(
+        "same public key as item {other_item} — signing would be ambiguous; start will refuse this"
+    )]
+    Duplicate { other_item: String },
+}
+
+/// The result of applying the agent's complete public-key policy to one
+/// item. Names are display-escaped before either consumer sees them.
+#[derive(Debug)]
+pub enum KeyInspection {
+    Usable(KeyEntry),
+    Unusable {
+        item_id: String,
+        name: String,
+        issue: KeyIssue,
+    },
+}
+
 /// One usable key: the public half plus where to find the private half.
 /// The private key is never stored here.
 #[derive(Debug)]
@@ -29,6 +63,68 @@ pub struct KeyStore {
     entries: Vec<KeyEntry>,
 }
 
+/// Fetch and validate every public key, including cross-item duplicate
+/// detection. This is the single source of truth for both startup and
+/// `doctor`; private fields are never touched.
+pub async fn inspect_keys(
+    client: &dyn LpassClient,
+    keys: &[KeyConfig],
+    config: &Config,
+) -> Vec<KeyInspection> {
+    let mut inspected = Vec::with_capacity(keys.len());
+    let mut seen: Vec<(KeyData, String)> = Vec::new();
+
+    for key in keys {
+        let name = crate::text::escape_for_display(key.display_name());
+        let public = match client.show_field(&key.id, "Public Key").await {
+            Ok(raw) if raw.is_empty() => Err(KeyIssue::Empty),
+            Ok(raw) => {
+                let text = String::from_utf8_lossy(&raw);
+                PublicKey::from_openssh(text.trim())
+                    .map_err(|e| KeyIssue::Malformed(e.to_string()))
+                    .and_then(|public| {
+                        if crate::signing::can_sign(&public.algorithm()) {
+                            Ok(public)
+                        } else {
+                            Err(KeyIssue::Unsupported(public.algorithm().to_string()))
+                        }
+                    })
+            }
+            Err(e) => Err(e.into()),
+        };
+
+        let public = public.and_then(|public| {
+            if let Some((_, other_item)) = seen
+                .iter()
+                .find(|(seen_key, _)| seen_key == public.key_data())
+            {
+                Err(KeyIssue::Duplicate {
+                    other_item: other_item.clone(),
+                })
+            } else {
+                seen.push((public.key_data().clone(), key.id.clone()));
+                Ok(public)
+            }
+        });
+
+        inspected.push(match public {
+            Ok(public) => KeyInspection::Usable(KeyEntry {
+                item_id: key.id.clone(),
+                name,
+                public,
+                confirm: config.confirm_required(key),
+            }),
+            Err(issue) => KeyInspection::Unusable {
+                item_id: key.id.clone(),
+                name,
+                issue,
+            },
+        });
+    }
+
+    inspected
+}
+
 impl KeyStore {
     /// Fetch the public half of every key (explicitly configured or
     /// auto-discovered). Items that fail to load are skipped with a warning;
@@ -40,56 +136,26 @@ impl KeyStore {
         config: &Config,
     ) -> Result<Self> {
         let mut entries: Vec<KeyEntry> = Vec::new();
-        for key in keys {
-            let public = match client.show_field(&key.id, "Public Key").await {
-                Ok(raw) if raw.is_empty() => {
-                    tracing::warn!(item = %key.id, name = %crate::text::escape_for_display(key.display_name()),
-                        "skipping: item has an empty Public Key field");
-                    continue;
+        for inspection in inspect_keys(client, keys, config).await {
+            match inspection {
+                KeyInspection::Usable(entry) => entries.push(entry),
+                KeyInspection::Unusable {
+                    item_id,
+                    name,
+                    issue: issue @ KeyIssue::Duplicate { .. },
+                } => {
+                    return Err(Error::ConfigInvalid(format!(
+                        "item {item_id} ({name}): {issue}"
+                    )));
                 }
-                Ok(raw) => {
-                    let text = String::from_utf8_lossy(&raw);
-                    match PublicKey::from_openssh(text.trim()) {
-                        Ok(public) if !crate::signing::can_sign(&public.algorithm()) => {
-                            // advertising it would mean offering an identity
-                            // every signing request then refuses
-                            tracing::warn!(item = %key.id, name = %crate::text::escape_for_display(key.display_name()),
-                                "skipping: this agent cannot sign with {} keys",
-                                public.algorithm());
-                            continue;
-                        }
-                        Ok(public) => public,
-                        Err(e) => {
-                            tracing::warn!(item = %key.id, name = %crate::text::escape_for_display(key.display_name()),
-                                "skipping: Public Key field does not parse as an OpenSSH public key: {e}");
-                            continue;
-                        }
-                    }
+                KeyInspection::Unusable {
+                    item_id,
+                    name,
+                    issue,
+                } => {
+                    tracing::warn!(item = %item_id, name = %name, "skipping: {issue}");
                 }
-                Err(e) => {
-                    tracing::warn!(item = %key.id, name = %crate::text::escape_for_display(key.display_name()),
-                        "skipping: {e}");
-                    continue;
-                }
-            };
-
-            if let Some(existing) = entries
-                .iter()
-                .find(|e| e.public.key_data() == public.key_data())
-            {
-                return Err(Error::ConfigInvalid(format!(
-                    "items {} and {} hold the same public key; signing would be ambiguous — remove one from the config",
-                    existing.item_id, key.id
-                )));
             }
-
-            entries.push(KeyEntry {
-                item_id: key.id.clone(),
-                // vault-controlled: rendered by ssh-add, dialogs and logs
-                name: crate::text::escape_for_display(key.display_name()),
-                public,
-                confirm: config.confirm_required(key),
-            });
         }
 
         if entries.is_empty() {

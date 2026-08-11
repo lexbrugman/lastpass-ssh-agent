@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
+const MAX_DISCOVERY_PROBES: usize = 8;
+
 /// One vault item as listed by `lpass ls` (names/ids only — no secrets).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemSummary {
@@ -59,8 +61,8 @@ pub trait LpassClient: Send + Sync {
         field: &str,
     ) -> Result<Zeroizing<Vec<u8>>, LpassError>;
 
-    /// `lpass ls` over the whole vault (interactive `search` helper only —
-    /// the agent itself never enumerates the vault).
+    /// `lpass ls` over the whole vault. Used by interactive `search` and by
+    /// agent startup when no keys are pinned in the config.
     async fn ls(&self) -> Result<Vec<ItemSummary>, LpassError>;
 }
 
@@ -78,30 +80,35 @@ pub async fn discover_ssh_key_items(
             .is_none_or(|needle| item.name.to_lowercase().contains(needle))
     });
 
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
     let mut probes = tokio::task::JoinSet::new();
-    for item in items {
-        let client = client.clone();
-        let semaphore = semaphore.clone();
-        probes.spawn(async move {
-            let _permit = semaphore.acquire().await.expect("semaphore never closed");
-            match client.show_field(&item.id, "NoteType").await {
-                Ok(note_type) => Ok((item, &*note_type == b"SSH Key")),
-                // The item is simply not a note (ordinary password entries
-                // have no NoteType), or vanished since `ls`.
-                Err(LpassError::FieldNotFound { .. } | LpassError::ItemNotFound(_)) => {
-                    Ok((item, false))
-                }
-                // A real vault failure (logged out, timeout, ...) must not
-                // masquerade as "this key does not exist" — serving an
-                // incomplete identity set would silently break signing.
-                Err(e) => Err(e),
-            }
-        });
-    }
-
+    let mut items = items;
     let mut found = Vec::new();
-    while let Some(result) = probes.join_next().await {
+    loop {
+        // Bound both subprocess concurrency and the amount of queued task
+        // state: at most MAX_DISCOVERY_PROBES probes exist at any time.
+        while probes.len() < MAX_DISCOVERY_PROBES {
+            let Some(item) = items.next() else {
+                break;
+            };
+            let client = client.clone();
+            probes.spawn(async move {
+                match client.show_field(&item.id, "NoteType").await {
+                    Ok(note_type) => Ok((item, &*note_type == b"SSH Key")),
+                    // The item is simply not a note (ordinary password entries
+                    // have no NoteType), or vanished since `ls`.
+                    Err(LpassError::FieldNotFound { .. } | LpassError::ItemNotFound(_)) => {
+                        Ok((item, false))
+                    }
+                    // A real vault failure (logged out, timeout, ...) must not
+                    // masquerade as "this key does not exist" — serving an
+                    // incomplete identity set would silently break signing.
+                    Err(e) => Err(e),
+                }
+            });
+        }
+        let Some(result) = probes.join_next().await else {
+            break;
+        };
         // JoinError is unreachable: the probe body cannot panic, and nothing
         // aborts the set.
         let (item, is_ssh_key) = result.expect("discovery probe panicked")?;
@@ -180,6 +187,27 @@ mod discovery_tests {
         let ids: Vec<_> = found.iter().map(|i| i.id.as_str()).collect();
         // sorted by name (GitHub Key < Work/...), equal names tie-break by id
         assert_eq!(ids, ["1", "4", "6"]);
+    }
+
+    #[tokio::test]
+    async fn discovery_replenishes_its_bounded_probe_window() {
+        // More than MAX_DISCOVERY_PROBES items forces the scheduler to reap
+        // completed work and admit later items instead of spawning the whole
+        // vault up front.
+        let mut mock = MockLpass::logged_in();
+        for id in 0..(MAX_DISCOVERY_PROBES + 3) {
+            let id = id.to_string();
+            mock.items.push(ItemSummary {
+                name: format!("Key {id:0>2}"),
+                id: id.clone(),
+            });
+            mock = mock.with_field(&id, "NoteType", b"SSH Key");
+        }
+
+        let found = discover_ssh_key_items(Arc::new(mock), None).await.unwrap();
+        assert_eq!(found.len(), MAX_DISCOVERY_PROBES + 3);
+        assert_eq!(found.first().unwrap().id, "0");
+        assert_eq!(found.last().unwrap().id, "10");
     }
 
     #[tokio::test]

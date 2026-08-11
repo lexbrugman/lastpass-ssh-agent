@@ -359,55 +359,22 @@ async fn doctor(config_path: &Path, test_confirm: bool) -> Result<()> {
                 Vec::new()
             }
         };
-        // (fingerprint, item id) of every key seen, to flag the duplicate
-        // public keys that KeyStore::load would reject at startup
-        let mut seen: Vec<(String, String)> = Vec::new();
-        for key in &keys {
-            let label = format!(
-                "key {} [id: {}]",
-                text::escape_for_display(key.display_name()),
-                key.id
-            );
-            match client.show_field(&key.id, "Public Key").await {
-                Ok(v) if v.is_empty() => {
-                    check(false, &label, "item has an empty Public Key field".into());
-                }
-                // Same parse as KeyStore::load — doctor must predict what
-                // start will actually be able to serve.
-                Ok(v) => match ssh_key::PublicKey::from_openssh(String::from_utf8_lossy(&v).trim())
-                {
-                    Ok(public) if !signing::can_sign(&public.algorithm()) => check(
-                        false,
-                        &label,
-                        format!("this agent cannot sign with {} keys", public.algorithm()),
-                    ),
-                    Ok(public) => {
-                        let fingerprint = public.fingerprint(ssh_key::HashAlg::Sha256).to_string();
-                        if let Some((_, other)) = seen.iter().find(|(f, _)| *f == fingerprint) {
-                            check(
-                                false,
-                                &label,
-                                format!(
-                                    "same public key as item {other} — signing would be \
-                                     ambiguous; start will refuse this"
-                                ),
-                            );
-                        } else {
-                            check(
-                                true,
-                                &label,
-                                format!("{} {fingerprint}", public.algorithm()),
-                            );
-                            seen.push((fingerprint, key.id.clone()));
-                        }
-                    }
-                    Err(e) => check(
-                        false,
-                        &label,
-                        format!("Public Key field does not parse as an OpenSSH public key: {e}"),
-                    ),
-                },
-                Err(e) => check(false, &label, e.to_string()),
+        for inspection in keystore::inspect_keys(client.as_ref(), &keys, config).await {
+            match inspection {
+                keystore::KeyInspection::Usable(entry) => check(
+                    true,
+                    &format!("key {} [id: {}]", entry.name, entry.item_id),
+                    format!("{} {}", entry.public.algorithm(), entry.fingerprint()),
+                ),
+                keystore::KeyInspection::Unusable {
+                    item_id,
+                    name,
+                    issue,
+                } => check(
+                    false,
+                    &format!("key {name} [id: {item_id}]"),
+                    issue.to_string(),
+                ),
             }
         }
     }
