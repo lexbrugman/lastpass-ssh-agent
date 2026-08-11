@@ -20,6 +20,14 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # There is no checkout in this job — nothing here reads the tree. gh
+      # works out which repository to act on from the git remote, though, and
+      # without one it fails before it makes a single API call, so name the
+      # repository outright rather than cloning to satisfy it.
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/download-artifact@v8.0.1
         with:
