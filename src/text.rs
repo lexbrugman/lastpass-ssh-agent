@@ -59,11 +59,9 @@ pub fn escape_for_display(text: &str) -> String {
 ///
 /// Verified against UCD 17.0 (`DerivedCoreProperties.txt` for the property,
 /// `PropList.txt` for `Variation_Selector`): 3917 codepoints, no difference.
-/// The same comparison against every release back to Unicode 9.0 yields an
-/// identical set — which is why this is a table rather than a dependency. It
-/// has not moved in nine years, and the property reserves the space (the tag
-/// plane, U+FFF0..FFF8, the U+2065 hole) that would absorb a change if it
-/// ever did.
+/// Every release back to Unicode 9.0 yields the same set, which is why this is
+/// a table rather than a dependency — and the space that would absorb a change
+/// is already reserved: the tag plane, U+FFF0..FFF8, the U+2065 hole.
 const INVISIBLE_RANGES: &[(u32, u32)] = &[
     (0x00ad, 0x00ad),   // SOFT HYPHEN
     (0x034f, 0x034f),   // COMBINING GRAPHEME JOINER

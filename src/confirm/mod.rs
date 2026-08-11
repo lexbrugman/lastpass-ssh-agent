@@ -35,6 +35,9 @@ pub struct PeerInfo {
 #[derive(Debug, Clone)]
 pub struct SessionBinding {
     pub host_fingerprint: String,
+    /// The name `known_hosts` records for that key, when it records one.
+    /// Untrusted text like any other: escaped before display.
+    pub host_name: Option<String>,
     pub is_forwarding: bool,
 }
 
@@ -83,16 +86,13 @@ pub fn from_config(
     })
 }
 
-/// Human-readable description of a signing request, shared by all
-/// confirmers.
+/// Human-readable description of a signing request, shared by all confirmers.
 ///
-/// The key name (vault-controlled) and the requesting executable's path
-/// (controlled by whoever spawned the process) are untrusted. They are never
-/// passed as code — only as data (argv / dialog text) — but raw control
-/// characters would still let them redraw a TTY prompt, and a bidi override
-/// would let them reverse how the rest of the line renders. Either one
-/// spoofs which key or requester is being approved, so both are escaped
-/// here.
+/// The key name, the requester's path and the host name are all untrusted — the
+/// vault, whoever spawned the process, and `known_hosts` respectively. They only
+/// ever travel as data, but control characters could still redraw a TTY prompt
+/// and a bidi override could reverse how a line renders, either of which spoofs
+/// what is being approved. So everything interpolated here is escaped.
 pub fn describe_request(ctx: &ConfirmContext) -> String {
     use std::fmt::Write as _;
     let requester = ctx.peer.map_or_else(
@@ -122,7 +122,11 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
             .bindings
             .iter()
             .map(|bind| {
-                let mut hop = escape_for_display(&bind.host_fingerprint);
+                // The name when there is one: a fingerprint identifies the
+                // host exactly and says nothing to the person reading it. The
+                // log keeps the fingerprint either way.
+                let mut hop =
+                    escape_for_display(bind.host_name.as_ref().unwrap_or(&bind.host_fingerprint));
                 if bind.is_forwarding {
                     hop.push_str(" (forwarding the agent onward)");
                 }
@@ -170,7 +174,8 @@ fn process_path(pid: i32) -> Option<String> {
     }
 }
 
-/// Used when confirmation is off (globally or per key).
+/// Used when `confirm = "off"` globally. A per-key override is handled by not
+/// asking at all.
 pub struct NoConfirmer;
 
 #[async_trait::async_trait]
@@ -220,6 +225,47 @@ mod tests {
         // config load-time validation normally rejects this; the defensive
         // branch in from_config must fail rather than default to anything
         assert!(build("confirm = \"askpass\"").is_err());
+    }
+
+    /// A binding, optionally with the name `known_hosts` gave for it.
+    fn bound(host_name: Option<&str>) -> Vec<SessionBinding> {
+        vec![SessionBinding {
+            host_fingerprint: "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU".into(),
+            host_name: host_name.map(str::to_string),
+            is_forwarding: false,
+        }]
+    }
+
+    #[test]
+    fn a_named_host_is_shown_by_name_rather_than_fingerprint() {
+        // What someone approving a signature needs to read in a second is
+        // "github.com", not 43 characters of base64.
+        let ctx = ConfirmContext::new(&entry(), None, bound(Some("github.com")));
+        let text = describe_request(&ctx);
+        assert!(text.contains("SSH session: github.com"), "{text}");
+        assert!(!text.contains("SHA256:+DiY3"), "{text}");
+    }
+
+    #[test]
+    fn an_unnamed_host_still_shows_its_fingerprint() {
+        // No known_hosts entry, a hashed one, or a revoked one: the prompt
+        // stays exact rather than saying nothing about the host at all.
+        let ctx = ConfirmContext::new(&entry(), None, bound(None));
+        assert!(
+            describe_request(&ctx).contains("SSH session: SHA256:+DiY3"),
+            "the fingerprint must remain when there is no name"
+        );
+    }
+
+    #[test]
+    fn a_hostname_from_known_hosts_is_untrusted_text() {
+        // known_hosts is an editable file, so a name out of it gets the same
+        // treatment as a vault-controlled key name.
+        let ctx = ConfirmContext::new(&entry(), None, bound(Some("evil\r\n\x1b[2Jgithub.com")));
+        let text = describe_request(&ctx);
+        assert!(!text.contains('\x1b'), "{text}");
+        assert!(!text.contains('\r'), "{text}");
+        assert!(text.contains("\\x1b[2J"), "{text}");
     }
 
     #[test]

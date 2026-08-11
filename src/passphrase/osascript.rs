@@ -7,13 +7,12 @@ use super::{PassphrasePrompt, PassphraseRequest, PromptError};
 
 /// Native macOS passphrase dialog via `osascript`.
 ///
-/// The dialog uses `with hidden answer`, so the passphrase is masked as it is
-/// typed. Untrusted text (the key name comes from the vault) is passed as argv
-/// to `on run argv` and never interpolated into `AppleScript` source.
+/// `with hidden answer` masks the passphrase as it is typed. Untrusted text
+/// reaches the dialog as argv to `on run argv`, never interpolated into
+/// `AppleScript` source.
 ///
-/// Dialogs are shown one at a time: two identical-looking passphrase prompts
-/// stacked on screen invite typing one key's passphrase into the other's
-/// dialog.
+/// One dialog at a time: two identical prompts on screen invite typing one
+/// key's passphrase into the other's.
 pub struct OsascriptPrompt {
     timeout: Duration,
     /// Extra slack past the dialog's own give-up before we kill osascript.
@@ -22,10 +21,10 @@ pub struct OsascriptPrompt {
     serialize: tokio::sync::Mutex<()>,
 }
 
-/// Only the typed text is returned, rather than the whole `display dialog`
-/// record. `osascript` renders a record as `button returned:OK, text
-/// returned:secret`, which cannot be parsed back safely — a passphrase
-/// containing `, ` would be indistinguishable from the field separator.
+/// Returns only the typed text, not the whole `display dialog` record:
+/// `osascript` renders a record as `button returned:OK, text returned:secret`,
+/// which cannot be parsed back — a passphrase containing `, ` would be
+/// indistinguishable from the separator.
 const DIALOG_SCRIPT: &str = r#"
 on run argv
     set message to item 1 of argv

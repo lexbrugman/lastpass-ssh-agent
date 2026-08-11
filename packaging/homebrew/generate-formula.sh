@@ -113,62 +113,38 @@ class LastpassSshAgent < Formula
 
         brew services start lastpass-ssh-agent
 
-      It then starts again at every login. Homebrew does not restart running
-      services on upgrade, so after `brew upgrade` the old binary keeps
-      serving until the next login unless you restart it yourself:
+      It restarts at every login. Homebrew does not restart services on
+      upgrade, so after `brew upgrade` the old binary keeps serving until you
+      do:
 
         brew services restart lastpass-ssh-agent
 
-      On Linux a --user service only runs while you have a session. To keep
-      the agent up without one:
+      Do NOT use `sudo brew services`: a system daemon has no GUI session, so
+      every confirmation fails closed and nothing is ever signed.
 
-        loginctl enable-linger "$USER"
-
-      Do NOT use `sudo brew services`: as a system daemon the agent has no
-      GUI session, so every confirmation prompt fails closed and no signature
-      is ever approved.
-
-      On Linux the default confirmation mode is "tty", which a background
-      service has no terminal for. Set an askpass helper in
-      ~/.config/lastpass-ssh-agent/config.toml before starting the service:
+      On Linux, a --user service runs only while you have a session
+      (`loginctl enable-linger "$USER"` keeps it up without one), and the
+      default "tty" confirmation has no terminal. Set a helper in
+      ~/.config/lastpass-ssh-agent/config.toml before starting it:
 
         confirm = "askpass"
         askpass = "/usr/bin/ssh-askpass"
 
-      Point SSH at the agent. The socket path differs per platform, so take
-      it from the agent rather than guessing:
+      Point SSH at the agent. The socket path differs per platform, so ask:
 
         lastpass-ssh-agent env
 
-      and put that path in ~/.ssh/config:
+      and put that path in ~/.ssh/config, remembering that IdentityAgent
+      overrides SSH_AUTH_SOCK for the hosts it matches:
 
         Host *
             IdentityAgent "<the path printed above>"
 
-      Note that IdentityAgent overrides SSH_AUTH_SOCK for the hosts it matches.
+      There is a dev track (`brew install --HEAD`), which builds from source
+      and does not move forward on a plain `brew upgrade`. Switching either
+      way is documented at:
 
-      To follow the dev branch instead of releases, replace the install. It
-      builds from source, so this pulls in a Rust toolchain:
-
-        brew uninstall lastpass-ssh-agent
-        brew install --HEAD lastpass-ssh-agent
-
-      Switching tracks is always uninstall-then-install: `brew reinstall` has
-      no --HEAD option, and cannot move an install between the two.
-
-      A HEAD install does NOT move forward on a plain `brew upgrade` — brew
-      only checks whether the branch advanced when asked to:
-
-        brew upgrade --fetch-HEAD lastpass-ssh-agent
-
-      And back to the latest release:
-
-        brew uninstall lastpass-ssh-agent
-        brew install lastpass-ssh-agent
-
-      Either switch replaces the binary, not the running agent, so restart the
-      service afterwards. Saved Keychain passphrases are keyed by SSH key
-      fingerprint and survive the switch.
+        https://github.com/@REPO@#following-the-dev-branch
     EOS
   end
 

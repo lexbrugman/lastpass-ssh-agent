@@ -19,17 +19,18 @@ What this agent **guarantees**:
 - **No caching.** There is deliberately no private-key cache. Each signature
   is a fresh fetch (public keys and item metadata are cached for the agent's
   lifetime — they are not secrets).
-- **User-visible signing.** By default every signature pops a native
-  confirmation dialog naming the key and the requesting process, with *Deny*
-  as the default and cancel button. Timeouts, missing GUI sessions, and
-  helper failures all fail closed to Deny.
-- **Agent forwarding is visible.** The agent implements
-  `session-bind@openssh.com`, so when a request arrives over a connection you
-  forwarded with `ssh -A`, the prompt names the host chain (verified by each
-  host's own key signature) and warns that the request may have originated
-  there rather than on your machine. Without this, a relayed request looks
-  identical to one you made yourself. Bindings whose signature does not
-  verify are refused and never displayed.
+- **User-visible signing.** By default every signature asks first — a native
+  dialog on macOS, a `/dev/tty` prompt on Linux — naming the key and the
+  requesting process, with *Deny* as the default and cancel button. Timeouts,
+  missing GUI sessions and helper failures all fail closed to Deny.
+- **The host is named, and forwarding is visible.** The agent implements
+  `session-bind@openssh.com`, so the prompt names the host each request is for
+  — by hostname where `known_hosts` records one for that key, by fingerprint
+  otherwise — and each hop proved possession of its host key. When the request
+  arrived over a connection you forwarded with `ssh -A` it says so and warns
+  that it may have originated there rather than on your machine; without that,
+  a relayed request looks identical to one you made yourself. Bindings whose
+  signature does not verify are refused and never displayed.
 - **Read-only agent.** `ssh-add` (add/remove/lock/unlock) is refused. The
   agent serves the vault's SSH Key items discovered at startup — or, with
   `[[keys]]` pinned in the config, exactly those and nothing else.
@@ -77,9 +78,8 @@ tar -xJf "lastpass-ssh-agent-${target}.tar.xz"
 install -m 755 lastpass-ssh-agent /usr/local/bin/
 ```
 
-> The tap is populated by the release pipeline. Until the first release has
-> run and a `homebrew-tap` repository exists (see [Releasing](#releasing)),
-> build from source instead.
+> The tap is populated by the release pipeline. If `brew install` cannot find
+> the formula, the tap does not exist yet — build from source.
 
 Or build it yourself:
 
@@ -87,6 +87,24 @@ Or build it yourself:
 brew install lastpass-cli
 cargo build --release        # needs rustup; rust-version >= 1.87
 cp target/release/lastpass-ssh-agent /usr/local/bin/  # or anywhere on PATH
+```
+
+Versions are CalVer — `YYYY.MMDD.PATCH`, so `2026.810.0` is the first
+release on 10 August 2026 and `2026.810.1` a same-day fix. `--version`
+spells it out along with the exact commit:
+
+```
+$ lastpass-ssh-agent --version
+lastpass-ssh-agent 2026.810.0 (2026-08-10, commit 4f2a9c1e77b3)
+```
+
+A build that is not a release says so, by naming the release it follows and
+how far past it the build is — five commits, here — so a dev install can
+never be mistaken for a published one:
+
+```
+$ lastpass-ssh-agent --version
+lastpass-ssh-agent 2026.810.0-5-g4f2a9c1e77b3 (2026-08-10, commit 4f2a9c1e77b3)
 ```
 
 ### Following the dev branch
@@ -107,38 +125,19 @@ brew uninstall lastpass-ssh-agent && brew install --HEAD lastpass-ssh-agent
 brew uninstall lastpass-ssh-agent && brew install lastpass-ssh-agent
 ```
 
-Two things about the dev track are easy to trip over. A HEAD install builds
-from source, so Homebrew installs a Rust toolchain as a build dependency and
-every update recompiles — a release install unpacks a prebuilt binary and
-needs no compiler. And `--fetch-HEAD` is not optional: without it Homebrew
-only re-examines the branch when a new version is released, so a plain
-`brew upgrade` leaves a dev install sitting on the commit it was built from.
+Two things are easy to trip over. A HEAD install builds from source, so
+Homebrew installs a Rust toolchain as a build dependency and every update
+recompiles, where a release install unpacks a prebuilt binary. And
+`--fetch-HEAD` is not optional: without it Homebrew only re-examines the branch
+when a new version is released, so a plain `brew upgrade` leaves a dev install
+sitting on the commit it was built from.
 
 `brew list --versions` shows `HEAD-<sha>` for a dev install, and `--version`
 reports the real commit either way, so it is always clear what is running.
 Switching tracks replaces the binary but not the running agent, so restart the
-service afterwards; saved Keychain passphrases are keyed by key fingerprint
-and are unaffected. Beware that a config using a dev-only setting will stop an
-older release from starting at all, since unknown values are rejected rather
-than ignored.
-
-Versions are CalVer — `YYYY.MMDD.PATCH`, so `2026.810.0` is the first
-release on 10 August 2026 and `2026.810.1` a same-day fix. `--version`
-spells it out along with the exact commit:
-
-```
-$ lastpass-ssh-agent --version
-lastpass-ssh-agent 2026.810.0 (2026-08-10, commit 4f2a9c1e77b3)
-```
-
-A build that is not a release says so, by naming the release it follows and
-how far past it the build is — five commits, here — so a dev install can
-never be mistaken for a published one:
-
-```
-$ lastpass-ssh-agent --version
-lastpass-ssh-agent 2026.810.0-5-g4f2a9c1e77b3 (2026-08-10, commit 4f2a9c1e77b3)
-```
+service afterwards; saved Keychain passphrases are keyed by key fingerprint and
+are unaffected. A config using a dev-only setting will stop an older release
+from starting at all, since unknown values are rejected rather than ignored.
 
 ## Setup
 
@@ -152,7 +151,9 @@ no secret fields are touched during discovery).
 3. Check everything: `lastpass-ssh-agent doctor` (add `--test-confirm` to
    try the confirmation dialog once — first use may trigger a macOS
    automation permission prompt for System Events).
-   `lastpass-ssh-agent search` lists the SSH Key items it would serve.
+   `lastpass-ssh-agent search` finds SSH Key items in the vault and prints
+   pin-ready snippets; `lastpass-ssh-agent list` prints the keys the agent
+   would actually serve, with fingerprints.
 
 ### Optional config
 
@@ -162,6 +163,7 @@ vault scan) or tuning behavior:
 
 ```toml
 # confirm = "osascript"        # default on macOS; tty | askpass | off
+# askpass = "/usr/bin/ssh-askpass"   # required when confirm = "askpass"
 # confirm_timeout_secs = 30
 # socket = "~/Library/Application Support/lastpass-ssh-agent/agent.sock"
 # lpass_path = "/opt/homebrew/bin/lpass"
@@ -194,8 +196,8 @@ Whoever steals the vault then holds a key they cannot use. The prompt appears
 on the same channel as your confirmations (`osascript`, `tty` or `askpass`);
 with `confirm = "off"` it uses the platform default, since silencing approval
 prompts does not mean you cannot be reached. Set
-`passphrase_fallback = "error"` to keep the pre-existing behavior, where an
-encrypted key with an empty `Passphrase` field simply refuses to sign.
+`passphrase_fallback = "error"` if an encrypted key with an empty `Passphrase`
+field should simply refuse to sign instead.
 
 On macOS, `passphrase_fallback = "keychain"` asks once and remembers the
 answer, so the separation costs one prompt per key rather than one per
@@ -205,33 +207,31 @@ session:
 passphrase_fallback = "keychain"
 ```
 
-The vault keeps the encrypted key; the Keychain keeps only the passphrase.
-Neither store holds both, so compromising either one alone yields nothing
-usable. It is stored as a generic-password item under the service
-`lastpass-ssh-agent`, with the key's SHA-256 fingerprint as the account — the
-fingerprint identifies the key itself, so renaming the vault item, moving it
-between folders or recreating it all still find the same passphrase. It is
-saved only *after* it has decrypted the key, so a typo never becomes a stored
-credential, and a stored passphrase that stops working prompts you to correct
-it rather than locking the key. The item uses the login keychain's ordinary
-protection, deliberately without a per-signature authorization dialog: the
-agent already asks you to approve each signature, and a second system prompt
-on top of that would make normal SSH use impractical.
+Neither store then holds both halves, so compromising one alone yields nothing
+usable. Each key gets its own generic-password entry under the service
+`lastpass-ssh-agent`, keyed by the key's SHA-256 fingerprint — so renaming or
+recreating the vault item still finds the passphrase, several keys are
+remembered independently, and deleting one entry in Keychain Access revokes just
+that key.
 
-This mode is macOS-only and rejected at startup elsewhere. It never caches the
-private key — every signature still fetches, decrypts and discards it; the
-Keychain is a passphrase store, not a key store.
+A passphrase is stored only *after* it has decrypted the key, so a typo never
+becomes a stored credential, and one that stops working prompts for a
+correction rather than locking the key. The entry takes the login keychain's
+ordinary protection, deliberately without a per-signature authorization dialog
+on top of the agent's own confirmation.
 
-Two properties are worth stating explicitly, because they are what stop a
-local prompt from becoming a way around the vault:
+This mode is macOS-only and rejected at startup elsewhere.
+
+Two properties are what stop a local prompt from becoming a way around the
+vault:
 
 - A **wrong** `Passphrase` field fails the signature. Fallback happens when
   the field is *absent*, never when it is present and does not work —
   otherwise anything able to draw a dialog could override a passphrase you
   pinned in the vault.
-- Nothing is cached. Each signature fetches the key, resolves the passphrase,
-  decrypts, signs, and wipes both. A passphrase typed once is not reused for
-  the next signature.
+- Nothing is cached, in any mode. Each signature fetches the key, resolves the
+  passphrase, decrypts, signs, and wipes both. The Keychain is a passphrase
+  store, not a key store.
 
 ## Run
 
@@ -322,10 +322,56 @@ another agent.
 
 | mode | behavior |
 |---|---|
-| `osascript` (macOS default) | Native dialog: key name, fingerprint, requesting process (pid/uid via the socket's peer credentials). Deny is default + cancel; expiry = Deny; no GUI session = Deny. Vault-sourced strings are passed as AppleScript *arguments*, never spliced into code. |
+| `osascript` (macOS default) | Native dialog: key name, fingerprint, requesting process (pid/uid via the socket's peer credentials), and the bound host. Deny is default + cancel; expiry = Deny; no GUI session = Deny. Vault-sourced strings are passed as AppleScript *arguments*, never spliced into code. |
 | `tty` (Linux default) | Prompt on the agent's own `/dev/tty`; type `yes` to approve. |
 | `askpass` | Runs the program in `askpass` with the prompt as its argument; exit 0 approves. `SSH_ASKPASS_PROMPT=confirm` is set, so OpenSSH-compatible helpers show a yes/no dialog rather than their password prompt — without it, clicking OK would approve whatever was typed. |
 | `off` | No confirmation (socket permissions are then your only guard, as with stock ssh-agent). |
+
+## Notes & limitations
+
+- **Passphrase-protected keys** work: the agent reads the item's
+  `Passphrase` field and decrypts in memory. Storing key + passphrase in the
+  same vault item means the passphrase adds nothing against a vault
+  compromise — it only protects the key blob in transit/backups. Leaving that
+  field empty is what buys the separation; see [Keeping the passphrase out of
+  the vault](#keeping-the-passphrase-out-of-the-vault).
+- **The passphrase prompt shares `confirm_timeout_secs`** (30s by default),
+  which is generous for pressing a button but tight for typing a long
+  passphrase. Raise it if entry keeps timing out.
+- **Suspending a `tty` passphrase prompt leaves the terminal with echo off.**
+  Ctrl-Z skips the cleanup a timeout or cancellation runs, so the shell comes
+  back not showing what you type and anything half-typed stays queued for it.
+  `stty sane` restores it; finishing or cancelling the prompt avoids it.
+- **`HashKnownHosts` means the prompt shows fingerprints, not hostnames.** A
+  hashed entry stores the name as a salted MAC, which can only be tested
+  against a name you already have — and the binding supplies only the key.
+  Hashing is per entry, so plain entries in the same file still resolve.
+  (Upstream OpenSSH defaults this off; Debian and Ubuntu ship it on.)
+- **Certificates** are not served; plain keys only.
+- Destination constraints (`ssh-add -h`) are not applicable: this agent
+  refuses key addition, and its key set comes from the vault.
+- **RSA**: SHA-1 (`ssh-rsa`) signature requests are refused; every OpenSSH
+  since 7.2 asks for `rsa-sha2-*`. Supported key types: ed25519, RSA,
+  ECDSA p256/p384.
+- The `socket` path must be absolute (SSH clients resolve `SSH_AUTH_SOCK`
+  from their own working directory), and macOS limits Unix socket paths to
+  ~104 bytes (`SUN_LEN`), so keep it short.
+- `ssh-agent-lib`'s own logging is capped at INFO even under
+  `RUST_LOG=debug`: its debug output Debug-formats whole requests, and an
+  `AddIdentity` request carries the client's private key. Routine refusals do
+  not reach it at all — this agent answers them itself, so a probe or a Deny
+  is never logged as a fault.
+- Each signature costs an `lpass show` (~100–500 ms against the local vault
+  cache). That is the price of the no-caching design.
+- Item lookups use the LastPass **item id**, not the name, so renames are
+  safe and duplicate names are ambiguity-free. If the vault item's key is
+  edited while the agent runs, the agent notices the public-key mismatch and
+  refuses to sign until restarted.
+- In auto-discovery mode, an SSH Key item added to the vault is served after
+  the next agent restart (discovery runs once at startup). Pin `[[keys]]` if
+  you want new vault items to require an explicit opt-in instead.
+- `tests/fixtures/` contains throwaway SSH keypairs used by the test suite
+  only. They protect nothing and must never be authorized anywhere.
 
 ## Releasing
 
@@ -462,14 +508,12 @@ docker compose run --rm audit   # cargo audit (fetches the advisory db)
 docker compose run --rm shell   # interactive shell in the dev image
 ```
 
-The container runs unprivileged: root bypasses file permissions, which would
-make the tests asserting that the agent refuses an unreadable config or an
-unprobeable socket skip themselves and drop coverage below the required 100%.
-The gate only reads the mounted checkout, so the container's ids do not have
-to match yours — on macOS they never do and it makes no difference. If you do
-need them to line up, build with `DEV_UID=$(id -u) DEV_GID=$(id -g) docker
-compose build`, and if any service has already run, `docker compose down -v`
-first: the cache volumes keep the ownership they were created with.
+The container runs unprivileged, because root bypasses the file permissions
+several tests assert on. The gate only reads the mounted checkout, so its ids
+need not match yours — on macOS they never do. If you do need them to line up,
+build with `DEV_UID=$(id -u) DEV_GID=$(id -g) docker compose build`, and
+`docker compose down -v` first if any service has already run: the cache
+volumes keep the ownership they were created with.
 
 The first run builds the dev image. Toolchains are baked in, so refresh them
 occasionally with `docker compose build --pull --no-cache` — `--pull` alone
@@ -487,9 +531,10 @@ export LASTPASS_SSH_AGENT_COMMIT=$(git rev-parse --short=12 HEAD)
 
 The gate itself is `./scripts/check.sh` (which the `check` service runs),
 and CI enforces the same on every push: `cargo fmt --check`, `cargo clippy`
-with the pedantic and nursery groups and `-D warnings`, and the test suite
-on macOS and Linux (`./scripts/test.sh`). If you do have the toolchain
-installed, the scripts run directly on the host too.
+with the pedantic and nursery groups and `-D warnings`, the archive and
+formula-generator checks, and the test suite on macOS and Linux
+(`./scripts/test.sh`). If you do have the toolchain installed, the scripts run
+directly on the host too.
 
 CI adds one check the gate does not: `cargo audit` (see
 [Dependencies](#dependencies)). It is deliberately not in `check.sh`, which
@@ -497,10 +542,6 @@ stays offline and hermetic — its result depends on a database fetched over
 the network and changes without the code changing, so a local run could fail
 for reasons that have nothing to do with your edit. The `audit` compose
 service runs it on demand.
-
-The generated dist workflow skips pull requests (`pr-run-mode = "skip"`), so
-ordinary branch pushes run only `CI`; the release workflow starts when the
-master gate explicitly dispatches it.
 
 Tests always run instrumented, so "the tests pass" means every test passed
 *and* every line and branch of production code was covered — anything less
@@ -511,44 +552,3 @@ Test modules themselves and a handful of provably-unreachable error edges
 (e.g. `setrlimit(0,0)` failing) are excluded via
 `#[cfg_attr(coverage_nightly, coverage(off))]`, each with a comment
 justifying why it cannot be exercised.
-
-## Notes & limitations
-
-- **Passphrase-protected keys** work: the agent reads the item's
-  `Passphrase` field and decrypts in memory. Storing key + passphrase in the
-  same vault item means the passphrase adds nothing against a vault
-  compromise — it only protects the key blob in transit/backups. Leaving that
-  field empty is what buys the separation; see [Keeping the passphrase out of
-  the vault](#keeping-the-passphrase-out-of-the-vault).
-- **The passphrase prompt shares `confirm_timeout_secs`** (30s by default),
-  which is generous for pressing a button but tight for typing a long
-  passphrase. Raise it if entry keeps timing out.
-- **Suspending a `tty` passphrase prompt leaves the terminal with echo off.**
-  Ctrl-Z (or Ctrl-\\) does not run the cleanup that a timeout, a cancellation
-  or an error does, so the shell comes back not showing what you type, and
-  anything half-typed stays queued for it to read. `stty sane` restores the
-  terminal. Finish or cancel the prompt rather than suspending it.
-- **Certificates** are not served; plain keys only.
-- Destination constraints (`ssh-add -h`) are not applicable: this agent
-  refuses key addition, and its key set comes from the vault.
-- **RSA**: SHA-1 (`ssh-rsa`) signature requests are refused; every OpenSSH
-  since 7.2 asks for `rsa-sha2-*`. Supported key types: ed25519, RSA,
-  ECDSA p256/p384.
-- The `socket` path must be absolute (SSH clients resolve `SSH_AUTH_SOCK`
-  from their own working directory), and macOS limits Unix socket paths to
-  ~104 bytes (`SUN_LEN`), so keep it short.
-- `ssh-agent-lib`'s own logging is off by default: it reports routine
-  protocol traffic (OpenSSH's per-connection extension probe, every refusal)
-  at ERROR level. Set `RUST_LOG=ssh_agent_lib=info` to see it; it stays
-  capped at INFO so request dumps can never reach the log.
-- Each signature costs an `lpass show` (~100–500 ms against the local vault
-  cache). That is the price of the no-caching design.
-- Item lookups use the LastPass **item id**, not the name, so renames are
-  safe and duplicate names are ambiguity-free. If the vault item's key is
-  edited while the agent runs, the agent notices the public-key mismatch and
-  refuses to sign until restarted.
-- In auto-discovery mode, an SSH Key item added to the vault is served after
-  the next agent restart (discovery runs once at startup). Pin `[[keys]]` if
-  you want new vault items to require an explicit opt-in instead.
-- `tests/fixtures/` contains throwaway SSH keypairs used by the test suite
-  only. They protect nothing and must never be authorized anywhere.

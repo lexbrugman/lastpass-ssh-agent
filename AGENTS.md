@@ -101,10 +101,9 @@ async fn a_crlf_helper_does_not_leak_the_carriage_return() {
 }
 ```
 
-That is the whole of what `rstest` or `test-case` would add, minus the
-dependency — and the diagnostics are better than a loop's, because a failing
-case is named rather than merely being the point where the loop stopped. (For
-the record: `test-case`'s last release was 2023, which is its own argument.)
+That is the whole of what a parameterized-test crate would add, minus the
+dependency — and the diagnostics beat a loop's, because a failure names the case
+rather than the point where the loop stopped.
 
 A `for` loop over a table is still right where the cases are cheap, pure and
 numerous — rejecting a list of malformed ids, escaping a list of strings. Name
@@ -120,9 +119,9 @@ with the bug — write both sides out literally.
 
 ## Test determinism
 
-Two races are easy to reintroduce, and both were flaky in CI before being
-fixed. They are worth knowing before writing a test that spawns a process or
-drives a prompt.
+Two races are easy to reintroduce. Both make a test fail once in a dozen runs
+rather than reliably, so they are worth knowing before writing a test that
+spawns a process or drives a prompt.
 
 - **Never write an executable with `std::fs::write` and then run it.** Executing
   a file that any process holds a write descriptor for fails with `ETXTBSY`, and

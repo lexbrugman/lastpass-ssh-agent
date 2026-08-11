@@ -46,9 +46,8 @@ fn crypto_err<E: std::fmt::Display>(e: E) -> SignError {
 ///
 /// RSA cannot go through ssh-key 0.6.7's own `Signer`: it hard-codes
 /// rsa-sha2-512 (ignoring the flags) and its `RsaKeypair -> rsa::RsaPrivateKey`
-/// conversion is broken (passes `p` twice). We convert manually and pick the
-/// digest from the request flags, exactly like the upstream key-storage
-/// example does.
+/// conversion passes `p` twice. So the components are converted here and the
+/// digest comes from the request flags.
 pub fn sign_with_key(key: &PrivateKey, data: &[u8], flags: u32) -> Result<Signature, SignError> {
     match key.key_data() {
         KeypairData::Rsa(rsa_keypair) => {

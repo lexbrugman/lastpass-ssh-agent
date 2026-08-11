@@ -6,6 +6,7 @@ mod config;
 mod confirm;
 mod error;
 mod keystore;
+mod knownhosts;
 mod lpass;
 mod passphrase;
 mod platform;
@@ -176,7 +177,13 @@ async fn start(config_path: &Path) -> Result<()> {
     print_env(&socket_path);
 
     let factory = AgentFactory {
-        template: agent::LpassAgent::new(store, client, confirmer, unlocker),
+        template: agent::LpassAgent::new(
+            store,
+            client,
+            confirmer,
+            unlocker,
+            Arc::new(knownhosts::HostNames::default()),
+        ),
     };
     let result = tokio::select! {
         result = ssh_agent_lib::agent::listen(listener, factory) => {
@@ -425,6 +432,7 @@ async fn doctor(config_path: &Path, test_confirm: bool) -> Result<()> {
                 item_id: "0".into(),
                 peer: Some(confirm::PeerInfo {
                     pid: Some(std::process::id().cast_signed()),
+                    // SAFETY: getuid cannot fail and touches no memory.
                     uid: unsafe { libc::getuid() },
                 }),
                 bindings: Vec::new(),

@@ -25,19 +25,19 @@ pub struct LpassAgent {
     /// Decrypts the fetched key, resolving a passphrase the vault does not
     /// hold. Reached only for an encrypted key.
     unlocker: Arc<Unlocker>,
+    /// Names the hosts a connection is bound to. Read per signature, since
+    /// `ssh` records a new host as it agrees to connect — before the signature
+    /// the prompt is about.
+    host_names: Arc<crate::knownhosts::HostNames>,
     /// One signing request at a time, shared by every connection.
     ///
-    /// Confirmation and passphrase entry are separate transports with separate
-    /// locks, so each only keeps *itself* from overlapping. Without this, one
-    /// request's passphrase prompt and another's confirmation prompt could own
-    /// the same terminal at once, and whichever read first would take the
-    /// answer meant for the other — with `TtyConfirmer` reading its line into
-    /// an ordinary `String`, that is a passphrase landing in memory nothing
-    /// wipes.
+    /// Confirmation and passphrase entry lock only against themselves, so two
+    /// requests could otherwise hold one terminal at once and each read the
+    /// other's answer — a passphrase landing in `TtyConfirmer`'s ordinary
+    /// `String`, which nothing wipes.
     ///
-    /// Held across the whole request rather than around each prompt:
-    /// releasing in between would leave exactly the gap this closes. OpenSSH's
-    /// own agent answers requests one at a time as well.
+    /// Held for the whole request: releasing between the two prompts leaves
+    /// exactly that gap. OpenSSH's own agent is serial too.
     interaction: Arc<tokio::sync::Mutex<()>>,
     /// pid/uid of the connected client, filled in per session.
     peer: Option<PeerInfo>,
@@ -58,12 +58,14 @@ impl LpassAgent {
         lpass: Arc<dyn LpassClient>,
         confirmer: Arc<dyn Confirmer>,
         unlocker: Arc<Unlocker>,
+        host_names: Arc<crate::knownhosts::HostNames>,
     ) -> Self {
         Self {
             store,
             lpass,
             confirmer,
             unlocker,
+            host_names,
             interaction: Arc::new(tokio::sync::Mutex::new(())),
             peer: None,
             bindings: Vec::new(),
@@ -137,9 +139,31 @@ impl LpassAgent {
             "session bound");
         self.bindings.push(SessionBinding {
             host_fingerprint,
+            // Named when a signature is actually asked for; see `host_names`.
+            host_name: None,
             is_forwarding: bind.is_forwarding,
         });
         Response::Success
+    }
+
+    /// This connection's bindings, each with the name `known_hosts` gives its
+    /// host key, so the prompt can say "github.com" instead of 43 characters
+    /// of base64.
+    async fn named_bindings(&self) -> Vec<SessionBinding> {
+        let mut bindings = self.bindings.clone();
+        let fingerprints = bindings
+            .iter()
+            .map(|bind| bind.host_fingerprint.clone())
+            .collect();
+        // Fewer names than bindings if the lookup gave up; zip stops at the
+        // shorter side and the rest keep their fingerprints.
+        for (bind, name) in bindings
+            .iter_mut()
+            .zip(self.host_names.names_for(fingerprints).await)
+        {
+            bind.host_name = name;
+        }
+        bindings
     }
 
     /// Everything that touches the private key, in one place.
@@ -193,13 +217,11 @@ impl Session for LpassAgent {
     /// Dispatch every request ourselves.
     ///
     /// The default dispatcher signals a refusal by returning `Err`, and
-    /// ssh-agent-lib logs every `Err` at ERROR. That made two entirely
-    /// normal things look like agent malfunctions: OpenSSH probes for
-    /// vendor extensions on each connection, and a user pressing Deny is a
-    /// deliberate outcome we already log ourselves. Refusals are protocol
-    /// answers, so they are returned as such — the bytes on the wire are
-    /// unchanged (`SSH_AGENT_FAILURE` either way), and the library's own
-    /// logging stays on to report faults that really are faults.
+    /// ssh-agent-lib logs every `Err` at ERROR — but an extension probe and a
+    /// user pressing Deny are protocol answers, not faults, so they are
+    /// returned as such. The bytes on the wire are unchanged
+    /// (`SSH_AGENT_FAILURE` either way), and the library's own logging stays
+    /// on for faults that really are faults.
     async fn handle(&mut self, message: Request) -> Result<Response, AgentError> {
         Ok(match message {
             Request::RequestIdentities => {
@@ -241,7 +263,7 @@ impl Session for LpassAgent {
         };
 
         if entry.confirm {
-            let ctx = ConfirmContext::new(entry, self.peer, self.bindings.clone());
+            let ctx = ConfirmContext::new(entry, self.peer, self.named_bindings().await);
             match self.confirmer.confirm(&ctx).await {
                 Decision::Approve => {}
                 Decision::Deny => {
@@ -345,7 +367,21 @@ mod tests {
                 .unwrap(),
         );
         let unlocker = Arc::new(Unlocker::new(client.clone(), prompt));
-        LpassAgent::new(store, client, Arc::new(NoConfirmer), unlocker)
+        LpassAgent::new(
+            store,
+            client,
+            Arc::new(NoConfirmer),
+            unlocker,
+            no_host_names(),
+        )
+    }
+
+    /// No `known_hosts` at all. Every binding then shows its fingerprint, so
+    /// these tests read the same on any machine — with the real files, a
+    /// fixture key that happened to be in someone's `~/.ssh/known_hosts`
+    /// would change what the prompt says.
+    fn no_host_names() -> Arc<crate::knownhosts::HostNames> {
+        Arc::new(crate::knownhosts::HostNames::with_files(Vec::new()))
     }
 
     /// The passphrase machinery wired to one prompt, for the direct
@@ -468,6 +504,7 @@ mod tests {
             client.clone(),
             Arc::new(DenyAll),
             unlocking(&client, Arc::new(NoPrompt)),
+            no_host_names(),
         );
 
         assert!(agent
@@ -501,6 +538,7 @@ mod tests {
             logged_out.clone(),
             Arc::new(NoConfirmer),
             unlocking(&logged_out, Arc::new(NoPrompt)),
+            no_host_names(),
         );
 
         assert!(agent
@@ -692,8 +730,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_populated_field_wins_over_the_prompt() {
-        // Backward compatibility: an existing user with the passphrase in the
-        // vault keeps working, and is never asked for it.
+        // The vault field is authoritative: a populated one is used, and
+        // nothing is asked.
         let prompt = TypedPassphrase::new(b"would be wrong");
         let mut agent = pw_agent(Some(b"fixture-passphrase"), PW_KEY, &prompt).await;
         assert!(agent
@@ -796,6 +834,7 @@ mod tests {
             client,
             Arc::new(WatchingConfirmer(watch.clone())),
             unlocker,
+            no_host_names(),
         );
 
         // two client connections, as separate sessions sharing the agent
@@ -831,6 +870,7 @@ mod tests {
             client.clone(),
             Arc::new(NoConfirmer),
             unlocking(&client, prompt.clone()),
+            no_host_names(),
         );
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -933,7 +973,7 @@ mod tests {
                 .unwrap(),
         );
         let unlocker = unlocking(&client, Arc::new(NoPrompt));
-        LpassAgent::new(store, client, confirmer, unlocker)
+        LpassAgent::new(store, client, confirmer, unlocker, no_host_names())
     }
 
     #[tokio::test]
@@ -1048,7 +1088,7 @@ mod tests {
         }
         assert_eq!(agent.bindings.len(), 1);
 
-        // distinct hops accumulate only up to the protocol limit
+        // distinct hops accumulate only up to our own cap
         for hop in 0..MAX_SESSION_BINDINGS + 4 {
             let key =
                 PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
@@ -1148,7 +1188,8 @@ mod tests {
                 .unwrap(),
         );
         let unlocker = unlocking(&client, Arc::new(NoPrompt));
-        let mut agent = LpassAgent::new(store, client, Arc::new(DenyAll), unlocker);
+        let mut agent =
+            LpassAgent::new(store, client, Arc::new(DenyAll), unlocker, no_host_names());
 
         let response = agent
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))

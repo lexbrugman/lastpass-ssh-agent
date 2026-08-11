@@ -72,10 +72,9 @@ impl PassphrasePrompt for TtyPrompt {
 
 /// Restores the terminal's original mode when dropped.
 ///
-/// A guard rather than a call at the end: the caller enforces its deadline by
-/// dropping this future mid-read, so the only way to guarantee echo comes back
-/// on is to tie it to unwinding. Leaving a terminal with `ECHO` off is
-/// invisible until the user types their next command and sees nothing.
+/// A guard, not a call at the end: the deadline drops this future mid-read, so
+/// only unwinding can guarantee echo comes back. A terminal left with `ECHO`
+/// off is invisible until the user types and sees nothing.
 struct TerminalMode {
     fd: std::os::unix::io::RawFd,
     original: libc::termios,
@@ -134,19 +133,16 @@ fn apply(fd: std::os::unix::io::RawFd, mode: &libc::termios) -> std::io::Result<
 
 impl Drop for TerminalMode {
     fn drop(&mut self) {
-        // Giving up on a half-typed passphrase — a timeout, a cancellation, an
-        // error — leaves those bytes in the terminal's canonical input queue,
-        // where they belong to whoever reads next. That is usually the user's
-        // shell, which would echo the passphrase and run it as a command the
-        // moment they finish the line. Dropping is the last point at which this
-        // code still controls them, so they are discarded here.
+        // Bytes typed before giving up stay in the terminal's canonical queue,
+        // where the next reader gets them — usually the shell, which would echo
+        // the passphrase and run it as a command. This is the last point that
+        // controls them.
         //
-        // Only then, though: after a completed entry the queue holds type-ahead
-        // for whatever comes next, and flushing that would eat the user's
-        // input for no reason.
+        // Only when entry did not finish: after a completed line the queue
+        // holds type-ahead meant for whatever runs next.
         //
-        // Best effort throughout: nothing useful can be done if either call
-        // fails, and Drop must not panic while a signature is being abandoned.
+        // Best effort: nothing useful follows a failure, and Drop must not
+        // panic while a signature is being abandoned.
         if self.discard_input {
             // SAFETY: tcflush only acts on the descriptor it is given.
             unsafe { libc::tcflush(self.fd, libc::TCIFLUSH) };
@@ -180,11 +176,9 @@ async fn read_passphrase(
     // user would never see that it had been.
     discard_pending_input(tty.get_ref());
 
-    // Deliberately declared *after* `tty`. Locals drop in reverse order, so
-    // this guard runs while the descriptor is still open; built before `tty`
-    // it would restore the terminal through an already-closed fd, silently
-    // fail, and leave the user typing blind — which is precisely what happens
-    // on the cancellation path, where the deadline drops this future mid-read.
+    // Declared *after* `tty` on purpose: locals drop in reverse order, so the
+    // guard restores the terminal while the descriptor is still open. Built
+    // first, it would restore through a closed fd and silently do nothing.
     let hidden = TerminalMode::hide_input(tty.get_ref())?;
 
     let prompt = format!("\n{message}\nPassphrase (not echoed): ");
