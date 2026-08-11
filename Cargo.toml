@@ -24,7 +24,7 @@ signature = "2"
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "io-util", "time", "signal"] }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "0.9"
 zeroize = { version = "1", features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
