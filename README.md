@@ -227,6 +227,22 @@ not be hand-edited — change `[workspace.metadata.dist]` in `Cargo.toml` and
 regenerate. dist cross-builds the four targets, packages and checksums them,
 publishes the GitHub release, and builds the shell installer.
 
+The dev image carries dist, installed with the same installer and pinned to
+the same version `release.yml` uses, so regenerating is:
+
+```sh
+docker compose run --rm shell dist generate
+```
+
+Swap in `dist generate --check` to verify the committed workflow matches the
+config without rewriting it — that is the check that fails a release when the
+two have drifted apart.
+
+Regenerating must run the exact version `cargo-dist-version` names, which is
+why the `CARGO_DIST_VERSION` build argument in the `Dockerfile` repeats it.
+Renovate treats the two as one dependency and bumps them in a single pull
+request, so neither can quietly fall behind the other.
+
 `publish-homebrew-formula.yml` is ours, wired in as a dist *publish job* so
 regeneration cannot clobber it. It generates the formula with
 `packaging/homebrew/generate-formula.sh` — the formula is not dist's, because
@@ -262,18 +278,53 @@ Without the secret the formula is simply attached to each release instead.
 ## Dependencies
 
 Updates come from [Renovate](https://docs.renovatebot.com); install the app
-on the repository and `renovate.json` governs it. That file is plain JSON and
-cannot explain itself, so its two exclusions are documented here:
+on the repository and `renovate.json` governs it. Everything carrying a
+version is tracked as precisely as its own format allows:
 
+- **Crates** keep caret ranges in `Cargo.toml`, and `Cargo.lock` is
+  committed. Cargo's default range strategy resolves to `update-lockfile`,
+  so an in-range release arrives as a lock-file-only pull request and the
+  manifest stays permissive.
+- **The rest of the locked tree** — the transitive crates with no manifest
+  entry of their own — is refreshed by `lockFileMaintenance`, weekly. Direct
+  dependencies are a small fraction of what actually gets compiled, and
+  without this nothing would ever move them.
+- **Actions are pinned to exact releases** (`actions/checkout@v7.0.1`, not
+  `@v7`), which is what makes a patch release show up as a pull request at
+  all; a floating major tag stays silent until the next major. Digests are
+  deliberately not pinned (`"pinDigests": false`) — an exact tag is specific
+  enough to track and stays readable.
+- **`dist`'s own version** lives in `[workspace.metadata.dist]`, which the
+  cargo manager does not read because it is not a dependency table. A regex
+  entry under `"customManagers"` tracks it against crates.io instead, and
+  matches the `Dockerfile` too so the dev image's dist moves with it. That
+  pull request is still only half an upgrade: the version is also baked into
+  the installer URL in the generated `release.yml`, which Renovate cannot
+  regenerate, so it needs `docker compose run --rm shell dist generate` run
+  and the result committed onto the branch. Nothing in CI catches a half-done
+  one — the gate never reads `release.yml`, so the release fails only after
+  promotion. The pull request carries a note saying so.
+
+Three things are deliberately not tracked, because a version is the wrong
+thing to pin:
+
+- **`dtolnay/rust-toolchain@stable` and `@nightly`** are branch references,
+  not versions. The point is to compile against whatever those resolve to
+  today, which is also what the dev container does.
+- **The `tool:` inputs to `taiki-e/install-action`** name `cargo-audit` and
+  `cargo-llvm-cov` without versions, matching how the dev container fetches
+  them. Pinning one side only would let CI and the container drift apart.
 - **`.github/workflows/release.yml` is off-limits.** dist generates that file
   and verifies it byte-for-byte at release time, so a bumped action version
   there fails every release until it is regenerated.
-- **`ssh-key` major and minor updates are off.** It is pinned to 0.6.x
-  because `ssh-agent-lib` depends on `^0.6`; a 0.7 pull request cannot build
-  until that moves first, so Renovate would only reopen a failing one.
 
-Renovate targets `dev` (`"baseBranches"`), not `master`. That matters here:
-every merge to `master` publishes a release, so pointing it at `master`
+One package is held back on purpose: **`ssh-key` major and minor updates are
+off.** It is pinned to 0.6.x because `ssh-agent-lib` depends on `^0.6`; a 0.7
+pull request cannot build until that moves first, so Renovate would only
+reopen a failing one.
+
+Renovate targets `dev` (`"baseBranchPatterns"`), not `master`. That matters
+here: every merge to `master` publishes a release, so pointing it at `master`
 would ship a release per dependency bump. Updates instead accumulate on
 `dev` and go out when you promote it.
 

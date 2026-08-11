@@ -28,7 +28,7 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           # tags are needed to work out today's next patch number
           fetch-depth: 0

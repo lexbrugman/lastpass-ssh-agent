@@ -8,6 +8,25 @@
   ],
   "dependencyDashboard": false,
   "pinDigests": false,
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "dist's own version sits in [workspace.metadata.dist], and the cargo manager only reads dependency tables — without this it is tracked by nothing and silently falls behind. The Dockerfile declares it a second time, because the dev image installs the dist that regenerates release.yml and it has to be that same version; matching both here means one pull request moves them together.",
+      "managerFilePatterns": [
+        "/^Cargo\\.toml$/",
+        "/^Dockerfile$/"
+      ],
+      "matchStrings": [
+        "cargo-dist-version = \"(?<currentValue>[^\"]+)\"",
+        "ARG CARGO_DIST_VERSION=(?<currentValue>\\S+)"
+      ],
+      "depNameTemplate": "cargo-dist",
+      "datasourceTemplate": "crate"
+    }
+  ],
   "packageRules": [
     {
       "matchManagers": [
@@ -48,6 +67,20 @@
         "lastpass-ssh-agent-dev"
       ],
       "enabled": false
+    },
+    {
+      "description": "A dist bump is only half an upgrade: the version is also baked into the installer URL in .github/workflows/release.yml, which dist generates and verifies byte-for-byte at release time. Renovate cannot run dist to regenerate it, and the incomplete pull request still passes CI — the release only fails later, after promotion to master. Hence the note on the pull request itself.",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchDepNames": [
+        "cargo-dist"
+      ],
+      "prBodyNotes": [
+        "⚠️ **Incomplete on its own.** `.github/workflows/release.yml` still installs the previous dist, and dist verifies that file byte-for-byte at release time, so this branch releases nothing until the workflow is regenerated. On this branch, run:",
+        "```sh\ndocker compose build\ndocker compose run --rm shell dist generate\n```",
+        "then commit the rewritten `release.yml`. CI passing does not cover it — nothing in the gate reads `release.yml`. `docker compose run --rm shell dist generate --check` verifies the result."
+      ]
     }
   ]
 }

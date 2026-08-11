@@ -22,16 +22,20 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Actions are pinned to exact releases rather than floating major tags, so
+# Renovate raises a pull request for every patch; @v7 would stay silent until
+# v8. The toolchain actions are the exception — `stable` and `nightly` are
+# branch references, and resolving them fresh is the whole point.
 jobs:
   lint:
     name: fmt + clippy (check only)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo fmt --check
       - run: ./packaging/homebrew/test-generate-formula.sh
       - run: cargo clippy --all-targets -- -D warnings
@@ -45,8 +49,8 @@ jobs:
     name: advisory audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@v7.0.1
+      - uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-audit
       # Fails on any advisory against the locked tree except those
@@ -61,13 +65,13 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       # the tests run instrumented, which requires nightly for branch coverage
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2.9.2
       - run: ./scripts/test.sh

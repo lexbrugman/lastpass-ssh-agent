@@ -1,7 +1,7 @@
 # Configuration for `cargo audit`, which CI runs against Cargo.lock. Kept in
-# the repository rather than passed as a CI flag so a local `cargo audit`
-# gives the same answer as the gate, and so every accepted advisory carries
-# its reasoning where a reviewer will find it.
+# the repository rather than passed as a CI flag so that running it locally
+# — `docker compose run --rm audit` — gives the same answer as CI, and so
+# every accepted advisory carries its reasoning where a reviewer will find it.
 
 [advisories]
 # RUSTSEC-2023-0071 — "Marvin Attack", a timing sidechannel in `rsa`
