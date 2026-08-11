@@ -31,7 +31,12 @@ fi
 # Entries at the root, exactly the files passed and nothing else. A wrapping
 # directory is the failure this exists to catch: `bin.install` in the formula
 # would find no binary where it looks.
-entries="$(tar -tJf "${out}/${archive}" | sort | tr '\n' ' ')"
+#
+# LC_ALL=C because this runs on both platforms and collation is not the same
+# in both: the runners' en_US.UTF-8 ignores case and puts lastpass-ssh-agent
+# first, while C compares bytes and puts README.md there. Only the sort needs
+# pinning — the archive itself is right either way.
+entries="$(tar -tJf "${out}/${archive}" | LC_ALL=C sort | tr '\n' ' ')"
 if [ "$entries" != "README.md lastpass-ssh-agent " ]; then
     echo "unexpected archive layout: $entries" >&2
     failed=1

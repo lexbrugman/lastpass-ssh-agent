@@ -46,7 +46,11 @@ jobs:
       version: ${{ needs.release-version.outputs.version }}
 
   publish-release:
-    needs: [release-version, checks, build-release]
+    # `checks` is not listed because build-release already waits on it.
+    # `release-version` is implied by that same chain, but outputs are only
+    # readable from a direct dependency — drop it and `version` resolves to
+    # empty, which skips this job silently rather than failing it.
+    needs: [release-version, build-release]
     if: needs.release-version.outputs.version != ''
     permissions:
       contents: write
