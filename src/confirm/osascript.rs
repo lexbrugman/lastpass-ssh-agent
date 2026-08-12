@@ -107,20 +107,42 @@ impl Confirmer for OsascriptConfirmer {
         let approved = output.status.success()
             && stdout.contains("button returned:Allow")
             && !stdout.contains("gave up:true");
-        if !approved && !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("No user interaction allowed") {
+        if approved {
+            return Decision::Approve;
+        }
+
+        // Everything below denies; the point is to say *why*. A refusal and a
+        // dialog that never appeared look identical from the outside — both
+        // simply stop the signature — and this is the last place that can still
+        // tell them apart. Reporting them alike once cost an afternoon: an
+        // upgrade dropped the agent's Apple Events authorization, every request
+        // was logged as the user denying it, and nothing in the log said
+        // otherwise.
+        if stdout.contains("gave up:true") {
+            tracing::info!("confirmation dialog expired unanswered, denying");
+        } else if output.status.success() {
+            tracing::info!("confirmation declined at the dialog, denying");
+        } else {
+            let stderr: String = String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .chars()
+                .take(300)
+                .collect();
+            if stderr.contains("User canceled") {
+                tracing::info!("confirmation declined at the dialog, denying");
+            } else {
+                // Not a refusal: nobody was asked. Most often the agent has no
+                // GUI session to draw in, or its authorization to drive System
+                // Events has lapsed — which macOS does when the binary is
+                // replaced, so an upgrade without a restart lands here.
                 tracing::warn!(
-                    "no GUI session available for the confirmation dialog — denying \
-                     (use confirm = \"tty\" or \"askpass\" in headless setups)"
+                    code = ?output.status.code(),
+                    "the confirmation dialog could not be shown, so the signature is \
+                     denied — nobody refused it: {stderr}"
                 );
             }
         }
-        if approved {
-            Decision::Approve
-        } else {
-            Decision::Deny
-        }
+        Decision::Deny
     }
 }
 

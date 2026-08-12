@@ -37,6 +37,29 @@ pub enum PassphraseFallback {
     Keychain,
 }
 
+/// Where the vault's master password comes from when `lpass` has forgotten the
+/// key it derived and asks for it again.
+///
+/// Not about *why* it was forgotten: the hourly timeout and a screen lock reach
+/// here alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MasterPassword {
+    /// Never asked for. A locked vault fails the signature, and you reopen it
+    /// yourself — what the agent did before any of this existed.
+    #[default]
+    Off,
+    /// Asked for through the agent's own prompt, and never kept.
+    Prompt,
+    /// Kept encrypted to a key held in the Secure Enclave, which releases it
+    /// only on Touch ID — so it cannot be taken silently by anything able to
+    /// trigger a signature. Falls back to `prompt` when there is nothing stored
+    /// yet, when the fingerprint is declined, or when the key needs seeding
+    /// again. macOS only; rejected at load elsewhere.
+    #[serde(rename = "touchid")]
+    TouchId,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyConfig {
@@ -88,6 +111,35 @@ pub struct Config {
     #[serde(default)]
     pub passphrase_fallback: PassphraseFallback,
 
+    /// How long the vault stays unlocked once `lpass` has derived its key.
+    ///
+    /// Unset leaves lpass to its own default, an hour. `0` means never expire,
+    /// which is lpass's own encoding and a deliberate footgun rather than one
+    /// to forbid.
+    ///
+    /// Only governs an `lpass` agent *this* agent starts: whichever process
+    /// gets there first fixes it, so a shell that has already run `lpass` keeps
+    /// whatever it set. `lastpass-ssh-agent env` prints this so a shell profile
+    /// can take the same value from here rather than repeating it.
+    #[serde(default)]
+    pub vault_unlock_timeout_secs: Option<u64>,
+
+    /// Where the master password comes from when `lpass` asks for one.
+    ///
+    /// Opt-in because it changes what a locked vault does to a signature, and
+    /// because anything but `off` means the agent handles the master password
+    /// at all — which by default it never does.
+    #[serde(default)]
+    pub master_password: MasterPassword,
+
+    /// Drop the vault's cached key when the screen locks, so walking away
+    /// shuts the vault and not just the display.
+    ///
+    /// Worth pairing with a `master_password` source: without one, every lock
+    /// costs one failed signature before you re-authenticate by hand.
+    #[serde(default)]
+    pub lock_on_screen_lock: bool,
+
     #[serde(default)]
     pub keys: Vec<KeyConfig>,
 }
@@ -110,17 +162,22 @@ impl Config {
     /// running without a config file is ordinary, not an error.
     pub fn load_or_default(path: &Path) -> Result<Self> {
         match Self::load(path) {
-            Err(Error::ConfigMissing(_)) => Ok(Self {
-                socket: None,
-                confirm: ConfirmMode::default(),
-                confirm_timeout_secs: default_confirm_timeout(),
-                lpass_path: None,
-                askpass: None,
-                passphrase_fallback: PassphraseFallback::default(),
-                keys: Vec::new(),
-            }),
+            Err(Error::ConfigMissing(_)) => Ok(Self::empty()),
             other => other,
         }
+    }
+
+    /// What a setup with no config file gets: exactly what an empty file
+    /// parses to.
+    ///
+    /// Parsed rather than constructed field by field, so it cannot drift.
+    /// A hand-written mirror still compiles when a new field's `#[serde(default)]`
+    /// says something else, and the two would then disagree about how the agent
+    /// behaves depending only on whether a file happens to exist.
+    fn empty() -> Self {
+        // Every field defaults, so the only way this fails is a bug in the
+        // struct's own serde attributes — which every other test would fail on.
+        toml::from_str("").expect("a config of nothing but defaults must parse")
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -180,6 +237,20 @@ impl Config {
                 "confirm_timeout_secs must be between 1 and {MAX_CONFIRM_TIMEOUT_SECS}"
             )));
         }
+        // lpass hands this to `alarm`, whose argument is 32-bit: anything
+        // larger wraps, and a value that wraps to zero means *never expire* —
+        // the opposite of a short timeout, arrived at silently. Refused here
+        // rather than discovered by a vault that never locks.
+        if self
+            .vault_unlock_timeout_secs
+            .is_some_and(|seconds| seconds > u64::from(u32::MAX))
+        {
+            return Err(Error::ConfigInvalid(format!(
+                "vault_unlock_timeout_secs must be at most {} — lpass truncates it to 32 \
+                 bits, and a larger value can wrap to 0, which means never expire",
+                u32::MAX
+            )));
+        }
         // Refused at load, not at the first signature — and by validation
         // rather than by failing to parse, because the mode is a reasonable
         // thing to write in a config shared between machines and deserves an
@@ -192,6 +263,22 @@ impl Config {
         if self.uses_keychain() {
             return Err(Error::ConfigInvalid(
                 "passphrase_fallback = \"keychain\" is only supported on macOS".into(),
+            ));
+        }
+        #[cfg(not(target_os = "macos"))]
+        if self.master_password == MasterPassword::TouchId {
+            return Err(Error::ConfigInvalid(
+                "master_password = \"touchid\" is only supported on macOS".into(),
+            ));
+        }
+        // Same treatment, and for the same reason: reading the screen's lock
+        // state is the one part of that feature a platform has to provide, and
+        // only macOS does so far. Refused at load rather than ignored, since a
+        // setting silently doing nothing is worse than one that says so.
+        #[cfg(not(target_os = "macos"))]
+        if self.lock_on_screen_lock {
+            return Err(Error::ConfigInvalid(
+                "lock_on_screen_lock is only supported on macOS".into(),
             ));
         }
         Ok(())
@@ -287,6 +374,7 @@ mod tests {
         assert!(config.socket.is_none());
         assert!(config.lpass_path.is_none());
         assert!(config.askpass.is_none());
+        assert_eq!(config.passphrase_fallback, PassphraseFallback::default());
     }
 
     #[test]
@@ -433,6 +521,96 @@ id = "1"
     /// `keychain` parses everywhere — it is a reasonable thing to write in a
     /// config shared between machines — and is accepted or refused by platform
     /// at load, never at the first signature.
+    #[test]
+    fn the_vault_timeout_is_bounded_by_what_lpass_can_hold() {
+        assert_eq!(parse("").unwrap().vault_unlock_timeout_secs, None);
+        assert_eq!(
+            parse("vault_unlock_timeout_secs = 300")
+                .unwrap()
+                .vault_unlock_timeout_secs,
+            Some(300)
+        );
+        // 0 is lpass's own encoding for "never expire" — a footgun, but its
+        // footgun, and one a config is entitled to ask for.
+        assert_eq!(
+            parse("vault_unlock_timeout_secs = 0")
+                .unwrap()
+                .vault_unlock_timeout_secs,
+            Some(0)
+        );
+        // the boundary itself is fine; one past it wraps in lpass's `alarm`
+        assert!(parse(&format!("vault_unlock_timeout_secs = {}", u32::MAX)).is_ok());
+        let error = parse(&format!(
+            "vault_unlock_timeout_secs = {}",
+            u64::from(u32::MAX) + 1
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("never expire"), "{error}");
+    }
+
+    #[test]
+    fn the_master_password_source_is_off_by_default() {
+        assert_eq!(parse("").unwrap().master_password, MasterPassword::Off);
+        assert_eq!(
+            parse("master_password = \"prompt\"")
+                .unwrap()
+                .master_password,
+            MasterPassword::Prompt
+        );
+        assert!(
+            parse("master_password = \"Prompt\"").is_err(),
+            "case matters"
+        );
+        assert!(parse("master_password = true").is_err(), "not a bool");
+    }
+
+    /// `prompt` is deliberately not macOS-only: `lpass` forgets its key on its
+    /// own timeout everywhere, and being asked rather than failing is worth
+    /// having on any platform. Only the Touch ID half needs a platform.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_touchid_source_is_accepted_here() {
+        assert_eq!(
+            parse("master_password = \"touchid\"")
+                .unwrap()
+                .master_password,
+            MasterPassword::TouchId
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn the_touchid_source_is_refused_here_with_a_reason() {
+        let error = parse("master_password = \"touchid\"")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("only supported on macOS"), "{error}");
+        // and the portable source is unaffected
+        assert!(parse("master_password = \"prompt\"").is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn lock_on_screen_lock_is_accepted_here() {
+        assert!(
+            parse("lock_on_screen_lock = true")
+                .unwrap()
+                .lock_on_screen_lock
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn lock_on_screen_lock_is_refused_here_with_a_reason() {
+        // Reading the screen's lock state is the one part a platform has to
+        // provide, and only macOS does. Refused at load, named in the message.
+        let error = parse("lock_on_screen_lock = true").unwrap_err().to_string();
+        assert!(error.contains("only supported on macOS"), "{error}");
+        // and the default is off everywhere, so an ordinary config is fine
+        assert!(!parse("").unwrap().lock_on_screen_lock);
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn keychain_is_accepted_here() {

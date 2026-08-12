@@ -79,6 +79,13 @@ The code already works this way, and these are the patterns to copy:
   passphrase before saving it, and asking again when a saved one stops working
   are all portable and fully tested; the macOS Keychain implementation behind
   it is two calls and no decisions.
+- `enclave` is the same idea taken as far as it goes, because the thing behind
+  the `cfg` there is not even Rust. The Swift shim returns the stage a call
+  stopped at and the system's own error code, and nothing else; which stage
+  means "ask again", which means "seed again" and which is a fault, along with
+  the format the key blob is written in, are all decided in `enclave.rs` and
+  tested on Linux as well as macOS. `askpass/enclave.rs` is three foreign calls
+  and no judgement.
 
 If a `cfg` block contains a branch, a loop, or an error decision, it is
 probably in the wrong place.

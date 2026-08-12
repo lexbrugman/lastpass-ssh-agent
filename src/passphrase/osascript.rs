@@ -169,6 +169,7 @@ mod tests {
             key_name: "dialog key".into(),
             fingerprint: "SHA256:dlg".into(),
             item_id: "3".into(),
+            master_password: false,
         }
     }
 

@@ -1,6 +1,6 @@
 mod cli;
 
-pub use cli::LpassCli;
+pub use cli::{LpassCli, ASKPASS_FROM_STORE, ASKPASS_MARKER, ASKPASS_ONCE_MARKER, ASKPASS_SIGNAL};
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -51,6 +51,29 @@ pub enum LpassError {
 /// copy them into non-zeroizing storage.
 #[async_trait::async_trait]
 pub trait LpassClient: Send + Sync {
+    /// Whether a call to this client can put a prompt on the user's screen —
+    /// true once lpass has somewhere to ask for the master password.
+    ///
+    /// The signing path needs to know *before* it calls: a prompt appearing from
+    /// inside a fetch would otherwise sit outside the one-interaction-at-a-time
+    /// gate, and could share the screen with another request's dialog.
+    ///
+    /// Required rather than defaulted: an implementation that quietly inherited
+    /// "never prompts" while in fact prompting would put a master-password
+    /// dialog outside the gate, which is the one thing this exists to prevent.
+    fn may_prompt(&self) -> bool;
+
+    /// Whether a call has made the master-password helper run since this
+    /// client was built.
+    ///
+    /// Proof that a password was actually consulted. Setup needs it: an `lpass`
+    /// call can succeed on a key that was already cached, which says nothing
+    /// about whether the candidate password is right.
+    /// Required rather than defaulted, like `may_prompt`: an implementation
+    /// inheriting "never asked" would make setup reject passwords that are in
+    /// fact correct, and the reason would be invisible.
+    fn master_password_came_from_store(&self) -> bool;
+
     async fn status(&self) -> Result<LoginStatus, LpassError>;
 
     /// `lpass show --field=<field> <item_id>` — the value with trailing
@@ -74,14 +97,30 @@ pub async fn discover_ssh_key_items(
     name_filter: Option<&str>,
 ) -> Result<Vec<ItemSummary>, LpassError> {
     let needle = name_filter.map(str::to_lowercase);
-    let items = client.ls().await?.into_iter().filter(|item| {
-        needle
-            .as_ref()
-            .is_none_or(|needle| item.name.to_lowercase().contains(needle))
-    });
+    let candidates: Vec<ItemSummary> = client
+        .ls()
+        .await?
+        .into_iter()
+        .filter(|item| {
+            needle
+                .as_ref()
+                .is_none_or(|needle| item.name.to_lowercase().contains(needle))
+        })
+        .collect();
+
+    // `lpass ls` does not carry the note type, so telling an SSH Key from a
+    // credit card costs one `lpass` call per item — which on a large vault is
+    // most of a minute before the socket is even bound. Said up front so the
+    // wait is explained while it is happening rather than afterwards, and so
+    // the way out of it is on screen next to the reason for it.
+    tracing::info!(
+        items = candidates.len(),
+        "probing vault items for SSH Key notes, one lpass call each — pin [[keys]] in the \
+         config to skip this"
+    );
 
     let mut probes = tokio::task::JoinSet::new();
-    let mut items = items;
+    let mut items = candidates.into_iter();
     let mut found = Vec::new();
     loop {
         // Bound both subprocess concurrency and the amount of queued task
@@ -118,6 +157,58 @@ pub async fn discover_ssh_key_items(
     }
     found.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
     Ok(found)
+}
+
+/// The `lpass` agent process, which is where the vault's derived key lives.
+///
+/// Ending it is the only way to make `lpass` forget that key: there is no
+/// "lock" subcommand, and `lpass logout` would discard the session as well,
+/// turning a master-password prompt into a full login with a second factor.
+///
+/// Identified by command line rather than by name: the agent rewrites its argv
+/// to `lpass [agent]`, and on macOS the rewritten title runs into the
+/// environment that followed it, so only the prefix is dependable. Matching a
+/// short-lived `lpass show` too would cost nothing — a signature in flight when
+/// the screen locks is one we are about to make ask for a password anyway.
+pub struct LpassAgentProcess;
+
+#[async_trait::async_trait]
+impl crate::vaultlock::VaultKey for LpassAgentProcess {
+    // Excluded from coverage, and deliberately: exercising the path that
+    // actually matches something would mean killing a process, and the only
+    // pattern worth testing is the real one — which on a developer's own
+    // machine is their live vault session. The rules around this call (when it
+    // fires, and how often) are `vaultlock`'s, and covered there.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    async fn forget(&self) {
+        // `pkill` rather than walking the process table ourselves: finding a
+        // process by command line is /proc on Linux and sysctl on macOS, which
+        // is exactly the per-platform logic this design keeps out of the way
+        // for something the system already exposes as one command.
+        let killed = tokio::process::Command::new("pkill")
+            .arg("-f")
+            .arg(r"^lpass \[a")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await;
+        // pkill's codes: 0 signalled something, 1 matched nothing, and 2 or 3
+        // are its own failures. Only 1 means "there was no key to drop" —
+        // folding the rest into it would report a vault as locked while it is
+        // still open, which is the one thing this must not get wrong.
+        match killed.as_ref().map(std::process::ExitStatus::code) {
+            Ok(Some(0)) => {
+                tracing::info!("the LastPass agent's cached key has been dropped");
+            }
+            Ok(Some(1)) => tracing::debug!("no LastPass agent was holding a key"),
+            other => tracing::warn!(
+                "could not drop the LastPass agent's cached key ({other:?}), so the vault \
+                 stays unlocked until it expires on its own"
+            ),
+        }
+    }
 }
 
 /// Locate the lpass binary: explicit config path first, then PATH.
@@ -332,10 +423,14 @@ pub mod mock {
         pub broken_items: Vec<String>,
         /// (item id, field) pairs that fail on access.
         pub broken_fields: Vec<(String, String)>,
+        /// (item id, field) pairs that report the vault as shut.
+        pub logged_out_fields: Vec<(String, String)>,
         /// (item id, field) pairs the item simply does not have.
         pub absent_fields: Vec<(String, String)>,
         /// Every (item, field) fetched, for assertions on what was touched.
         pub fetch_log: Mutex<Vec<(String, String)>>,
+        /// Stands in for a vault that can ask for the master password.
+        pub prompting: bool,
     }
 
     impl MockLpass {
@@ -352,8 +447,22 @@ pub mod mock {
             self
         }
 
+        /// As a client with an askpass helper installed: fetches from it may
+        /// put a prompt on screen.
+        pub const fn prompting(mut self) -> Self {
+            self.prompting = true;
+            self
+        }
+
         pub fn with_broken_item(mut self, item: &str) -> Self {
             self.broken_items.push(item.into());
+            self
+        }
+
+        /// As a vault whose key has expired: this field reports not-logged-in
+        /// while the rest of the client still works.
+        pub fn with_logged_out_field(mut self, item: &str, field: &str) -> Self {
+            self.logged_out_fields.push((item.into(), field.into()));
             self
         }
 
@@ -370,6 +479,14 @@ pub mod mock {
 
     #[async_trait::async_trait]
     impl LpassClient for MockLpass {
+        fn master_password_came_from_store(&self) -> bool {
+            self.prompting
+        }
+
+        fn may_prompt(&self) -> bool {
+            self.prompting
+        }
+
         async fn status(&self) -> Result<LoginStatus, LpassError> {
             Ok(if self.logged_in {
                 LoginStatus::LoggedIn("mock@example.com".into())
@@ -388,6 +505,13 @@ pub mod mock {
                 .unwrap()
                 .push((item_id.into(), field.into()));
             if !self.logged_in {
+                return Err(LpassError::NotLoggedIn);
+            }
+            if self
+                .logged_out_fields
+                .iter()
+                .any(|(id, f)| id == item_id && f == field)
+            {
                 return Err(LpassError::NotLoggedIn);
             }
             if self

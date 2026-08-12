@@ -9,6 +9,8 @@ echo "== rustfmt"
 cargo fmt --check
 echo "== clippy (pedantic + nursery, warnings are errors)"
 cargo clippy --all-targets -- -D warnings
+echo "== clippy for macOS (the cfg-gated half that never builds here)"
+cargo clippy --target aarch64-apple-darwin --all-targets -- -D warnings
 echo "== release archive"
 ./packaging/test-archive.sh
 echo "== homebrew formula generator"

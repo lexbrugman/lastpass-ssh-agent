@@ -3,7 +3,7 @@
 # llvm-tools for branch-instrumented coverage, cargo-llvm-cov, and
 # cargo-audit. Toolchains float with upstream exactly like CI's, so the gate
 # behaves identically in both places.
-FROM rust:1-slim
+FROM rust:1.97.1-slim-trixie
 
 # git: build.rs stamps the binary with the current commit.
 # curl + ca-certificates: fetching the cargo-llvm-cov release binary below.
@@ -59,7 +59,13 @@ USER dev
 # The slim image ships the minimal profile: rustfmt and clippy have to be
 # added, and branch coverage needs nightly (-Z coverage-options) with its
 # llvm tools.
+# The macOS target is for type-checking, not building: half of this codebase is
+# behind `cfg(target_os = "macos")` and never compiles here, so a mistake in it
+# used to survive the whole local gate and surface only in CI. `cargo clippy
+# --target aarch64-apple-darwin` checks that half without linking anything —
+# there is no Apple SDK here and none is needed to find the errors that matter.
 RUN rustup component add rustfmt clippy \
+    && rustup target add aarch64-apple-darwin \
     && rustup toolchain install nightly --profile minimal \
         --component llvm-tools-preview
 

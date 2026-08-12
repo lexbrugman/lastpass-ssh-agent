@@ -21,6 +21,77 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct LpassCli {
     binary: PathBuf,
     timeout: Duration,
+    /// This binary and the config it was started with, when lpass should ask
+    /// for the master password rather than fail.
+    askpass_helper: Option<(PathBuf, PathBuf)>,
+    /// How long lpass should keep the key it derives, when the config says.
+    vault_unlock_timeout: Option<u64>,
+    /// Set once the helper has reported supplying a master password *from the
+    /// store*, which is the only thing that verifies what is stored.
+    master_password_from_store: std::sync::atomic::AtomicBool,
+}
+
+/// Set on the helper's environment to say which config to prompt from. Its
+/// presence is what makes this binary a password prompt instead of an agent.
+pub const ASKPASS_MARKER: &str = "LASTPASS_SSH_AGENT_ASKPASS_CONFIG";
+
+/// Printed by the helper once it has handed a master password over, so the
+/// agent can say so.
+///
+/// It travels on stderr because that is the only channel back: the helper is a
+/// process `lpass` spawns, not one this agent can see, and its stdout is the
+/// password itself. A plain line rather than a log line — it is a signal to be
+/// recognised, and formatting it twice would read as nonsense in the log.
+pub const ASKPASS_SIGNAL: &str = "lastpass-ssh-agent: master password supplied";
+
+/// Appended when the password came out of the store rather than from a prompt.
+///
+/// Setup needs the difference: if presence fails it falls back to asking, and a
+/// correct answer typed there would otherwise certify a stored typo as working.
+pub const ASKPASS_FROM_STORE: &str = " (from store)";
+
+/// Names the file the helper touches once it has answered from the store.
+///
+/// Its path rather than its contents is what matters, and it holds nothing —
+/// so it travels in the environment beside the config path, which the helper
+/// already reads from there.
+pub const ASKPASS_ONCE_MARKER: &str = "LASTPASS_SSH_AGENT_ASKPASS_ONCE";
+
+/// A path unique to one `lpass` run, cleared at both ends by whoever owns it.
+///
+/// Not a lock and not a secret: it exists so a helper invoked twice by the same
+/// `lpass` can tell the second time from the first. Removing it on `Drop` as
+/// well as up front means every way out of `run` — including a timeout — leaves
+/// nothing behind for the next invocation to trip over.
+struct OnceMarker(Option<std::path::PathBuf>);
+
+impl OnceMarker {
+    /// Beside the askpass wrapper, which already lives in the agent's own
+    /// directory. Named for this process and this call, so two runs at once
+    /// cannot answer for each other.
+    fn beside(helper: Option<&std::path::PathBuf>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(helper.map(|helper| {
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut name = helper.as_os_str().to_os_string();
+            name.push(format!(".once.{}.{n}", std::process::id()));
+            let path = std::path::PathBuf::from(name);
+            let _ = std::fs::remove_file(&path);
+            path
+        }))
+    }
+
+    fn path(&self) -> Option<&std::path::Path> {
+        self.0.as_deref()
+    }
+}
+
+impl Drop for OnceMarker {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl LpassCli {
@@ -28,15 +99,62 @@ impl LpassCli {
         Self {
             binary,
             timeout: DEFAULT_TIMEOUT,
+            askpass_helper: None,
+            vault_unlock_timeout: None,
+            master_password_from_store: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Ask lpass to forget its derived key after this many seconds.
+    ///
+    /// Passed on every invocation, because lpass reads it when it starts the
+    /// agent that holds the key, and any call might be the one that does.
+    #[must_use]
+    pub const fn unlocked_for(mut self, seconds: Option<u64>) -> Self {
+        self.vault_unlock_timeout = seconds;
+        self
+    }
+
+    /// Let lpass ask for the master password by running `helper`, which is this
+    /// binary, with the config the agent was started from.
+    ///
+    /// Only the long-running agent sets this. The one-shot commands have a
+    /// terminal of their own, and `lpass` prompting there directly is better
+    /// than a dialog appearing over it.
+    /// `prompt_timeout` is added to the command timeout, because the answer now
+    /// arrives at human speed: without it a prompt left open longer than
+    /// `DEFAULT_TIMEOUT` would kill the lpass call that opened it, and any
+    /// `confirm_timeout_secs` above that could never be answered in time.
+    /// `helper` is `None` when the agent was not asked to offer this, which is
+    /// the default — taken here rather than branched on by the caller so that
+    /// both answers live in one testable place.
+    #[must_use]
+    pub fn asking_with(
+        mut self,
+        helper: Option<PathBuf>,
+        config: PathBuf,
+        prompt_timeout: Duration,
+    ) -> Self {
+        let Some(helper) = helper else {
+            return self;
+        };
+        self.askpass_helper = Some((helper, config));
+        self.timeout = self.timeout.saturating_add(prompt_timeout);
+        self
     }
 
     #[cfg(test)]
     pub const fn with_timeout(binary: PathBuf, timeout: Duration) -> Self {
-        Self { binary, timeout }
+        Self {
+            binary,
+            timeout,
+            askpass_helper: None,
+            vault_unlock_timeout: None,
+            master_password_from_store: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
-    fn command(&self, args: &[&str]) -> tokio::process::Command {
+    fn command(&self, args: &[&str], once: Option<&std::path::Path>) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.binary);
         cmd.args(args)
             .stdin(Stdio::null())
@@ -58,6 +176,40 @@ impl LpassCli {
                 cmd.env(key, value);
             }
         }
+        // Where lpass asks for the master password when its agent no longer
+        // holds the derived key — which is the ordinary state after the screen
+        // has locked. Pointed at this binary, so the question is put through
+        // whichever prompt the config already selected for passphrases.
+        //
+        // Checked by lpass *before* LPASS_DISABLE_PINENTRY, so the two below
+        // are not in conflict: the fallback still applies when no helper can be
+        // named, and then a missing key fails fast rather than blocking on a
+        // prompt nobody can answer.
+        if let Some((helper, config)) = &self.askpass_helper {
+            cmd.env("LPASS_ASKPASS", helper);
+            // lpass runs the helper as `<program> "<prompt>"`, with no way to
+            // add an argument of our own, so what tells this binary to be the
+            // helper rather than the agent travels beside it. It carries the
+            // config path too: the helper has to reach for the same prompt the
+            // agent was started with, and inherits no `--config`.
+            cmd.env(ASKPASS_MARKER, config);
+        }
+        // Where the helper records that it has already handed the stored
+        // password to *this* lpass. It asks again on a wrong password —
+        // `agent.c` loops forever and discards the "incorrect" text before the
+        // helper could ever see it — and the store would answer the same way
+        // every time, so without this the only end is our timeout, a
+        // fingerprint per turn until then.
+        //
+        // Beside the block above rather than inside it: there is a marker
+        // exactly when there is a helper, so nesting it would leave an arm no
+        // test on any platform could reach.
+        if let Some(once) = once {
+            cmd.env(ASKPASS_ONCE_MARKER, once);
+        }
+        if let Some(seconds) = self.vault_unlock_timeout {
+            cmd.env("LPASS_AGENT_TIMEOUT", seconds.to_string());
+        }
         // Never let lpass block on an interactive master-password prompt
         // from inside the agent; with stdin closed this makes it fail fast
         // and we surface "run lpass login" instead.
@@ -66,7 +218,13 @@ impl LpassCli {
     }
 
     async fn run(&self, args: &[&str], max_bytes: usize) -> Result<CmdOutput, LpassError> {
-        let mut child = self.command(args).spawn().map_err(LpassError::Spawn)?;
+        // Cleared before the run as well as after it, so a marker some earlier
+        // crash left behind cannot make this invocation skip the store.
+        let once = OnceMarker::beside(self.askpass_helper.as_ref().map(|(helper, _)| helper));
+        let mut child = self
+            .command(args, once.path())
+            .spawn()
+            .map_err(LpassError::Spawn)?;
         let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
         let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
 
@@ -102,7 +260,34 @@ impl LpassCli {
                 stdout.pop();
             }
         }
-        let stderr: String = String::from_utf8_lossy(&stderr)
+        let diagnostics = String::from_utf8_lossy(&stderr);
+        // Looked for before the truncation below, not after: lpass can be
+        // talkative, and a few hundred characters of its own warnings would
+        // push the signal out of the window and lose the record entirely.
+        //
+        // The agent never sees the prompt itself — it happens inside a process
+        // lpass spawned — so without this, the one moment it handles a master
+        // password would pass unrecorded.
+        if diagnostics.contains(ASKPASS_SIGNAL) {
+            if diagnostics.contains(ASKPASS_FROM_STORE) {
+                self.master_password_from_store
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            // Says only what is known here. The helper signals once it has
+            // handed the password over, which is before lpass has judged it, so
+            // claiming the vault reopened would announce a success that a typo
+            // is about to turn into a failure.
+            tracing::info!("a master password was supplied to lpass through this agent's prompt");
+        }
+        // Our own line, dropped before `classify` sees any of this: it would
+        // otherwise spend part of the 300-character window, and pushing lpass's
+        // own wording ("Not logged in") past the end would turn a diagnosis we
+        // have into a generic failure.
+        let stderr: String = diagnostics
+            .lines()
+            .filter(|line| !line.contains(ASKPASS_SIGNAL))
+            .collect::<Vec<_>>()
+            .join("\n")
             .trim()
             .chars()
             .take(300)
@@ -216,6 +401,15 @@ struct CmdOutput {
 
 #[async_trait::async_trait]
 impl LpassClient for LpassCli {
+    fn master_password_came_from_store(&self) -> bool {
+        self.master_password_from_store
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn may_prompt(&self) -> bool {
+        self.askpass_helper.is_some()
+    }
+
     async fn status(&self) -> Result<LoginStatus, LpassError> {
         let out = self.run(&["status"], MAX_FIELD_BYTES).await?;
         let text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -539,6 +733,125 @@ done"#,
     #[test]
     fn ls_line_parser_rejects_empty_id() {
         assert!(parse_ls_line("name [id: ]").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_master_password_helper_is_named_to_lpass() {
+        // Both halves matter: LPASS_ASKPASS is what lpass runs, and the marker
+        // beside it is what tells that run to be a prompt rather than an agent.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(
+            dir.path(),
+            r#"printf '%s|%s' "$LPASS_ASKPASS" "$LASTPASS_SSH_AGENT_ASKPASS_CONFIG""#,
+        );
+        let value = LpassCli::new(bin)
+            .asking_with(
+                Some(PathBuf::from("/helper")),
+                PathBuf::from("/cfg.toml"),
+                Duration::from_secs(30),
+            )
+            .show_field("42", "x")
+            .await
+            .unwrap();
+        assert_eq!(&*value, b"/helper|/cfg.toml");
+    }
+
+    #[tokio::test]
+    async fn without_a_helper_lpass_is_told_of_none() {
+        // Not asked for, so not installed: lpass falls back to the stdin path
+        // that fails fast instead of blocking on a prompt nobody can answer.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(dir.path(), r#"printf '[%s]' "$LPASS_ASKPASS""#);
+        let client = LpassCli::new(bin).asking_with(
+            None,
+            PathBuf::from("/cfg.toml"),
+            Duration::from_secs(30),
+        );
+        assert!(!client.may_prompt());
+        assert_eq!(&*client.show_field("42", "x").await.unwrap(), b"[]");
+    }
+
+    #[tokio::test]
+    async fn a_master_password_unlock_is_reported_back_to_the_agent() {
+        // The helper runs where the agent cannot see it, so the signal on
+        // stderr is the only way this reaches a log at all.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(
+            dir.path(),
+            &format!(
+                "echo '{}{}' >&2; printf 'value'",
+                super::ASKPASS_SIGNAL,
+                super::ASKPASS_FROM_STORE
+            ),
+        );
+        let client = LpassCli::new(bin);
+        assert!(
+            !client.master_password_came_from_store(),
+            "nothing asked yet"
+        );
+        let value = client.show_field("42", "x").await.unwrap();
+        assert_eq!(&*value, b"value");
+        // Only the store's own signal counts: a password typed at the fallback
+        // prompt says nothing about what is stored.
+        assert!(client.master_password_came_from_store());
+    }
+
+    #[tokio::test]
+    async fn a_typed_password_does_not_pass_for_a_stored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(
+            dir.path(),
+            &format!("echo '{}' >&2; printf 'v'", super::ASKPASS_SIGNAL),
+        );
+        let client = LpassCli::new(bin);
+        client.show_field("42", "x").await.unwrap();
+        assert!(!client.master_password_came_from_store());
+    }
+
+    #[tokio::test]
+    async fn the_signal_does_not_crowd_out_lpass_own_diagnosis() {
+        // The marker is ours, not lpass's. Left in the diagnostic it would eat
+        // part of the window `classify` reads, and a long enough preamble would
+        // push the wording that identifies the failure out of view.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(
+            dir.path(),
+            &format!(
+                "echo '{}' >&2; echo 'lpass: Error: Not logged in.' >&2; exit 1",
+                super::ASKPASS_SIGNAL
+            ),
+        );
+        assert!(matches!(
+            LpassCli::new(bin).show_field("42", "x").await.unwrap_err(),
+            LpassError::NotLoggedIn
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_vault_timeout_is_passed_on_when_configured() {
+        // Set on every call, because lpass reads it when it starts the agent
+        // that holds the key, and any call might be the one that does.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(dir.path(), r#"printf '[%s]' "$LPASS_AGENT_TIMEOUT""#);
+        let value = LpassCli::new(bin)
+            .unlocked_for(Some(300))
+            .show_field("42", "x")
+            .await
+            .unwrap();
+        assert_eq!(&*value, b"[300]");
+    }
+
+    #[tokio::test]
+    async fn without_it_lpass_keeps_its_own_default() {
+        // Unset rather than guessed at: an hour is lpass's choice to make.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(dir.path(), r#"printf '[%s]' "$LPASS_AGENT_TIMEOUT""#);
+        let value = LpassCli::new(bin)
+            .unlocked_for(None)
+            .show_field("42", "x")
+            .await
+            .unwrap();
+        assert_eq!(&*value, b"[]");
     }
 
     #[tokio::test]

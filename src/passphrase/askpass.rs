@@ -99,6 +99,7 @@ mod tests {
             key_name: "askpass key".into(),
             fingerprint: "SHA256:apk".into(),
             item_id: "7".into(),
+            master_password: false,
         }
     }
 

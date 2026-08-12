@@ -159,6 +159,16 @@ impl KeyStore {
                         "item {item_id} ({name}): {issue}"
                     )));
                 }
+                // A shut vault is not a fact about one item. Skipping it would
+                // drop that key and carry on — and if a later key's fetch
+                // reopened the vault (a master-password prompt answered on the
+                // second attempt, say), the agent would come up serving an
+                // identity set quietly missing the first. Discovery refuses the
+                // same thing for the same reason.
+                KeyInspection::Unusable {
+                    issue: KeyIssue::Fetch(crate::lpass::LpassError::NotLoggedIn),
+                    ..
+                } => return Err(crate::lpass::LpassError::NotLoggedIn.into()),
                 KeyInspection::Unusable {
                     item_id,
                     name,
@@ -284,6 +294,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_shut_vault_stops_the_load_rather_than_dropping_a_key() {
+        // Item 1 loads, item 2 finds the vault shut. Carrying on would serve a
+        // set quietly missing item 2 — worse than not starting.
+        let client = MockLpass::logged_in()
+            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_field("2", "Public Key", RSA_PUB.as_bytes())
+            .with_logged_out_field("2", "Public Key");
+        let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
+        let error = KeyStore::load(&client, &config.keys, &config)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not logged in"), "{error}");
     }
 
     #[tokio::test]
