@@ -88,6 +88,15 @@ fn secure_enclave_shim() {
             "-emit-object".as_ref(),
             "-parse-as-library".as_ref(),
             "-O".as_ref(),
+            // Said rather than inherited: a bare `swiftc` compiles in whatever
+            // language mode its toolchain defaults to, and that default moves.
+            // 5 rather than 6 only because `--HEAD` builds on the user's own
+            // machine, and asking for 6 would refuse to compile on a toolchain
+            // that predates it. The shim does pass Swift 6 mode — strict
+            // concurrency included — so raising this is free whenever the
+            // oldest Xcode worth supporting has it.
+            "-swift-version".as_ref(),
+            "5".as_ref(),
             "-target".as_ref(),
             triple.as_ref(),
             "-sdk".as_ref(),

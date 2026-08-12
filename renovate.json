@@ -29,6 +29,21 @@
       "enabled": false
     },
     {
+      "description": "These two are one decision, for the same reason as the block above but with a quieter failure. security-framework 3 requires core-foundation ^0.10, and we declare core-foundation directly only because platform.rs reads one key out of the dictionary CGSessionCopyCurrentDictionary returns. Either of them moving alone resolves two copies of core-foundation into one binary — us taking 0.11 first, or a future security-framework requiring 0.11 while our direct pin stays at 0.10. Both compile today, because platform.rs and keychain.rs never hand each other a CoreFoundation value and so the duplicate types never meet; that silence is exactly why this needs a rule rather than a failing build to catch it. Lift the pair together. Patch updates are unaffected, and the caret ranges already absorb anything compatible through lockFileMaintenance.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "core-foundation",
+        "security-framework"
+      ],
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "enabled": false
+    },
+    {
       "description": "The dev image's base tag floats within a major (rust:1-slim picks up new minors on 'docker compose build --pull', matching how CI floats on dtolnay/rust-toolchain@stable), so only the major needs a pull request. Grouping it keeps the Dockerfile and compose file in one change.",
       "matchManagers": [
         "dockerfile",
