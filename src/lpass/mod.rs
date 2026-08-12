@@ -1,6 +1,6 @@
 mod cli;
 
-pub use cli::{LpassCli, ASKPASS_MARKER};
+pub use cli::{LpassCli, ASKPASS_FROM_STORE, ASKPASS_MARKER, ASKPASS_SIGNAL};
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -62,6 +62,17 @@ pub trait LpassClient: Send + Sync {
     /// "never prompts" while in fact prompting would put a master-password
     /// dialog outside the gate, which is the one thing this exists to prevent.
     fn may_prompt(&self) -> bool;
+
+    /// Whether a call has made the master-password helper run since this
+    /// client was built.
+    ///
+    /// Proof that a password was actually consulted. Setup needs it: an `lpass`
+    /// call can succeed on a key that was already cached, which says nothing
+    /// about whether the candidate password is right.
+    /// Required rather than defaulted, like `may_prompt`: an implementation
+    /// inheriting "never asked" would make setup reject passwords that are in
+    /// fact correct, and the reason would be invisible.
+    fn master_password_came_from_store(&self) -> bool;
 
     async fn status(&self) -> Result<LoginStatus, LpassError>;
 
@@ -412,6 +423,8 @@ pub mod mock {
         pub broken_items: Vec<String>,
         /// (item id, field) pairs that fail on access.
         pub broken_fields: Vec<(String, String)>,
+        /// (item id, field) pairs that report the vault as shut.
+        pub logged_out_fields: Vec<(String, String)>,
         /// (item id, field) pairs the item simply does not have.
         pub absent_fields: Vec<(String, String)>,
         /// Every (item, field) fetched, for assertions on what was touched.
@@ -446,6 +459,13 @@ pub mod mock {
             self
         }
 
+        /// As a vault whose key has expired: this field reports not-logged-in
+        /// while the rest of the client still works.
+        pub fn with_logged_out_field(mut self, item: &str, field: &str) -> Self {
+            self.logged_out_fields.push((item.into(), field.into()));
+            self
+        }
+
         pub fn with_broken_field(mut self, item: &str, field: &str) -> Self {
             self.broken_fields.push((item.into(), field.into()));
             self
@@ -459,6 +479,10 @@ pub mod mock {
 
     #[async_trait::async_trait]
     impl LpassClient for MockLpass {
+        fn master_password_came_from_store(&self) -> bool {
+            self.prompting
+        }
+
         fn may_prompt(&self) -> bool {
             self.prompting
         }
@@ -481,6 +505,13 @@ pub mod mock {
                 .unwrap()
                 .push((item_id.into(), field.into()));
             if !self.logged_in {
+                return Err(LpassError::NotLoggedIn);
+            }
+            if self
+                .logged_out_fields
+                .iter()
+                .any(|(id, f)| id == item_id && f == field)
+            {
                 return Err(LpassError::NotLoggedIn);
             }
             if self

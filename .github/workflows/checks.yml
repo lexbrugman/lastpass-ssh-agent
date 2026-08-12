@@ -29,9 +29,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # Type-checking only: the macOS-gated code never compiles on the
+          # Linux runner otherwise, and the test job that does build it runs
+          # the suite rather than clippy.
+          targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --target aarch64-apple-darwin --all-targets -- -D warnings
 
   # Advisories are time-based rather than code-based: a dependency that was
   # clean yesterday can be vulnerable today without anything here changing.

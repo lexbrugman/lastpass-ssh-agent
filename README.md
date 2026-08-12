@@ -54,11 +54,11 @@ What it **cannot** guarantee:
 - **Your master password**, specifically. By default the agent never sees it:
   lpass's own pinentry is disabled, so a vault that has forgotten its key fails
   the signature and you run `lpass login` yourself. Turning on
-  [`lock_on_screen_lock`](#locking-the-vault-with-the-screen) trades that away
-  deliberately — a vault the agent locks is one it must be able to reopen, so it
-  prompts for the master password and passes it to `lpass` over a pipe, in a
-  zeroizing buffer, never logged, written, cached, or placed in argv or the
-  environment. Leave the setting off (the default) and none of that happens.
+  [`master_password`](#being-asked-for-the-master-password) trades that
+  away deliberately — it prompts for the master password and passes it to
+  `lpass` over a pipe, in a zeroizing buffer, never logged, written, cached, or
+  placed in argv or the environment. Leave the setting off (the default) and
+  none of that happens.
 
 ## Install
 
@@ -180,6 +180,15 @@ vault scan) or tuning behavior:
 # "keychain" (macOS) asks once and remembers; "error" refuses to sign.
 # passphrase_fallback = "prompt"
 
+# How long the vault stays unlocked once lpass has derived its key. Unset
+# leaves lpass to its own default of an hour; 0 means never expire.
+# vault_unlock_timeout_secs = 300
+
+# Where the master password comes from when lpass has forgotten its key.
+# "off" (default) fails the signature; "prompt" asks you, any platform;
+# "keychain" (macOS) releases it on Touch ID, falling back to asking.
+# master_password = "off"
+
 # Shut the vault when the screen locks, not just the display. macOS only.
 # lock_on_screen_lock = false
 
@@ -259,16 +268,91 @@ it locks. The LastPass *session* survives, so the way back is your master
 password, not a fresh login with a second factor — and you are not asked for it
 on unlock, only when a signature actually needs the vault again.
 
-That asking is the part to be deliberate about: **the agent prompts you for the
-master password itself**, which it does not do otherwise — see the security
-model above for how it is handled. Without it, every unlock would cost you a
-failed `ssh` until you re-authenticated by hand. The prompt looks like every
-other one this agent shows, since it uses whatever `confirm` already selects,
-and it appears whenever `lpass` has no cached key — so after the ordinary hourly
-expiry too, not only after a lock.
-
 macOS only, and refused at startup elsewhere: reading the screen's lock state is
 the one part of this a platform has to provide, and only macOS does so far.
+
+On its own, though, a lock costs you a failed `ssh` afterwards — which is what
+the setting below is for, and why the two are usually turned on together.
+
+### Being asked for the master password
+
+```toml
+master_password = "prompt"     # or "keychain" on macOS
+```
+
+`lpass` forgets its cached key on its own hourly timeout as readily as it does
+when a screen lock takes it away, and by default either one fails the next
+signature with *not logged in* until you re-authenticate by hand. With this on,
+the agent asks instead — **it prompts you for the master password itself**,
+which it does not do otherwise; see the security model above for how that is
+handled.
+
+### Keeping it behind Touch ID
+
+```toml
+master_password = "keychain"     # macOS only
+```
+
+```sh
+lastpass-ssh-agent store-master-password
+```
+
+The setup command locks the vault, asks once, checks that what you typed
+actually opens it, and keeps it only if it does — so a typo never becomes a
+stored credential, and setting it up proves the whole arrangement works rather
+than only that a password was typed.
+
+After that a locked vault costs a fingerprint instead of typing your master
+password. The item is created requiring **user presence**, so it is released
+only on Touch ID or your login password: something able to trigger signatures
+can make the prompt appear, but cannot answer it. That is the difference between
+this and simply storing the password — without the constraint, anything running
+as you could take the key to the whole vault silently.
+
+Two things it does not change. The confirmation dialog still runs, separately
+and unchanged, naming the key, fingerprint, requester and host — Touch ID
+authorises opening the vault, never a signature. And until you have run
+`store-master-password`, or when biometry is unavailable, it behaves exactly
+like `"prompt"`.
+
+Deliberately a separate setting from `lock_on_screen_lock`, and deliberately not
+macOS-only: nothing about being asked for a password is platform-specific, and
+the hourly expiry happens everywhere. The prompt looks like every other one this
+agent shows, since it uses whatever `confirm` already selects.
+
+Mechanically, `lpass` runs a password helper as a bare executable path with the
+prompt as its only argument — no shell, no room for a subcommand. So the agent
+writes a two-line wrapper into its own socket directory and points `lpass` at
+that; the wrapper runs `lastpass-ssh-agent askpass`, an ordinary subcommand you
+can see in `--help` and in `ps`. It is rewritten on every start, so an upgrade
+that moves the binary corrects itself. Run by hand it refuses, because the
+config it prompts from is named by an environment variable the agent sets.
+
+### How long the vault stays unlocked
+
+`lpass` keeps the key it derives for an hour by default. To shorten that:
+
+```toml
+vault_unlock_timeout_secs = 300
+```
+
+Two things are worth knowing. `0` means *never expire*, which is lpass's own
+encoding — it disables the timer rather than setting it to nothing. And the
+value only governs an `lpass` agent that **this** agent starts: whichever
+process runs `lpass` first fixes the timeout for that agent's lifetime, so a
+shell that has already used `lpass` keeps whatever it set.
+
+That is why `lastpass-ssh-agent env` prints it too:
+
+```sh
+$ lastpass-ssh-agent env
+SSH_AUTH_SOCK='/Users/you/…/agent.sock'; export SSH_AUTH_SOCK;
+LPASS_AGENT_TIMEOUT='300'; export LPASS_AGENT_TIMEOUT;
+```
+
+If your shell profile already runs `eval "$(lastpass-ssh-agent env)"`, both
+your shells and the agent take the number from this one file — rather than you
+keeping it in `.zshrc` as well and the two drifting apart.
 
 ## Run
 
@@ -288,9 +372,9 @@ ssh github.com      # pops the confirmation dialog, then signs
 If you log out of LastPass while the agent runs, signatures fail with a
 clear log message; `lpass login` in any terminal and retry — the agent does
 not need a restart. (With
-[`lock_on_screen_lock`](#locking-the-vault-with-the-screen) on, a vault that has
-only forgotten its key prompts you for the master password instead of failing;
-a real logout still needs `lpass login`.)
+[`master_password`](#being-asked-for-the-master-password) set, a vault
+that has only forgotten its key prompts you instead of failing; a real logout
+still needs `lpass login`.)
 
 ### Start automatically
 
@@ -376,8 +460,8 @@ another agent.
   field empty is what buys the separation; see [Keeping the passphrase out of
   the vault](#keeping-the-passphrase-out-of-the-vault).
 - **Secret prompts share `confirm_timeout_secs`** (30s by default) — the key
-  passphrase and, with `lock_on_screen_lock`, the master password. Generous for
-  pressing a button, tight for typing a long secret; raise it if entry keeps
+  passphrase and, with a `master_password` source, the master password. Generous
+  for pressing a button, tight for typing a long secret; raise it if entry keeps
   timing out.
 - **Suspending a `tty` passphrase prompt leaves the terminal with echo off.**
   Ctrl-Z skips the cleanup a timeout or cancellation runs, so the shell comes
@@ -412,8 +496,10 @@ another agent.
   the next agent restart (discovery runs once at startup). Pin `[[keys]]` if
   you want new vault items to require an explicit opt-in instead.
 - With `lock_on_screen_lock`, the vault reopens on the first signature that
-  needs it and stays open until the next lock or `lpass`'s own hour — the lock
-  bounds exposure, it does not make each signature cost a password.
+  needs it and stays open until the next lock or `vault_unlock_timeout_secs` —
+  the lock bounds exposure, it does not make each signature cost a password.
+  With `master_password = "off"`, that first signature fails rather than
+  prompting.
 - Auto-discovery costs one `lpass` call per vault item, eight at a time:
   `lpass ls` reports names and ids but not the note type, so every item has to
   be asked. A few hundred items are quick; a few thousand are most of a minute

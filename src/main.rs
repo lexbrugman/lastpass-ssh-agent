@@ -1,11 +1,18 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod agent;
+mod askpass;
 mod cli;
 mod config;
 mod confirm;
 mod error;
 mod interaction;
+// Excluded from coverage as a whole, which is the point of it being this small:
+// every line talks to the real Keychain of whoever runs the tests. The rules
+// around it are covered through store fakes on every platform.
+#[cfg(target_os = "macos")]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod keychain;
 mod keystore;
 mod knownhosts;
 mod lpass;
@@ -88,18 +95,6 @@ async fn main() {
         )
         .init();
 
-    // Before the command line is even looked at: lpass runs this binary as
-    // `<program> "<prompt>"` and gives no way to pass a subcommand, so being
-    // the password helper is decided by the environment it was handed.
-    if let Some(config) = std::env::var_os(lpass::ASKPASS_MARKER) {
-        if let Err(e) = askpass(Path::new(&config)).await {
-            // stderr, never stdout: stdout is the answer, and lpass reads it.
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {
         tracing::error!("{e}");
@@ -108,24 +103,29 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let config_path = cli
-        .config
-        .clone()
-        .or_else(Config::default_path)
-        .ok_or_else(no_home)?;
+    // Resolved per command rather than up front: `askpass` is told which config
+    // to use by the environment the agent set, and must not fail for want of a
+    // home directory it was never going to consult.
+    let Cli { config, command } = cli;
+    let config_path = || {
+        config
+            .clone()
+            .or_else(Config::default_path)
+            .ok_or_else(no_home)
+    };
 
     // The config file is optional throughout: without one (or without
     // [[keys]]) the agent auto-discovers the vault's SSH Key items.
-    match cli.command {
-        Command::Doctor { test_confirm } => doctor(&config_path, test_confirm).await,
+    match command {
+        Command::Doctor { test_confirm } => doctor(&config_path()?, test_confirm).await,
         Command::Env => {
-            let config = Config::load_or_default(&config_path)?;
-            print_env(&config.socket_path()?);
+            let config = Config::load_or_default(&config_path()?)?;
+            print_env(&config.socket_path()?, config.vault_unlock_timeout_secs);
             Ok(())
         }
-        Command::Start => start(&config_path).await,
+        Command::Start => start(&config_path()?).await,
         Command::List => {
-            let config = Config::load_or_default(&config_path)?;
+            let config = Config::load_or_default(&config_path()?)?;
             let client: Arc<dyn LpassClient> = Arc::new(client_from(&config)?);
             require_login(client.as_ref()).await?;
             let keys = effective_keys(&client, &config).await?;
@@ -144,9 +144,123 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Search { query } => {
             // Must work before any config exists — it's the setup helper.
-            let config = Config::load_or_default(&config_path)?;
+            let config = Config::load_or_default(&config_path()?)?;
             let client: Arc<dyn LpassClient> = Arc::new(client_from(&config)?);
             search(&client, query.as_deref()).await
+        }
+        Command::StoreMasterPassword => store_master_password(&config_path()?).await,
+        // Its config is named by the environment the agent set, not by
+        // `--config`: lpass owns this command line and leaves no room for one.
+        Command::Askpass { .. } => askpass(&askpass::config_from_env()?).await,
+    }
+}
+
+/// Keep the master password in the platform's store, once it has been shown to
+/// open the vault.
+///
+/// Locks the vault first, because that is what makes checking possible at all:
+/// `lpass` only asks for a password when it has no key. What follows is the
+/// production path exactly — the same wrapper, the same helper, the same
+/// presence prompt — so setting this up proves the whole arrangement works
+/// rather than only that a password was typed.
+///
+/// Excluded from coverage: it needs a real vault to lock, a real Keychain to
+/// write and a fingerprint to release it, and the one branch a test could take
+/// is the one platform where the rest is refused at config load. What it
+/// decides is `askpass::seed`'s, tested with fakes on every platform; that it
+/// refuses without somewhere to store is covered end to end by the CLI tests.
+async fn store_master_password(config_path: &Path) -> Result<()> {
+    let config = Config::load_or_default(config_path)?;
+    let socket_path = config.socket_path()?;
+    refuse_while_an_agent_runs(&socket_path)?;
+    seed_master_password(&config, config_path, &socket_path).await
+}
+
+/// Setup refuses while an agent is running.
+///
+/// Kept out of the exempt function below, and testable on any platform: this is
+/// the check worth a regression test, since getting it wrong means two prompts
+/// on one terminal.
+fn refuse_while_an_agent_runs(socket_path: &Path) -> Result<()> {
+    // Only one thing may talk to the user at a time, and that gate lives inside
+    // a running agent — it cannot reach across to this process. Rather than
+    // build an interprocess one for a command run once, refuse: a signing
+    // confirmation appearing over this prompt could take the answer meant for
+    // it, and a master password would land in a buffer nothing wipes.
+    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        return Err(Error::ConfigInvalid(format!(
+            "an agent is running on {} — stop it first (`brew services stop \
+             lastpass-ssh-agent`), so nothing else can prompt while this does",
+            socket_path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The rest: lock the vault, ask, and keep the answer if it opens it.
+///
+/// Excluded from coverage, and only this: every line needs a real vault to
+/// lock, a real Keychain to write and a fingerprint to release it. What it
+/// decides is `askpass::seed`'s, tested with fakes on every platform.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn seed_master_password(
+    config: &Config,
+    config_path: &Path,
+    socket_path: &Path,
+) -> Result<()> {
+    if config.master_password != config::MasterPassword::Keychain {
+        return Err(Error::ConfigInvalid(
+            "nothing to store: set master_password = \"keychain\" in the config first".into(),
+        ));
+    }
+    let client: Arc<dyn LpassClient> = Arc::new(asking_client(config, config_path, socket_path)?);
+    // No login check first. `lpass status` cannot answer once the key is gone,
+    // and a locked vault is the state this command creates — so checking would
+    // refuse the second run of a command whose first run failed. A session that
+    // is genuinely gone surfaces from the vault call below, in lpass's own
+    // words.
+
+    // Shut the vault so lpass has to ask, which is the only way to learn
+    // whether what we are about to keep actually opens it.
+    tracing::info!("locking the vault, so the password can be checked against it");
+    vaultlock::VaultKey::forget(&lpass::LpassAgentProcess).await;
+
+    let secret = passphrase::from_config(config)?
+        .prompt(&passphrase::PassphraseRequest::master_password())
+        .await
+        .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
+
+    askpass::seed(
+        askpass::default_store().as_ref(),
+        &secret,
+        &VaultOpens(client),
+    )
+    .await
+}
+
+/// Opening the vault means using it for something that needs the derived key
+/// and returns no secret: listing what is in it.
+struct VaultOpens(Arc<dyn LpassClient>);
+
+#[async_trait::async_trait]
+impl askpass::VaultUnlock for VaultOpens {
+    /// Excluded from coverage with its caller: this is the one line that needs
+    /// a vault.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    async fn attempt(&self) -> std::result::Result<(), String> {
+        self.0.ls().await.map_err(|e| e.to_string())?;
+        // Succeeding is not enough: lpass may have used a key it still had
+        // cached, in which case the candidate was never looked at and calling
+        // it verified would let any typo through. The helper reports itself, so
+        // its silence means exactly that.
+        if self.0.master_password_came_from_store() {
+            Ok(())
+        } else {
+            Err(
+                "the vault was already open, so the password was never used — \
+                 lock it and try again"
+                    .into(),
+            )
         }
     }
 }
@@ -158,22 +272,47 @@ async fn run(cli: Cli) -> Result<()> {
 /// nothing is kept: the answer goes to stdout and the buffer holding it is
 /// wiped when this returns.
 async fn askpass(config_path: &Path) -> Result<()> {
-    use std::io::Write as _;
-
     let config = Config::load_or_default(config_path)?;
-    let prompt = passphrase::from_config(&config)?;
-    let secret = prompt
-        .prompt(&passphrase::PassphraseRequest::master_password())
-        .await
-        .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
+    let (secret, from) = askpass::resolve(
+        config.master_password,
+        askpass::default_store().as_ref(),
+        passphrase::from_config(&config)?.as_ref(),
+    )
+    .await?;
 
-    // Written as bytes and flushed by hand: `println!` would copy the secret
-    // into a `String` first, and a panicking lock would leave it unwiped.
-    let mut out = std::io::stdout().lock();
-    out.write_all(&secret).map_err(Error::Io)?;
-    out.write_all(b"\n").map_err(Error::Io)?;
-    out.flush().map_err(Error::Io)?;
+    // One zeroizing allocation, sized once, carrying the newline lpass expects.
+    // `println!` would copy the secret into a `String` on the way past, which
+    // is a copy this code owns and therefore one it must not make.
+    let mut answer = zeroize::Zeroizing::new(Vec::with_capacity(secret.len() + 1));
+    answer.extend_from_slice(&secret);
+    answer.push(b'\n');
+    write_answer(&answer)?;
+
+    // Tell the agent this happened. Its log is the only place anyone looks, and
+    // the agent cannot see this process — lpass spawned it, not us. Which
+    // source answered goes with it, because setup trusts only the store's own
+    // answer: a password typed at the fallback prompt says nothing about what
+    // is kept.
+    eprintln!("{}{}", lpass::ASKPASS_SIGNAL, from.signal_suffix());
     Ok(())
+}
+
+/// Hand the answer to whatever is reading our stdout — `lpass`, in practice.
+///
+/// Through the ordinary `Stdout`, which keeps a buffer of its own that this
+/// does not reach into. Tempting to write at the descriptor instead and leave
+/// no copy behind, but that means manufacturing ownership of fd 1, and a helper
+/// launched with stdout closed could then have that descriptor be something
+/// else entirely — a master password sent somewhere unrelated is a worse
+/// failure than one lingering in a buffer this process is about to exit from.
+///
+/// The same line the rest of this codebase draws: our own buffers are
+/// `Zeroizing` and allocated once, a library's intermediates are left alone.
+fn write_answer(bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    out.write_all(bytes).map_err(Error::Io)?;
+    out.flush().map_err(Error::Io)
 }
 
 /// The keys the agent should serve: the configured [[keys]] if any,
@@ -205,19 +344,11 @@ async fn effective_keys(client: &Arc<dyn LpassClient>, config: &Config) -> Resul
 
 async fn start(config_path: &Path) -> Result<()> {
     let config = Config::load_or_default(config_path)?;
-    // Only the long-running agent points lpass at a prompt of ours: the one-shot
-    // commands have a terminal, where lpass asking there directly beats a dialog
-    // over the top of it.
-    // And only when the vault is being locked with the screen: without that,
-    // lpass losing its key is the ordinary expiry it always was, and failing
-    // fast beats a master-password dialog nobody asked for.
-    let client: Arc<dyn LpassClient> = Arc::new(client_from(&config)?.asking_with(
-        config.lock_on_screen_lock,
-        own_binary(),
-        config_path.to_path_buf(),
-        std::time::Duration::from_secs(config.confirm_timeout_secs),
-    ));
-    require_login(client.as_ref()).await?;
+    let socket_path = config.socket_path()?;
+    let client: Arc<dyn LpassClient> = Arc::new(asking_client(&config, config_path, &socket_path)?);
+    if wants_login_checked(config.master_password) {
+        require_login(client.as_ref()).await?;
+    }
 
     let keys = effective_keys(&client, &config).await?;
     let store = Arc::new(keystore::KeyStore::load(client.as_ref(), &keys, &config).await?);
@@ -237,9 +368,8 @@ async fn start(config_path: &Path) -> Result<()> {
         client.clone(),
         passphrase::from_config(&config)?,
     ));
-    let socket_path = config.socket_path()?;
     let (listener, guard) = socket::bind(&socket_path)?;
-    print_env(&socket_path);
+    print_env(&socket_path, config.vault_unlock_timeout_secs);
 
     // Runs beside the agent rather than inside a request: the screen locks when
     // nobody is asking for a signature, which is the whole point of it. Spawned
@@ -300,6 +430,40 @@ async fn shutdown_signal() {
     }
 }
 
+/// An lpass client that can have the master password asked for, wrapper and all.
+///
+/// Shared by `start` and `store-master-password`, which need the same
+/// arrangement for the same reason: lpass execs a bare path with one argument,
+/// so what it runs is a small wrapper written here, and the wrapper runs an
+/// ordinary `askpass` subcommand. Written before any lpass call, because the
+/// first one may already need it.
+///
+/// Only the long-running agent and the setup command do this: the other
+/// one-shot commands have a terminal, where lpass asking there directly beats a
+/// dialog over the top of it. A socket path with no usable parent falls through
+/// to `bind`, which refuses it in words of its own.
+fn asking_client(
+    config: &Config,
+    config_path: &Path,
+    socket_path: &Path,
+) -> Result<lpass::LpassCli> {
+    let helper = match socket_path
+        .parent()
+        .filter(|_| config.master_password != config::MasterPassword::Off)
+    {
+        Some(dir) => {
+            socket::prepare_dir(dir)?;
+            Some(askpass::install(socket_path, &own_binary())?)
+        }
+        None => None,
+    };
+    Ok(client_from(config)?.asking_with(
+        helper,
+        config_path.to_path_buf(),
+        std::time::Duration::from_secs(config.confirm_timeout_secs),
+    ))
+}
+
 /// Build the real lpass client from config.
 fn client_from(config: &Config) -> Result<lpass::LpassCli> {
     let binary = lpass::resolve_binary(config.lpass_path.as_deref()).ok_or_else(|| {
@@ -308,7 +472,20 @@ fn client_from(config: &Config) -> Result<lpass::LpassCli> {
                 .into(),
         )
     })?;
-    Ok(lpass::LpassCli::new(binary))
+    Ok(lpass::LpassCli::new(binary).unlocked_for(config.vault_unlock_timeout_secs))
+}
+
+/// Whether a locked vault should stop the agent starting.
+///
+/// `lpass status` cannot answer once the derived key has expired, so it reports
+/// a locked vault as a logged-out one. With nowhere to get a master password
+/// that is the right answer — nothing here could reopen it, and failing at
+/// startup beats failing at the first signature. With a source configured it is
+/// wrong: loading the keys is itself a vault call, so it would prompt once and
+/// carry on, and refusing first turns a recoverable state into a dead agent
+/// that launchd then restarts in a loop.
+const fn wants_login_checked(source: config::MasterPassword) -> bool {
+    matches!(source, config::MasterPassword::Off)
 }
 
 async fn require_login(client: &dyn lpass::LpassClient) -> Result<()> {
@@ -355,8 +532,15 @@ async fn search(client: &Arc<dyn LpassClient>, query: Option<&str>) -> Result<()
     Ok(())
 }
 
-fn print_env(socket: &Path) {
+fn print_env(socket: &Path, vault_unlock_timeout_secs: Option<u64>) {
     println!("SSH_AUTH_SOCK={}; export SSH_AUTH_SOCK;", sh_quote(socket));
+    // So a shell profile that already evaluates this takes the vault's timeout
+    // from the config too, instead of repeating the number in a second place —
+    // a shell's own lpass calls start their own agent, and whichever starts it
+    // first decides.
+    if let Some(seconds) = vault_unlock_timeout_secs {
+        println!("LPASS_AGENT_TIMEOUT='{seconds}'; export LPASS_AGENT_TIMEOUT;");
+    }
 }
 
 fn sh_quote(path: &Path) -> String {
@@ -475,9 +659,14 @@ fn check_config(config_path: &Path) -> (Check, Option<Config>) {
 /// The lpass binary, and a client that talks to it.
 fn check_lpass_binary(config: Option<&Config>) -> (Check, Option<Arc<dyn LpassClient>>) {
     let configured = config.and_then(|c| c.lpass_path.as_deref());
+    // Carrying the configured timeout, because these calls can be the ones that
+    // start the lpass agent — and then its lifetime is fixed, so a `doctor` run
+    // before the agent would quietly pin the default hour on everything after.
+    let unlocked_for = config.and_then(|c| c.vault_unlock_timeout_secs);
     lpass::resolve_binary(configured).map_or_else(no_lpass_binary, |path| {
         let check = Check::passed("lpass binary", path.display().to_string());
-        let client: Arc<dyn LpassClient> = Arc::new(lpass::LpassCli::new(path));
+        let client: Arc<dyn LpassClient> =
+            Arc::new(lpass::LpassCli::new(path).unlocked_for(unlocked_for));
         (check, Some(client))
     })
 }
@@ -607,7 +796,28 @@ mod tests {
     }
 
     #[test]
-    fn print_env_emits_export_line() {
-        print_env(Path::new("/tmp/agent.sock"));
+    fn a_locked_vault_only_stops_startup_when_nothing_could_reopen_it() {
+        // `lpass status` cannot tell a locked vault from a logged-out one, so
+        // the check is only honest when there is no way back.
+        assert!(wants_login_checked(config::MasterPassword::Off));
+        assert!(!wants_login_checked(config::MasterPassword::Prompt));
+    }
+
+    #[test]
+    fn setup_refuses_while_an_agent_is_listening() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        // nothing there yet
+        refuse_while_an_agent_runs(&socket).unwrap();
+
+        let _listening = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let error = refuse_while_an_agent_runs(&socket).unwrap_err().to_string();
+        assert!(error.contains("an agent is running"), "{error}");
+    }
+
+    #[test]
+    fn print_env_emits_export_lines() {
+        print_env(Path::new("/tmp/agent.sock"), None);
+        print_env(Path::new("/tmp/agent.sock"), Some(300));
     }
 }

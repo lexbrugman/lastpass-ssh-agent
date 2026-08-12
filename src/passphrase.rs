@@ -126,7 +126,7 @@ impl std::fmt::Display for PromptError {
 ///
 /// Counted against the answer as delivered, framing included, so at least 1022
 /// bytes of passphrase always fit.
-const MAX_PASSPHRASE_BYTES: usize = 1024;
+pub const MAX_PASSPHRASE_BYTES: usize = 1024;
 
 /// A prompt helper's pipe or exit could not be read.
 ///

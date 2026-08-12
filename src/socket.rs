@@ -92,7 +92,10 @@ pub fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
     ))
 }
 
-fn prepare_dir(dir: &Path) -> Result<()> {
+/// Create the socket directory if it is missing and check the invariants
+/// `bind` relies on. Called by `bind`, and separately by `start` when the
+/// askpass wrapper has to be written there before anything is spawned.
+pub fn prepare_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
         fs::create_dir_all(dir)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;

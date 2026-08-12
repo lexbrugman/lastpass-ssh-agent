@@ -432,7 +432,7 @@ fn askpass_setup(helper_body: &str) -> Setup {
     let s = setup(&healthy_vault_body_owned(), "");
     let helper = fake_lpass(s.dir.path(), helper_body);
     let config = format!(
-        "confirm = \"askpass\"\naskpass = {}\n",
+        "confirm = \"askpass\"\nmaster_password = \"prompt\"\naskpass = {}\n",
         toml::Value::String(helper.display().to_string())
     );
     std::fs::write(&s.config, config).unwrap();
@@ -443,6 +443,7 @@ fn askpass_setup(helper_body: &str) -> Setup {
 fn askpass_helper_prints_the_master_password_on_stdout() {
     let s = askpass_setup("printf 'the-master-password\\n'");
     let output = Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
+        .args(["askpass", "a prompt from lpass"])
         .env("HOME", s.dir.path())
         .env("LASTPASS_SSH_AGENT_ASKPASS_CONFIG", &s.config)
         .output()
@@ -450,6 +451,12 @@ fn askpass_helper_prints_the_master_password_on_stdout() {
     assert!(output.status.success(), "{}", stderr(&output));
     // exactly the answer and one newline: lpass reads this verbatim
     assert_eq!(stdout(&output), "the-master-password\n");
+    // and it says so on stderr, which is what the agent turns into a log line
+    assert!(
+        stderr(&output).contains("master password supplied"),
+        "the unlock must leave a trace: {}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -458,6 +465,7 @@ fn a_dismissed_master_password_prompt_fails_without_printing_anything() {
     // password, and an empty answer is not one.
     let s = askpass_setup("exit 1");
     let output = Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
+        .args(["askpass", "a prompt from lpass"])
         .env("HOME", s.dir.path())
         .env("LASTPASS_SSH_AGENT_ASKPASS_CONFIG", &s.config)
         .output()
@@ -465,6 +473,96 @@ fn a_dismissed_master_password_prompt_fails_without_printing_anything() {
     assert!(!output.status.success());
     assert_eq!(stdout(&output), "");
     assert!(!stderr(&output).is_empty(), "it must say why");
+}
+
+#[test]
+fn askpass_run_by_hand_refuses_and_says_why() {
+    // The whole reason it is a named command rather than a mode the environment
+    // switches on: run without the arrangement it belongs to, it says so.
+    let s = setup(&healthy_vault_body_owned(), "");
+    let output = Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
+        .arg("askpass")
+        .env("HOME", s.dir.path())
+        .env_remove("LASTPASS_SSH_AGENT_ASKPASS_CONFIG")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(stdout(&output), "", "never a password on stdout");
+    assert!(
+        stderr(&output).contains("not a command to run by hand"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn askpass_is_listed_in_help() {
+    // It was invisible before: a mode selected by an environment variable can
+    // never appear here, which is what made it folklore.
+    let s = setup(&healthy_vault_body_owned(), "");
+    let output = run(&s, &["--help"]);
+    assert!(stdout(&output).contains("askpass"), "{}", stdout(&output));
+}
+
+#[test]
+fn start_writes_the_askpass_wrapper_lpass_will_run() {
+    // It has to exist before the first lpass call, so it is written even when
+    // that call is the one that fails.
+    use std::os::unix::fs::PermissionsExt as _;
+    let s = setup(
+        "echo 'Not logged in.'; exit 1",
+        "master_password = \"prompt\"\n",
+    );
+    let output = run(&s, &["start"]);
+    assert!(!output.status.success(), "the vault is logged out");
+
+    let wrapper = s.dir.path().join("agent.sock.askpass");
+    let script = std::fs::read_to_string(&wrapper).expect("the wrapper must be written");
+    assert!(script.starts_with("#!/bin/sh\n"), "{script}");
+    assert!(script.contains(" askpass \"$@\""), "{script}");
+    let mode = std::fs::metadata(&wrapper).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "only this user may run it");
+
+    // and it really runs: what lpass execs is this file, with a prompt
+    let helper = Command::new(&wrapper)
+        .arg("a prompt from lpass")
+        .env("HOME", s.dir.path())
+        .env_remove("LASTPASS_SSH_AGENT_ASKPASS_CONFIG")
+        .output()
+        .unwrap();
+    assert!(!helper.status.success(), "no config named, so it refuses");
+    assert!(
+        stderr(&helper).contains("not a command to run by hand"),
+        "{}",
+        stderr(&helper)
+    );
+}
+
+#[test]
+fn start_writes_no_wrapper_when_it_was_not_asked_for() {
+    let s = setup("echo 'Not logged in.'; exit 1", "");
+    assert!(!run(&s, &["start"]).status.success());
+    assert!(!s.dir.path().join("agent.sock.askpass").exists());
+}
+
+#[test]
+fn storing_a_master_password_needs_the_keychain_source() {
+    // Nothing to store without somewhere to put it, and saying so beats
+    // prompting for a secret that would then have nowhere to go.
+    let s = setup(&healthy_vault_body_owned(), "");
+    let output = run(&s, &["store-master-password"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("master_password = \"keychain\""),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn store_master_password_is_listed_in_help() {
+    let s = setup(&healthy_vault_body_owned(), "");
+    assert!(stdout(&run(&s, &["--help"])).contains("store-master-password"));
 }
 
 #[test]
