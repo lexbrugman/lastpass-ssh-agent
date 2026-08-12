@@ -305,7 +305,7 @@ impl Unlocker {
         entry: &KeyEntry,
         gate: &mut crate::interaction::InteractionGate,
     ) -> Result<Zeroizing<Vec<u8>>, String> {
-        // Nothing above this point reaches the user, so this is where a request
+        // Nothing before this point reaches the user, so this is where a request
         // that only ever needed a passphrase claims the gate.
         gate.enter().await;
         let typed = self
@@ -331,19 +331,19 @@ impl Unlocker {
         gate: &mut crate::interaction::InteractionGate,
     ) -> Result<ssh_key::PrivateKey, String> {
         // Before the read, not just before the prompt: a locked Keychain puts a
-        // system dialog on screen and waits (see `keychain::blocking`), so the
+        // system dialog on screen and waits (see `crate::apple::blocking`), so the
         // read is itself an interaction. Outside the gate it could share the
         // screen with another request's confirmation, and two requests missing
         // at once would queue duplicate passphrase prompts behind it.
         gate.enter().await;
         let fingerprint = entry.fingerprint();
         match self.store.get(&fingerprint).await {
-            // Nothing this agent saved can be over the cap, so a value that is
+            // Nothing this agent saved can be over the cap, so one that is
             // did not come from here. Refused rather than used — and the cap is
             // enforced on this side because a store is an outside system whose
             // contents are not ours to trust.
             Ok(Some(saved)) if saved.len() > MAX_PASSPHRASE_BYTES => {
-                tracing::warn!(key = %fingerprint,
+                tracing::warn!(fingerprint = %fingerprint,
                     "ignoring a value in {} too long to be a passphrase",
                     self.store.name());
             }
@@ -356,17 +356,17 @@ impl Unlocker {
                 // The key was replaced, or this entry belongs to an older one.
                 // Asking again is the only way out: retrying a value that
                 // cannot work would lock the key permanently.
-                tracing::info!(key = %fingerprint,
+                tracing::info!(fingerprint = %fingerprint,
                     "the passphrase in {} no longer decrypts this key — asking again",
                     self.store.name());
             }
             Ok(None) => {
-                tracing::debug!(key = %fingerprint,
+                tracing::debug!(fingerprint = %fingerprint,
                     "no passphrase stored in {} for this key yet", self.store.name());
             }
             // A store that cannot be read is not a reason to refuse the
             // signature: asking is always available as a way through.
-            Err(e) => tracing::warn!(key = %fingerprint,
+            Err(e) => tracing::warn!(fingerprint = %fingerprint,
                 "cannot read the passphrase from {}, asking instead: {e}",
                 self.store.name()),
         }
@@ -377,14 +377,14 @@ impl Unlocker {
         let key = decrypt(encrypted, &typed)?;
         if let Err(e) = self.store.set(&fingerprint, &typed).await {
             // Not fatal: the signature can go ahead, and the next one asks.
-            tracing::warn!(key = %fingerprint,
+            tracing::warn!(fingerprint = %fingerprint,
                 "could not store the passphrase in {}, so the next signature will ask \
                  again: {e}",
                 self.store.name());
         } else {
             // Says what was stored, where, and what was not: a log line about
             // persisting a secret must not leave the private key in doubt.
-            tracing::info!(key = %fingerprint,
+            tracing::info!(fingerprint = %fingerprint,
                 "stored this key's passphrase in {} — the private key itself is never \
                  stored, and is still fetched from LastPass for every signature",
                 self.store.name());

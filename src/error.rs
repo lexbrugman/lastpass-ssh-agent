@@ -20,6 +20,15 @@ pub enum Error {
     #[error("invalid config: {0}")]
     ConfigInvalid(String),
 
+    /// A file this agent owns is not in the state it needs to be — the askpass
+    /// wrapper, the Secure Enclave store. Deliberately unprefixed: these
+    /// messages name the file, what is wrong with it and what to run, so a
+    /// label in front would only push the useful part further along the line.
+    /// Not `ConfigInvalid`: none of these are the user's config, and saying so
+    /// sends them to edit a file that was never the problem.
+    #[error("{0}")]
+    State(String),
+
     #[error("hardening failed: {0}")]
     Harden(String),
 

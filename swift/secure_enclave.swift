@@ -28,9 +28,9 @@
 //   its authorisation for its whole lifetime — not for some window — so one
 //   Touch ID would let every later use of the key through silently. Survivable
 //   for a tool that exits in milliseconds; not for an agent that runs for
-//   weeks. The context below is made inside the call that uses it, is never
-//   authenticated here, and is gone when that call returns, so each unwrap
-//   prompts. Its only job is to carry the sentence the user reads:
+//   weeks. The context in `lssha_se_open` is made inside the call that uses
+//   it, is never authenticated here, and is gone when that call returns, so
+//   each unwrap prompts. Its only job is to carry the sentence the user reads:
 //   `localizedReason` is what the system shows when an implicit prompt was
 //   given no reason of its own, and an unexplained fingerprint request is one
 //   nobody can sensibly refuse.
@@ -58,6 +58,13 @@ private let stageDecrypt: Int32 = 9
 
 /// Domain separation for the key derivation, so the bytes agreed here cannot
 /// double as a key for anything else that ever agrees the same secret.
+///
+/// Its `v1` is not `enclave::MAGIC`'s `v2` and must not be made to match. The
+/// magic versions the *file*, and was bumped when padding changed its layout;
+/// this versions the *derivation*, which has never changed. Changing this
+/// string derives a different key, so every password already stored becomes
+/// permanently unreadable — bump it only to deliberately invalidate them all,
+/// and never to tidy up the numbers.
 private let salt = Data("lastpass-ssh-agent secure enclave v1".utf8)
 
 /// An uncompressed P-256 point: `04 || X || Y`. The ciphertext carries the

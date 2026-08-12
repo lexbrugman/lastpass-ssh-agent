@@ -275,6 +275,50 @@ The one credential is `TAP_DEPLOY_KEY`, and only because the tap is a different
 repository — `GITHUB_TOKEN` cannot write to one. Without it a release still
 publishes and the formula is still attached to it; only the tap goes unupdated.
 
+## Comments
+
+This codebase comments heavily. That only pays while they are true, needed, and
+short enough that people still read them — a wall of prose gets skipped as
+reliably as no prose at all, and a stale line is worse than a missing one
+because it is believed. Four habits keep them worth their space.
+
+**Write for the code as it stands.** The reader is seeing it for the first time
+and has no idea what it looked like before. So no diary: "this used to be X",
+"the copies had drifted", "we changed this after a bug". They never saw X,
+cannot act on it, and now have to work out which half of the sentence still
+applies. State the rule in the present tense and leave the history in `git
+log`, which is built for it and which nobody has to read by accident.
+
+**Explain a choice only when the alternative is one a reader would reach for**,
+and the reason it fails is expensive to rediscover.
+
+- Worth it: why the master password is not a Keychain item (someone will try
+  it, and the answer is an entitlement that takes a day to find); why `install`
+  does not use `files::open_regular` (the two look interchangeable); why the
+  Swift language mode is pinned to 5 when the shim passes 6 (says when to
+  raise it).
+- Not worth it: which error variant this used to be, which helper this was
+  extracted from, what the comment above it said last week.
+
+**Say what the code cannot.** Restating the line beneath doubles the reading,
+halves the trust, and goes stale the moment that line changes. Spend the space
+on what is invisible: why a bound is that number, what breaks if it moves,
+which invariant the next edit must not quietly drop. Anchor to things that
+survive — names, invariants, filenames. Not line numbers, not "the function
+below", not "currently" or "recently", and not a version that will be bumped by
+someone who never reads the sentence beside it.
+
+**Length is earned a point at a time.** One sentence that stops a wrong change
+beats a paragraph restating a right one. The same explanation in three places
+is a liability rather than thoroughness: two of them will be updated and one
+will not, and there is no way to tell which. Give each fact one home and point
+at it — `swift/secure_enclave.swift` owns why the keychain is closed,
+`enclave.rs` owns what a stage means, and their callers link instead of
+retelling.
+
+The test, when unsure: delete the sentence and ask whether anyone could now
+make a wrong change safely. If they could, it was diary or decoration.
+
 ## Commits
 
 One line, imperative, no body and no attribution trailers.

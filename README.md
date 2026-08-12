@@ -60,11 +60,13 @@ What it **cannot** guarantee:
   and never placed in argv or the environment.
   [`"touchid"`](#keeping-it-behind-touch-id) goes further and is the only one
   of the three that keeps the master password at rest: it is written to disk,
-  encrypted to a key held in this Mac's Secure Enclave that the system will not
-  use without your fingerprint. That is a deliberate trade of a stored secret
-  for a hardware-enforced gate, and worth reading that section before turning
-  it on. (Key *passphrases* are a separate setting with a store of its own —
-  see [`passphrase_fallback`](#keeping-the-passphrase-out-of-the-vault).)
+  encrypted to a key that never leaves the Secure Enclave of the Mac it was
+  created on, and that macOS will not use without your fingerprint. Copies of
+  the file are inert anywhere else. That is a deliberate trade of a stored
+  secret for a hardware-enforced gate, and worth reading that section before
+  turning it on. (Key *passphrases* are a separate setting with a store of
+  their own — see
+  [`passphrase_fallback`](#keeping-the-passphrase-out-of-the-vault).)
 
 ## Install
 
@@ -144,6 +146,12 @@ recompiles, where a release install unpacks a prebuilt binary. And
 `--fetch-HEAD` is not optional: without it Homebrew only re-examines the branch
 when a new version is released, so a plain `brew upgrade` leaves a dev install
 sitting on the commit it was built from.
+
+On macOS a HEAD build also compiles a small Swift file — the part of
+`master_password = "touchid"` that only CryptoKit can do. Apple's Command Line
+Tools are enough for it; Xcode is not required. `xcode-select --install` if
+`swiftc` is missing. A release install compiles nothing, so none of this
+applies there, and Linux has no Swift in the build at all.
 
 `brew list --versions` shows `HEAD-<sha>` for a dev install, and `--version`
 reports the real commit either way, so it is always clear what is running.
@@ -309,11 +317,12 @@ stored credential, and setting it up proves the whole arrangement works rather
 than only that a password was typed.
 
 After that a locked vault costs a fingerprint instead of typing your master
-password. The password is encrypted to a key generated inside this Mac's
-**Secure Enclave**, which will not use that key until the fingerprint sensor
-says so. The enforcement is the system's, not this agent's: something able to
-trigger signatures can make the prompt appear, but cannot answer it, and copying
-the files away gains nothing because the key cannot leave the Enclave. That is
+password. The password is encrypted to a key generated inside your Mac's
+**Secure Enclave**, which never leaves it and which macOS will not use until
+the fingerprint sensor says so. The enforcement is the system's, not this
+agent's: something able to trigger signatures can make the prompt appear, but
+cannot answer it, and copying the files away gains nothing because the key
+cannot leave the Enclave. That is
 the difference between this and simply storing the password — without the
 constraint, anything running as you could take the key to the whole vault
 silently.

@@ -161,8 +161,8 @@ mod tests {
     /// reached under load turns into a wrong-looking decision rather than a
     /// timeout. The answer is read one byte per readiness wakeup, so the longest
     /// of them needs sixty-odd round trips and is the first to feel a loaded
-    /// machine; that is what used to fail here, roughly one run in ten with a
-    /// second instrumented build running alongside.
+    /// machine. Tighten this and it flakes — around one run in ten with a
+    /// second instrumented build alongside.
     const UNHURRIED: Duration = Duration::from_secs(120);
 
     /// Shared body for the plain answer cases, so each stays one line and still

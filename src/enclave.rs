@@ -148,12 +148,11 @@ pub const PADDED_LEN: usize = 2 + crate::passphrase::MAX_PASSPHRASE_BYTES;
 
 /// Put a secret into a fixed-size block.
 ///
-/// One allocation, at its final size, the way every buffer holding a secret in
-/// this codebase is: growing one would copy the bytes into a new allocation and
-/// free the old one unwiped.
+/// One allocation, at its final size — the rule for every buffer holding a
+/// secret here.
 pub fn pad(secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if secret.len() > crate::passphrase::MAX_PASSPHRASE_BYTES {
-        return Err(Error::ConfigInvalid(format!(
+        return Err(Error::State(format!(
             "a master password longer than {} bytes cannot be stored",
             crate::passphrase::MAX_PASSPHRASE_BYTES
         )));
@@ -168,8 +167,9 @@ pub fn pad(secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
 /// Take one back out again.
 ///
 /// Consumes the block and shortens it in place rather than copying the secret
-/// into a buffer of its own — same reason as above, and truncating is safe to
-/// do to a secret because zeroizing a `Vec` wipes its whole capacity.
+/// into a buffer of its own, for the same one-allocation reason as `pad`.
+/// Truncating is safe to do to a secret: zeroizing a `Vec` wipes its whole
+/// capacity, not just the part still in view.
 pub fn unpad(padded: Zeroizing<Vec<u8>>) -> Result<Zeroizing<Vec<u8>>> {
     let mut padded = padded;
     if padded.len() != PADDED_LEN {
@@ -235,13 +235,12 @@ pub const MAX_CIPHER: usize = 4096;
 /// Says whose file this is and which arrangement it belongs to. A later format
 /// gets a later magic, so an old file is refused rather than misread.
 ///
-/// v2 because v1 sealed the secret at its own length. Reading one of those here
-/// would decrypt fine and then fail an inner size check, which is a confusing
-/// way to say "different format" — and the alternative, accepting a block that
-/// is not one this wrote, would give up the very check that makes a corrupted
-/// ciphertext detectable. A v1 file is therefore declared foreign and the user
-/// is told to seed again, which costs one command and no secret: the master
-/// password was never only here.
+/// Bumping it makes every stored file foreign, so every user is asked to seed
+/// again — which costs one command and no secret, since the master password was
+/// never only here. Do that rather than teach this to read an older layout: a
+/// block that is not one this wrote must stay detectable, because that is what
+/// catches a corrupted ciphertext. The salt in `swift/secure_enclave.swift`
+/// also looks like a version and is not this one.
 const MAGIC: &[u8] = b"lastpass-ssh-agent secure enclave v2\n";
 
 /// The blob and the ciphertext, as they sit on disk.
@@ -324,14 +323,14 @@ pub fn path_for(socket: &Path) -> PathBuf {
 /// Read it back, or `None` when there is nothing stored yet.
 ///
 /// Bounded, because a file on disk is not necessarily the file this wrote. One
-/// byte past the largest thing `save` can produce is read deliberately: it
-/// turns an oversized file into a refusal rather than a silent truncation that
-/// happens to parse.
+/// byte past the largest thing `save` can produce is read deliberately: an
+/// oversized file then fails to decode, rather than being cut down to a length
+/// that happens to parse.
 pub fn load(path: &Path) -> Result<Option<Stored>> {
     use std::io::Read as _;
 
     // This name is derived from a path the user chooses, so something else can
-    // be sitting on it — and a FIFO would make the read below wait for a writer
+    // be sitting on it — and a FIFO would make this read wait for a writer
     // that never comes, on the one thread the agent serves every connection
     // from. `open_regular` settles that on the open file rather than on the
     // path, so nothing can be swapped in between the two.
@@ -376,7 +375,7 @@ pub fn remove(path: &Path) -> Result<()> {
 }
 
 fn malformed(why: &str) -> Error {
-    Error::ConfigInvalid(format!(
+    Error::State(format!(
         "the stored Secure Enclave key is unreadable ({why}) — run \
          `lastpass-ssh-agent store-master-password` again"
     ))
