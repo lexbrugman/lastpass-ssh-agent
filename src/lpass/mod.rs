@@ -74,14 +74,30 @@ pub async fn discover_ssh_key_items(
     name_filter: Option<&str>,
 ) -> Result<Vec<ItemSummary>, LpassError> {
     let needle = name_filter.map(str::to_lowercase);
-    let items = client.ls().await?.into_iter().filter(|item| {
-        needle
-            .as_ref()
-            .is_none_or(|needle| item.name.to_lowercase().contains(needle))
-    });
+    let candidates: Vec<ItemSummary> = client
+        .ls()
+        .await?
+        .into_iter()
+        .filter(|item| {
+            needle
+                .as_ref()
+                .is_none_or(|needle| item.name.to_lowercase().contains(needle))
+        })
+        .collect();
+
+    // `lpass ls` does not carry the note type, so telling an SSH Key from a
+    // credit card costs one `lpass` call per item — which on a large vault is
+    // most of a minute before the socket is even bound. Said up front so the
+    // wait is explained while it is happening rather than afterwards, and so
+    // the way out of it is on screen next to the reason for it.
+    tracing::info!(
+        items = candidates.len(),
+        "probing vault items for SSH Key notes, one lpass call each — pin [[keys]] in the \
+         config to skip this"
+    );
 
     let mut probes = tokio::task::JoinSet::new();
-    let mut items = items;
+    let mut items = candidates.into_iter();
     let mut found = Vec::new();
     loop {
         // Bound both subprocess concurrency and the amount of queued task

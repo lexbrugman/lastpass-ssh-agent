@@ -370,6 +370,12 @@ another agent.
 - In auto-discovery mode, an SSH Key item added to the vault is served after
   the next agent restart (discovery runs once at startup). Pin `[[keys]]` if
   you want new vault items to require an explicit opt-in instead.
+- Auto-discovery costs one `lpass` call per vault item, eight at a time:
+  `lpass ls` reports names and ids but not the note type, so every item has to
+  be asked. A few hundred items are quick; a few thousand are most of a minute
+  at startup, before the socket exists. The agent logs how many it is about to
+  probe. **Pinning `[[keys]]` skips discovery entirely** and is worth it on a
+  large vault — `lastpass-ssh-agent search` prints the snippets.
 - `tests/fixtures/` contains throwaway SSH keypairs used by the test suite
   only. They protect nothing and must never be authorized anywhere.
 

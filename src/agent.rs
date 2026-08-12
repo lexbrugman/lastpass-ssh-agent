@@ -8,6 +8,7 @@ use ssh_key::{PrivateKey, Signature};
 use zeroize::Zeroizing;
 
 use crate::confirm::{ConfirmContext, Confirmer, Decision, PeerInfo, SessionBinding};
+use crate::interaction::InteractionGate;
 use crate::keystore::{KeyEntry, KeyStore};
 use crate::lpass::LpassClient;
 use crate::passphrase::Unlocker;
@@ -29,15 +30,12 @@ pub struct LpassAgent {
     /// `ssh` records a new host as it agrees to connect — before the signature
     /// the prompt is about.
     host_names: Arc<crate::knownhosts::HostNames>,
-    /// One signing request at a time, shared by every connection.
+    /// One *interaction* at a time, shared by every connection.
     ///
-    /// Confirmation and passphrase entry lock only against themselves, so two
-    /// requests could otherwise hold one terminal at once and each read the
-    /// other's answer — a passphrase landing in `TtyConfirmer`'s ordinary
-    /// `String`, which nothing wipes.
-    ///
-    /// Held for the whole request: releasing between the two prompts leaves
-    /// exactly that gap. OpenSSH's own agent is serial too.
+    /// Taken by the first prompt a request shows and held until that request
+    /// ends; a request that shows none never takes it and runs alongside the
+    /// others. `InteractionGate` documents why it is both late to take and late
+    /// to release.
     interaction: Arc<tokio::sync::Mutex<()>>,
     /// pid/uid of the connected client, filled in per session.
     peer: Option<PeerInfo>,
@@ -172,6 +170,7 @@ impl LpassAgent {
         entry: &KeyEntry,
         data: &[u8],
         flags: u32,
+        gate: &mut InteractionGate,
     ) -> Result<Signature, String> {
         let pem: Zeroizing<Vec<u8>> = self
             .lpass
@@ -204,7 +203,7 @@ impl LpassAgent {
             // Decryption lives with the passphrase, because "is this the right
             // passphrase?" and "did it decrypt?" are the same question — and a
             // passphrase is only ever saved once that question is answered.
-            key = self.unlocker.unlock(entry, &key).await?;
+            key = self.unlocker.unlock(entry, &key, gate).await?;
         }
 
         signing::sign_with_key(&key, data, flags).map_err(|e| e.to_string())
@@ -252,9 +251,17 @@ impl Session for LpassAgent {
             .collect())
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "holding the gate to the end of the request is the point: released \
+                  at its last use — after the confirmation — it would leave a gap \
+                  for another request's prompt before this one asks for a passphrase"
+    )]
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        // Everything below may talk to the user; see `interaction`.
-        let _one_at_a_time = self.interaction.clone().lock_owned().await;
+        // Claimed by the first prompt this request shows, and held from there to
+        // the end of it. A request that shows none never claims it; see
+        // `InteractionGate`.
+        let mut gate = InteractionGate::new(self.interaction.clone());
 
         let key_data = request.credential.key_data();
         let Some(entry) = self.store.lookup(key_data) else {
@@ -264,6 +271,7 @@ impl Session for LpassAgent {
 
         if entry.confirm {
             let ctx = ConfirmContext::new(entry, self.peer, self.named_bindings().await);
+            gate.enter().await;
             match self.confirmer.confirm(&ctx).await {
                 Decision::Approve => {}
                 Decision::Deny => {
@@ -275,7 +283,7 @@ impl Session for LpassAgent {
         }
 
         match self
-            .fetch_and_sign(entry, &request.data, request.flags)
+            .fetch_and_sign(entry, &request.data, request.flags, &mut gate)
             .await
         {
             Ok(signature) => {
@@ -340,6 +348,8 @@ mod tests {
     const ED25519_PW: &str = include_str!("../tests/fixtures/ed25519_pw");
     const ED25519_PW_PUB: &str = include_str!("../tests/fixtures/ed25519_pw.pub");
     const RSA_PUB: &str = include_str!("../tests/fixtures/rsa.pub");
+    const ECDSA: &str = include_str!("../tests/fixtures/ecdsa");
+    const ECDSA_PUB: &str = include_str!("../tests/fixtures/ecdsa.pub");
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt()
@@ -849,6 +859,73 @@ mod tests {
             !watch.overlapped(),
             "two prompts were open on the same channel at once"
         );
+    }
+
+    /// Waits for the test to let it through, standing in for a human who has
+    /// not answered the dialog yet.
+    struct BlockUntilReleased(Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl Confirmer for BlockUntilReleased {
+        async fn confirm(&self, _ctx: &ConfirmContext) -> Decision {
+            self.0.notified().await;
+            Decision::Approve
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signature_that_asks_nothing_does_not_queue_behind_one_waiting_on_a_human() {
+        // The gate is for interaction, so it must cost nothing to a request
+        // that has none. Item 2 confirms off and its key is unencrypted, so it
+        // never prompts; item 1 sits in a confirmation that only completes once
+        // item 2 has been signed. Taking the gate at request entry instead
+        // would deadlock this exactly — hence the timeout, so the regression
+        // fails the test rather than hanging it.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let client = Arc::new(
+            MockLpass::logged_in()
+                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+                .with_field("1", "Private Key", ED25519.as_bytes())
+                .with_field("2", "Public Key", ECDSA_PUB.as_bytes())
+                .with_field("2", "Private Key", ECDSA.as_bytes()),
+        );
+        let config: Config =
+            toml::from_str("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"\nconfirm = false").unwrap();
+        let store = Arc::new(
+            KeyStore::load(&*client, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let agent = LpassAgent::new(
+            store,
+            client.clone(),
+            Arc::new(BlockUntilReleased(release.clone())),
+            unlocking(&client, Arc::new(NoPrompt)),
+            no_host_names(),
+        );
+
+        // two client connections, as separate sessions sharing the agent
+        let mut confirming = agent.with_peer(None);
+        let mut silent = agent.with_peer(None);
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                confirming.sign(sign_request(ED25519_PUB, b"needs a human", 0)),
+                async {
+                    let signed = silent
+                        .sign(sign_request(ECDSA_PUB, b"needs nobody", 0))
+                        .await;
+                    // Only now is the confirmation allowed to finish: reaching
+                    // this line at all is what the test is proving.
+                    release.notify_one();
+                    signed
+                }
+            )
+        })
+        .await;
+
+        let (confirmed, unattended) =
+            finished.expect("a signature needing no interaction queued behind one that did");
+        assert!(confirmed.is_ok() && unattended.is_ok());
     }
 
     #[tokio::test]

@@ -237,6 +237,7 @@ impl Unlocker {
         &self,
         entry: &KeyEntry,
         encrypted: &ssh_key::PrivateKey,
+        gate: &mut crate::interaction::InteractionGate,
     ) -> Result<ssh_key::PrivateKey, String> {
         let stored: Zeroizing<Vec<u8>> = self
             .lpass
@@ -262,15 +263,22 @@ impl Unlocker {
                     .into(),
             ),
             PassphraseFallback::Prompt => {
-                let typed = self.ask(entry).await?;
+                let typed = self.ask(entry, gate).await?;
                 decrypt(encrypted, &typed)
             }
-            PassphraseFallback::Keychain => self.unlock_from_store(entry, encrypted).await,
+            PassphraseFallback::Keychain => self.unlock_from_store(entry, encrypted, gate).await,
         }
     }
 
     /// Ask the user, rejecting an answer that cannot be a passphrase.
-    async fn ask(&self, entry: &KeyEntry) -> Result<Zeroizing<Vec<u8>>, String> {
+    async fn ask(
+        &self,
+        entry: &KeyEntry,
+        gate: &mut crate::interaction::InteractionGate,
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
+        // Nothing above this point reaches the user, so this is where a request
+        // that only ever needed a passphrase claims the gate.
+        gate.enter().await;
         let typed = self
             .prompt
             .prompt(&PassphraseRequest::new(entry))
@@ -291,7 +299,14 @@ impl Unlocker {
         &self,
         entry: &KeyEntry,
         encrypted: &ssh_key::PrivateKey,
+        gate: &mut crate::interaction::InteractionGate,
     ) -> Result<ssh_key::PrivateKey, String> {
+        // Before the read, not just before the prompt: a locked Keychain puts a
+        // system dialog on screen and waits (see `keychain::blocking`), so the
+        // read is itself an interaction. Outside the gate it could share the
+        // screen with another request's confirmation, and two requests missing
+        // at once would queue duplicate passphrase prompts behind it.
+        gate.enter().await;
         let fingerprint = entry.fingerprint();
         match self.store.get(&fingerprint).await {
             // Nothing this agent saved can be over the cap, so a value that is
@@ -327,7 +342,7 @@ impl Unlocker {
                 self.store.name()),
         }
 
-        let typed = self.ask(entry).await?;
+        let typed = self.ask(entry, gate).await?;
         // Verified first. A typo must never become a stored credential, which
         // is why decryption happens here and not after this function returns.
         let key = decrypt(encrypted, &typed)?;
@@ -621,6 +636,14 @@ mod tests {
         Unlocker::with_store(Arc::new(lpass), prompt, store)
     }
 
+    /// A gate nothing is contending for, standing in for the one the agent
+    /// builds per signing request. These tests are about where a passphrase
+    /// comes from; that it is asked for under the gate is `interaction`'s own
+    /// business, and `agent` proves the two prompts never share a channel.
+    fn gate() -> crate::interaction::InteractionGate {
+        crate::interaction::InteractionGate::new(Arc::new(tokio::sync::Mutex::new(())))
+    }
+
     /// The decrypted key must be the one the fixture's public half names.
     fn assert_unlocked(key: &ssh_key::PrivateKey) {
         assert!(!key.is_encrypted());
@@ -645,7 +668,7 @@ mod tests {
             let store = FakeStore::holding(WRONG);
             let unlocker = unlocker(vault_holding(RIGHT), prompt.clone(), store.clone());
             let key = unlocker
-                .unlock(&entry(fallback), &encrypted())
+                .unlock(&entry(fallback), &encrypted(), &mut gate())
                 .await
                 .unwrap();
             assert_unlocked(&key);
@@ -663,7 +686,7 @@ mod tests {
             let store = FakeStore::holding(RIGHT);
             let unlocker = unlocker(vault_holding(WRONG), prompt.clone(), store.clone());
             let error = unlocker
-                .unlock(&entry(fallback), &encrypted())
+                .unlock(&entry(fallback), &encrypted(), &mut gate())
                 .await
                 .unwrap_err();
             assert!(error.starts_with("decrypting private key:"), "{error}");
@@ -680,7 +703,11 @@ mod tests {
         // wrong passphrase, so it fails — but as a decryption failure, which
         // proves the field was used rather than skipped
         let error = unlocker
-            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Prompt),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap_err();
         assert!(error.starts_with("decrypting private key:"), "{error}");
@@ -692,7 +719,7 @@ mod tests {
         let prompt = FakePrompt::answering(RIGHT);
         let unlocker = unlocker(empty_field(), prompt.clone(), FakeStore::empty());
         let error = unlocker
-            .unlock(&entry(PassphraseFallback::Error), &encrypted())
+            .unlock(&entry(PassphraseFallback::Error), &encrypted(), &mut gate())
             .await
             .unwrap_err();
         assert_eq!(
@@ -707,7 +734,11 @@ mod tests {
         let prompt = FakePrompt::answering(RIGHT);
         let unlocker = unlocker(empty_field(), prompt.clone(), FakeStore::empty());
         let key = unlocker
-            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Prompt),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap();
         assert_unlocked(&key);
@@ -721,7 +752,11 @@ mod tests {
         let store = FakeStore::empty();
         let unlocker = unlocker(empty_field(), FakePrompt::answering(RIGHT), store.clone());
         unlocker
-            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Prompt),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap();
         assert_eq!(store.writes(), 0, "prompt mode persists nothing");
@@ -735,7 +770,11 @@ mod tests {
             FakeStore::empty(),
         );
         let error = unlocker
-            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Prompt),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap_err();
         assert!(error.starts_with("decrypting private key:"), "{error}");
@@ -756,7 +795,11 @@ mod tests {
                 FakeStore::empty(),
             );
             let reported = unlocker
-                .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+                .unlock(
+                    &entry(PassphraseFallback::Prompt),
+                    &encrypted(),
+                    &mut gate(),
+                )
                 .await
                 .unwrap_err();
             assert_eq!(reported, expected);
@@ -768,7 +811,11 @@ mod tests {
             FakeStore::empty(),
         );
         let reported = unlocker
-            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Prompt),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -782,7 +829,11 @@ mod tests {
     async fn an_empty_answer_is_rejected_rather_than_attempted() {
         let unlocker = unlocker(empty_field(), FakePrompt::silent(), FakeStore::empty());
         let error = unlocker
-            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Prompt),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap_err();
         assert_eq!(error, "no passphrase entered");
@@ -795,7 +846,11 @@ mod tests {
         let lpass = MockLpass::logged_in().with_broken_field("1", "Passphrase");
         let unlocker = unlocker(lpass, prompt.clone(), FakeStore::empty());
         let error = unlocker
-            .unlock(&entry(PassphraseFallback::Prompt), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Prompt),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap_err();
         assert!(error.starts_with("fetching passphrase:"), "{error}");
@@ -809,7 +864,11 @@ mod tests {
         let store = FakeStore::holding(RIGHT);
         let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
         let key = unlocker
-            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Keychain),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap();
         assert_unlocked(&key);
@@ -823,7 +882,11 @@ mod tests {
         let store = FakeStore::empty();
         let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
         let key = unlocker
-            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Keychain),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap();
         assert_unlocked(&key);
@@ -838,7 +901,11 @@ mod tests {
         let store = FakeStore::empty();
         let unlocker = unlocker(empty_field(), FakePrompt::answering(WRONG), store.clone());
         assert!(unlocker
-            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Keychain),
+                &encrypted(),
+                &mut gate()
+            )
             .await
             .is_err());
         assert_eq!(store.writes(), 0, "an unverified passphrase was saved");
@@ -853,7 +920,11 @@ mod tests {
         let store = FakeStore::holding(WRONG);
         let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
         let key = unlocker
-            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Keychain),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap();
         assert_unlocked(&key);
@@ -871,7 +942,11 @@ mod tests {
         );
         assert_eq!(
             unlocker
-                .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+                .unlock(
+                    &entry(PassphraseFallback::Keychain),
+                    &encrypted(),
+                    &mut gate()
+                )
                 .await
                 .unwrap_err(),
             "passphrase entry cancelled"
@@ -915,7 +990,7 @@ mod tests {
             let lpass = MockLpass::logged_in().with_field(&entry.item_id, "Passphrase", b"");
             let prompt = FakePrompt::answering(secret);
             let unlocker = Unlocker::with_store(Arc::new(lpass), prompt.clone(), store.clone());
-            assert!(unlocker.unlock(entry, locked).await.is_ok());
+            assert!(unlocker.unlock(entry, locked, &mut gate()).await.is_ok());
             assert_eq!(prompt.calls(), 1, "item {}", entry.item_id);
         }
 
@@ -938,7 +1013,7 @@ mod tests {
             let prompt = FakePrompt::failing(PromptError::Cancelled);
             let unlocker = Unlocker::with_store(Arc::new(lpass), prompt.clone(), store.clone());
             assert!(
-                unlocker.unlock(entry, locked).await.is_ok(),
+                unlocker.unlock(entry, locked, &mut gate()).await.is_ok(),
                 "item {} was not found again",
                 entry.item_id
             );
@@ -954,7 +1029,11 @@ mod tests {
         let store = FakeStore::holding(&vec![b'x'; MAX_PASSPHRASE_BYTES + 1]);
         let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
         let key = unlocker
-            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Keychain),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap();
         assert_unlocked(&key);
@@ -970,7 +1049,11 @@ mod tests {
         let store = FakeStore::unreadable();
         let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
         let key = unlocker
-            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Keychain),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap();
         assert_unlocked(&key);
@@ -983,7 +1066,11 @@ mod tests {
         let store = FakeStore::unwritable();
         let unlocker = unlocker(empty_field(), prompt.clone(), store.clone());
         let key = unlocker
-            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Keychain),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap();
         assert_unlocked(&key);
@@ -1002,7 +1089,10 @@ mod tests {
         let mut renamed = entry(PassphraseFallback::Keychain);
         renamed.name = "renamed since".into();
         renamed.item_id = "9999".into();
-        unlocker.unlock(&renamed, &encrypted()).await.unwrap();
+        unlocker
+            .unlock(&renamed, &encrypted(), &mut gate())
+            .await
+            .unwrap();
         assert_eq!(
             store.contents().as_deref(),
             Some(RIGHT),
@@ -1019,7 +1109,11 @@ mod tests {
         let prompt = FakePrompt::answering(RIGHT);
         let unlocker = Unlocker::new(Arc::new(empty_field()), prompt.clone());
         let key = unlocker
-            .unlock(&entry(PassphraseFallback::Keychain), &encrypted())
+            .unlock(
+                &entry(PassphraseFallback::Keychain),
+                &encrypted(),
+                &mut gate(),
+            )
             .await
             .unwrap();
         assert_unlocked(&key);

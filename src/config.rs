@@ -110,17 +110,22 @@ impl Config {
     /// running without a config file is ordinary, not an error.
     pub fn load_or_default(path: &Path) -> Result<Self> {
         match Self::load(path) {
-            Err(Error::ConfigMissing(_)) => Ok(Self {
-                socket: None,
-                confirm: ConfirmMode::default(),
-                confirm_timeout_secs: default_confirm_timeout(),
-                lpass_path: None,
-                askpass: None,
-                passphrase_fallback: PassphraseFallback::default(),
-                keys: Vec::new(),
-            }),
+            Err(Error::ConfigMissing(_)) => Ok(Self::empty()),
             other => other,
         }
+    }
+
+    /// What a setup with no config file gets: exactly what an empty file
+    /// parses to.
+    ///
+    /// Parsed rather than constructed field by field, so it cannot drift.
+    /// A hand-written mirror still compiles when a new field's `#[serde(default)]`
+    /// says something else, and the two would then disagree about how the agent
+    /// behaves depending only on whether a file happens to exist.
+    fn empty() -> Self {
+        // Every field defaults, so the only way this fails is a bug in the
+        // struct's own serde attributes — which every other test would fail on.
+        toml::from_str("").expect("a config of nothing but defaults must parse")
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -287,6 +292,7 @@ mod tests {
         assert!(config.socket.is_none());
         assert!(config.lpass_path.is_none());
         assert!(config.askpass.is_none());
+        assert_eq!(config.passphrase_fallback, PassphraseFallback::default());
     }
 
     #[test]

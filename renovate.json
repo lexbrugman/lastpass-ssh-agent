@@ -13,11 +13,14 @@
   },
   "packageRules": [
     {
+      "description": "One exception, not three: these are all pinned by the same chain. ssh-agent-lib 0.6 depends on ssh-key ^0.6, and ssh-key 0.6 is built on signature 2, rand_core 0.6 and rsa 0.9. We declare signature and rand_core directly only to import the traits ssh-key and rsa implement, and to guarantee the getrandom feature OsRng needs (see Cargo.toml) — so their versions are not ours to choose. Bumping one alone puts two incompatible copies of a crate in one binary, and cargo either fails to resolve or compiles the wrong traits; neither is fixable on this side. Lift all three together, and only once ssh-agent-lib publishes a release built on ssh-key 0.7+ — that is what unblocks the RustCrypto next generation (signature 3, rand_core 0.9+, rsa 0.10), which is still in release candidate. rsa 0.10 is also what would retire the RUSTSEC-2023-0071 exception in .cargo/audit.toml, so there is a real reason to revisit rather than let this sit. Patch updates are unaffected, and the caret ranges already absorb anything compatible through lockFileMaintenance.",
       "matchManagers": [
         "cargo"
       ],
       "matchPackageNames": [
-        "ssh-key"
+        "ssh-key",
+        "signature",
+        "rand_core"
       ],
       "matchUpdateTypes": [
         "major",
