@@ -25,7 +25,12 @@ rsa = { version = "0.9", features = ["sha2"] }
 # turn it on, which is no basis for a security mitigation.
 rand_core = { version = "0.6", features = ["getrandom"] }
 signature = "2"
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "io-util", "time", "signal"] }
+# `sync` is what the interaction gate, every prompt that serializes itself and
+# the Linux screen-lock probe's cached connection are built from. None of the
+# other features here imply it, so without this the build compiles only because
+# a dependency's feature set happens to turn it on — which is no basis for code
+# of ours that will not compile without it.
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "io-util", "time", "signal", "sync"] }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.0"
@@ -43,6 +48,21 @@ libc = "0.2"
 security-framework = "3"
 # Reading one key out of the dictionary CGSessionCopyCurrentDictionary returns.
 core-foundation = "0.10"
+
+# The Linux equivalents of those two: a passphrase store and the screen-lock
+# probe. Declared per-target for the same reason, and both are pure Rust, so
+# the static musl builds stay static.
+[target.'cfg(target_os = "linux")'.dependencies]
+# `rt-tokio-crypto-rust` is the feature that keeps this free of C: the session
+# with the secret service is encrypted using RustCrypto's AES rather than
+# OpenSSL, and zbus runs on the tokio runtime the agent already has.
+secret-service = { version = "5", default-features = false, features = ["rt-tokio-crypto-rust"] }
+# Reading one property off logind. Pinned to 5.x because secret-service
+# depends on zbus ^5: two zbus versions in one binary would each open a bus
+# connection of their own. Default features off for the same reason
+# secret-service turns them off — they would pull in a second async runtime
+# alongside tokio.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
