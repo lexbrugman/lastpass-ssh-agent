@@ -172,6 +172,14 @@ impl LpassAgent {
         flags: u32,
         gate: &mut InteractionGate,
     ) -> Result<Signature, String> {
+        // A fetch can itself put a prompt on screen: with the vault locked to
+        // the screen, lpass asks for the master password through a helper of
+        // ours. That is an interaction like any other, and it arrives from
+        // inside a subprocess where the gate cannot reach it — so the gate is
+        // taken here, before the call, rather than after the fact.
+        if self.lpass.may_prompt() {
+            gate.enter().await;
+        }
         let pem: Zeroizing<Vec<u8>> = self
             .lpass
             .show_field(&entry.item_id, "Private Key")
@@ -926,6 +934,52 @@ mod tests {
         let (confirmed, unattended) =
             finished.expect("a signature needing no interaction queued behind one that did");
         assert!(confirmed.is_ok() && unattended.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_vault_that_can_ask_for_a_password_signs_under_the_gate() {
+        // With the vault locked to the screen, the fetch itself may prompt —
+        // lpass asks for the master password through a helper of ours, from
+        // inside a subprocess the gate cannot see into. So the gate is taken
+        // before the fetch, and this pair must not overlap even though neither
+        // request confirms.
+        let watch = Arc::new(ChannelWatch::default());
+        let client = Arc::new(
+            MockLpass::logged_in()
+                .prompting()
+                .with_field("1", "Public Key", ED25519_PW_PUB.as_bytes())
+                .with_field("1", "Private Key", ED25519_PW.as_bytes())
+                .with_field("1", "Passphrase", b""),
+        );
+        let config: Config = toml::from_str(PW_KEY).unwrap();
+        let store = Arc::new(
+            KeyStore::load(&*client, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let unlocker = unlocking(
+            &client,
+            Arc::new(WatchingPrompt(
+                watch.clone(),
+                b"fixture-passphrase".to_vec(),
+            )),
+        );
+        let agent = LpassAgent::new(
+            store,
+            client,
+            Arc::new(NoConfirmer),
+            unlocker,
+            no_host_names(),
+        );
+
+        let mut first = agent.with_peer(None);
+        let mut second = agent.with_peer(None);
+        let (a, b) = tokio::join!(
+            first.sign(sign_request(ED25519_PW_PUB, b"first", 0)),
+            second.sign(sign_request(ED25519_PW_PUB, b"second", 0)),
+        );
+        assert!(a.is_ok() && b.is_ok());
+        assert!(!watch.overlapped(), "two prompts shared one screen");
     }
 
     #[tokio::test]

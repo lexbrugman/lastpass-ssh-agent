@@ -40,6 +40,11 @@ pub struct PassphraseRequest {
     pub key_name: String,
     pub fingerprint: String,
     pub item_id: String,
+    /// Set when the secret wanted is the vault's own master password rather
+    /// than one key's passphrase. The two are asked for in different words —
+    /// a prompt naming a key when it wants the master password would train
+    /// someone to type the master password at a per-key prompt.
+    master_password: bool,
 }
 
 impl PassphraseRequest {
@@ -48,6 +53,21 @@ impl PassphraseRequest {
             key_name: entry.name.clone(),
             fingerprint: entry.fingerprint(),
             item_id: entry.item_id.clone(),
+            master_password: false,
+        }
+    }
+
+    /// What `lpass` asks for once its agent no longer holds the derived key.
+    ///
+    /// Nothing identifies a key here, because nothing about this is per-key:
+    /// answering it unlocks the vault, and the signature that prompted it is
+    /// incidental.
+    pub const fn master_password() -> Self {
+        Self {
+            key_name: String::new(),
+            fingerprint: String::new(),
+            item_id: String::new(),
+            master_password: true,
         }
     }
 
@@ -55,6 +75,15 @@ impl PassphraseRequest {
     /// a vault-controlled name must not be able to redraw a terminal or
     /// reverse the line that says which key is being unlocked.
     pub fn describe(&self) -> String {
+        if self.master_password {
+            // No cause claimed: lpass asks for this whenever its cached key is
+            // gone, which is a screen lock only sometimes — the hourly expiry
+            // reaches here too, and naming the wrong reason at a password
+            // prompt is worse than naming none.
+            return "Enter your LastPass master password\n\nThe vault is locked, and a \
+                    signature needs it."
+                .to_string();
+        }
         format!(
             "Enter passphrase for SSH key\n\nKey: {}\nFingerprint: {}\nLastPass item: {}",
             escape_for_display(&self.key_name),
@@ -1134,6 +1163,21 @@ mod tests {
         assert!(build("confirm = \"askpass\"\naskpass = \"/bin/true\"").is_ok());
         // defensive branch: config validation normally rejects this
         assert!(build("confirm = \"askpass\"").is_err());
+    }
+
+    #[test]
+    fn the_master_password_is_asked_for_in_its_own_words() {
+        // Never as a key's passphrase: a prompt naming a key while wanting the
+        // vault's master password would teach someone to type the master
+        // password at a per-key prompt, which is the habit to avoid.
+        let text = PassphraseRequest::master_password().describe();
+        assert!(text.contains("master password"), "{text}");
+        assert!(!text.contains("SSH key"), "{text}");
+        assert!(!text.contains("Fingerprint:"), "{text}");
+        // and a key's own prompt is unchanged by its existence
+        let key = PassphraseRequest::new(&entry(PassphraseFallback::Prompt)).describe();
+        assert!(key.contains("passphrase for SSH key"), "{key}");
+        assert!(!key.contains("master password"), "{key}");
     }
 
     #[test]

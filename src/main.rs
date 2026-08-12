@@ -17,6 +17,7 @@ mod socket;
 mod testutil;
 mod text;
 mod tty;
+mod vaultlock;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -51,6 +52,20 @@ fn no_home() -> Error {
     Error::ConfigInvalid("cannot determine home directory; pass --config".into())
 }
 
+/// This executable, for `lpass` to run when it wants the master password.
+///
+/// `current_exe` fails only on a system that cannot name its own running
+/// binary — excluded from coverage, since a test cannot arrange that. The
+/// fallback is the command name: worth trying on `PATH`, and if that is wrong
+/// too, lpass falls back to the behaviour it had before there was a helper.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn own_binary() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_else(|e| {
+        tracing::debug!("cannot locate this binary, so lpass will look on PATH instead: {e}");
+        std::path::PathBuf::from("lastpass-ssh-agent")
+    })
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Before anything else: no core dumps, owner-only file creation.
@@ -72,6 +87,18 @@ async fn main() {
                 .with_filter(env_filter),
         )
         .init();
+
+    // Before the command line is even looked at: lpass runs this binary as
+    // `<program> "<prompt>"` and gives no way to pass a subcommand, so being
+    // the password helper is decided by the environment it was handed.
+    if let Some(config) = std::env::var_os(lpass::ASKPASS_MARKER) {
+        if let Err(e) = askpass(Path::new(&config)).await {
+            // stderr, never stdout: stdout is the answer, and lpass reads it.
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {
@@ -124,6 +151,31 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// The `LPASS_ASKPASS` helper: ask for the master password, print it, exit.
+///
+/// Runs as its own short-lived process because that is the contract lpass
+/// defines — it names a program and reads its stdout. Nothing is logged and
+/// nothing is kept: the answer goes to stdout and the buffer holding it is
+/// wiped when this returns.
+async fn askpass(config_path: &Path) -> Result<()> {
+    use std::io::Write as _;
+
+    let config = Config::load_or_default(config_path)?;
+    let prompt = passphrase::from_config(&config)?;
+    let secret = prompt
+        .prompt(&passphrase::PassphraseRequest::master_password())
+        .await
+        .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
+
+    // Written as bytes and flushed by hand: `println!` would copy the secret
+    // into a `String` first, and a panicking lock would leave it unwiped.
+    let mut out = std::io::stdout().lock();
+    out.write_all(&secret).map_err(Error::Io)?;
+    out.write_all(b"\n").map_err(Error::Io)?;
+    out.flush().map_err(Error::Io)?;
+    Ok(())
+}
+
 /// The keys the agent should serve: the configured [[keys]] if any,
 /// otherwise every SSH Key item discovered in the vault.
 async fn effective_keys(client: &Arc<dyn LpassClient>, config: &Config) -> Result<Vec<KeyConfig>> {
@@ -153,7 +205,18 @@ async fn effective_keys(client: &Arc<dyn LpassClient>, config: &Config) -> Resul
 
 async fn start(config_path: &Path) -> Result<()> {
     let config = Config::load_or_default(config_path)?;
-    let client: Arc<dyn LpassClient> = Arc::new(client_from(&config)?);
+    // Only the long-running agent points lpass at a prompt of ours: the one-shot
+    // commands have a terminal, where lpass asking there directly beats a dialog
+    // over the top of it.
+    // And only when the vault is being locked with the screen: without that,
+    // lpass losing its key is the ordinary expiry it always was, and failing
+    // fast beats a master-password dialog nobody asked for.
+    let client: Arc<dyn LpassClient> = Arc::new(client_from(&config)?.asking_with(
+        config.lock_on_screen_lock,
+        own_binary(),
+        config_path.to_path_buf(),
+        std::time::Duration::from_secs(config.confirm_timeout_secs),
+    ));
     require_login(client.as_ref()).await?;
 
     let keys = effective_keys(&client, &config).await?;
@@ -177,6 +240,16 @@ async fn start(config_path: &Path) -> Result<()> {
     let socket_path = config.socket_path()?;
     let (listener, guard) = socket::bind(&socket_path)?;
     print_env(&socket_path);
+
+    // Runs beside the agent rather than inside a request: the screen locks when
+    // nobody is asking for a signature, which is the whole point of it. Spawned
+    // unconditionally, because whether to watch at all is `watch`'s decision.
+    tokio::task::spawn(vaultlock::watch(
+        config.lock_on_screen_lock,
+        Arc::new(platform::screen_is_locked),
+        Arc::new(lpass::LpassAgentProcess),
+        vaultlock::POLL_INTERVAL,
+    ));
 
     let factory = AgentFactory {
         template: agent::LpassAgent::new(

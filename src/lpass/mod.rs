@@ -1,6 +1,6 @@
 mod cli;
 
-pub use cli::LpassCli;
+pub use cli::{LpassCli, ASKPASS_MARKER};
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -51,6 +51,18 @@ pub enum LpassError {
 /// copy them into non-zeroizing storage.
 #[async_trait::async_trait]
 pub trait LpassClient: Send + Sync {
+    /// Whether a call to this client can put a prompt on the user's screen —
+    /// true once lpass has somewhere to ask for the master password.
+    ///
+    /// The signing path needs to know *before* it calls: a prompt appearing from
+    /// inside a fetch would otherwise sit outside the one-interaction-at-a-time
+    /// gate, and could share the screen with another request's dialog.
+    ///
+    /// Required rather than defaulted: an implementation that quietly inherited
+    /// "never prompts" while in fact prompting would put a master-password
+    /// dialog outside the gate, which is the one thing this exists to prevent.
+    fn may_prompt(&self) -> bool;
+
     async fn status(&self) -> Result<LoginStatus, LpassError>;
 
     /// `lpass show --field=<field> <item_id>` — the value with trailing
@@ -134,6 +146,58 @@ pub async fn discover_ssh_key_items(
     }
     found.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
     Ok(found)
+}
+
+/// The `lpass` agent process, which is where the vault's derived key lives.
+///
+/// Ending it is the only way to make `lpass` forget that key: there is no
+/// "lock" subcommand, and `lpass logout` would discard the session as well,
+/// turning a master-password prompt into a full login with a second factor.
+///
+/// Identified by command line rather than by name: the agent rewrites its argv
+/// to `lpass [agent]`, and on macOS the rewritten title runs into the
+/// environment that followed it, so only the prefix is dependable. Matching a
+/// short-lived `lpass show` too would cost nothing — a signature in flight when
+/// the screen locks is one we are about to make ask for a password anyway.
+pub struct LpassAgentProcess;
+
+#[async_trait::async_trait]
+impl crate::vaultlock::VaultKey for LpassAgentProcess {
+    // Excluded from coverage, and deliberately: exercising the path that
+    // actually matches something would mean killing a process, and the only
+    // pattern worth testing is the real one — which on a developer's own
+    // machine is their live vault session. The rules around this call (when it
+    // fires, and how often) are `vaultlock`'s, and covered there.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    async fn forget(&self) {
+        // `pkill` rather than walking the process table ourselves: finding a
+        // process by command line is /proc on Linux and sysctl on macOS, which
+        // is exactly the per-platform logic this design keeps out of the way
+        // for something the system already exposes as one command.
+        let killed = tokio::process::Command::new("pkill")
+            .arg("-f")
+            .arg(r"^lpass \[a")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await;
+        // pkill's codes: 0 signalled something, 1 matched nothing, and 2 or 3
+        // are its own failures. Only 1 means "there was no key to drop" —
+        // folding the rest into it would report a vault as locked while it is
+        // still open, which is the one thing this must not get wrong.
+        match killed.as_ref().map(std::process::ExitStatus::code) {
+            Ok(Some(0)) => {
+                tracing::info!("the LastPass agent's cached key has been dropped");
+            }
+            Ok(Some(1)) => tracing::debug!("no LastPass agent was holding a key"),
+            other => tracing::warn!(
+                "could not drop the LastPass agent's cached key ({other:?}), so the vault \
+                 stays unlocked until it expires on its own"
+            ),
+        }
+    }
 }
 
 /// Locate the lpass binary: explicit config path first, then PATH.
@@ -352,6 +416,8 @@ pub mod mock {
         pub absent_fields: Vec<(String, String)>,
         /// Every (item, field) fetched, for assertions on what was touched.
         pub fetch_log: Mutex<Vec<(String, String)>>,
+        /// Stands in for a vault that can ask for the master password.
+        pub prompting: bool,
     }
 
     impl MockLpass {
@@ -365,6 +431,13 @@ pub mod mock {
         pub fn with_field(mut self, item: &str, field: &str, value: &[u8]) -> Self {
             self.fields
                 .insert((item.into(), field.into()), value.to_vec());
+            self
+        }
+
+        /// As a client with an askpass helper installed: fetches from it may
+        /// put a prompt on screen.
+        pub const fn prompting(mut self) -> Self {
+            self.prompting = true;
             self
         }
 
@@ -386,6 +459,10 @@ pub mod mock {
 
     #[async_trait::async_trait]
     impl LpassClient for MockLpass {
+        fn may_prompt(&self) -> bool {
+            self.prompting
+        }
+
         async fn status(&self) -> Result<LoginStatus, LpassError> {
             Ok(if self.logged_in {
                 LoginStatus::LoggedIn("mock@example.com".into())

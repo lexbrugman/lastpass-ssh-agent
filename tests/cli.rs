@@ -423,6 +423,50 @@ fn doctor_test_confirm_modes() {
     assert!(stdout(&output).contains("denied/timed out"));
 }
 
+/// The `LPASS_ASKPASS` helper: lpass runs this binary with the marker set in
+/// its environment, and reads the master password off stdout.
+///
+/// Driven through `confirm = "askpass"` so the answer comes from a script this
+/// test controls, rather than from a terminal or a dialog the suite has not got.
+fn askpass_setup(helper_body: &str) -> Setup {
+    let s = setup(&healthy_vault_body_owned(), "");
+    let helper = fake_lpass(s.dir.path(), helper_body);
+    let config = format!(
+        "confirm = \"askpass\"\naskpass = {}\n",
+        toml::Value::String(helper.display().to_string())
+    );
+    std::fs::write(&s.config, config).unwrap();
+    s
+}
+
+#[test]
+fn askpass_helper_prints_the_master_password_on_stdout() {
+    let s = askpass_setup("printf 'the-master-password\\n'");
+    let output = Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
+        .env("HOME", s.dir.path())
+        .env("LASTPASS_SSH_AGENT_ASKPASS_CONFIG", &s.config)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    // exactly the answer and one newline: lpass reads this verbatim
+    assert_eq!(stdout(&output), "the-master-password\n");
+}
+
+#[test]
+fn a_dismissed_master_password_prompt_fails_without_printing_anything() {
+    // Nothing on stdout, ever: lpass would take whatever is there as the
+    // password, and an empty answer is not one.
+    let s = askpass_setup("exit 1");
+    let output = Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
+        .env("HOME", s.dir.path())
+        .env("LASTPASS_SSH_AGENT_ASKPASS_CONFIG", &s.config)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(stdout(&output), "");
+    assert!(!stderr(&output).is_empty(), "it must say why");
+}
+
 #[test]
 fn start_refuses_when_logged_out() {
     let s = setup("echo 'Not logged in.'; exit 1", "");

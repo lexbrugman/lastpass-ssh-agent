@@ -88,6 +88,14 @@ pub struct Config {
     #[serde(default)]
     pub passphrase_fallback: PassphraseFallback,
 
+    /// Drop the vault's cached key when the screen locks, so walking away
+    /// shuts the vault and not just the display.
+    ///
+    /// Opt-in: it changes when the agent asks for the master password, and
+    /// that is not a decision to make on someone's behalf.
+    #[serde(default)]
+    pub lock_on_screen_lock: bool,
+
     #[serde(default)]
     pub keys: Vec<KeyConfig>,
 }
@@ -197,6 +205,16 @@ impl Config {
         if self.uses_keychain() {
             return Err(Error::ConfigInvalid(
                 "passphrase_fallback = \"keychain\" is only supported on macOS".into(),
+            ));
+        }
+        // Same treatment, and for the same reason: reading the screen's lock
+        // state is the one part of that feature a platform has to provide, and
+        // only macOS does so far. Refused at load rather than ignored, since a
+        // setting silently doing nothing is worse than one that says so.
+        #[cfg(not(target_os = "macos"))]
+        if self.lock_on_screen_lock {
+            return Err(Error::ConfigInvalid(
+                "lock_on_screen_lock is only supported on macOS".into(),
             ));
         }
         Ok(())
@@ -439,6 +457,27 @@ id = "1"
     /// `keychain` parses everywhere — it is a reasonable thing to write in a
     /// config shared between machines — and is accepted or refused by platform
     /// at load, never at the first signature.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn lock_on_screen_lock_is_accepted_here() {
+        assert!(
+            parse("lock_on_screen_lock = true")
+                .unwrap()
+                .lock_on_screen_lock
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn lock_on_screen_lock_is_refused_here_with_a_reason() {
+        // Reading the screen's lock state is the one part a platform has to
+        // provide, and only macOS does. Refused at load, named in the message.
+        let error = parse("lock_on_screen_lock = true").unwrap_err().to_string();
+        assert!(error.contains("only supported on macOS"), "{error}");
+        // and the default is off everywhere, so an ordinary config is fine
+        assert!(!parse("").unwrap().lock_on_screen_lock);
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn keychain_is_accepted_here() {

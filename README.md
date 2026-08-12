@@ -48,10 +48,17 @@ What it **cannot** guarantee:
   attacker can attach to `lpass` itself, which holds the whole vault).
 - What **is** done cheaply: core dumps disabled (`RLIMIT_CORE=0`),
   `umask 077`, socket directory forced to `0700`/owner-only with symlink
-  refusal, socket `0600`, lpass environment allowlisted, lpass pinentry
-  disabled (the agent never handles your master password — log in with
-  `lpass login` yourself), `ssh_agent_lib` debug logging capped (its request
-  dumps could contain a private key a client tried to add).
+  refusal, socket `0600`, lpass environment allowlisted, `ssh_agent_lib` debug
+  logging capped (its request dumps could contain a private key a client tried
+  to add).
+- **Your master password**, specifically. By default the agent never sees it:
+  lpass's own pinentry is disabled, so a vault that has forgotten its key fails
+  the signature and you run `lpass login` yourself. Turning on
+  [`lock_on_screen_lock`](#locking-the-vault-with-the-screen) trades that away
+  deliberately — a vault the agent locks is one it must be able to reopen, so it
+  prompts for the master password and passes it to `lpass` over a pipe, in a
+  zeroizing buffer, never logged, written, cached, or placed in argv or the
+  environment. Leave the setting off (the default) and none of that happens.
 
 ## Install
 
@@ -173,6 +180,9 @@ vault scan) or tuning behavior:
 # "keychain" (macOS) asks once and remembers; "error" refuses to sign.
 # passphrase_fallback = "prompt"
 
+# Shut the vault when the screen locks, not just the display. macOS only.
+# lock_on_screen_lock = false
+
 # Pin items (disables auto-discovery); `search` prints these snippets.
 [[keys]]
 id = "7482913650418273946"     # stable LastPass item id (names are ambiguous)
@@ -233,6 +243,33 @@ vault:
   passphrase, decrypts, signs, and wipes both. The Keychain is a passphrase
   store, not a key store.
 
+### Locking the vault with the screen
+
+`lpass` keeps the key it derived from your master password in an agent process
+of its own — for an hour by default. That is what makes each signature cost no
+password, and it is also what leaves the **whole vault** readable by anything
+running as you until it expires. Locking the screen does not touch it.
+
+```toml
+lock_on_screen_lock = true
+```
+
+With this on, the agent watches the screen and drops that cached key the moment
+it locks. The LastPass *session* survives, so the way back is your master
+password, not a fresh login with a second factor — and you are not asked for it
+on unlock, only when a signature actually needs the vault again.
+
+That asking is the part to be deliberate about: **the agent prompts you for the
+master password itself**, which it does not do otherwise — see the security
+model above for how it is handled. Without it, every unlock would cost you a
+failed `ssh` until you re-authenticated by hand. The prompt looks like every
+other one this agent shows, since it uses whatever `confirm` already selects,
+and it appears whenever `lpass` has no cached key — so after the ordinary hourly
+expiry too, not only after a lock.
+
+macOS only, and refused at startup elsewhere: reading the screen's lock state is
+the one part of this a platform has to provide, and only macOS does so far.
+
 ## Run
 
 ```sh
@@ -250,7 +287,10 @@ ssh github.com      # pops the confirmation dialog, then signs
 
 If you log out of LastPass while the agent runs, signatures fail with a
 clear log message; `lpass login` in any terminal and retry — the agent does
-not need a restart.
+not need a restart. (With
+[`lock_on_screen_lock`](#locking-the-vault-with-the-screen) on, a vault that has
+only forgotten its key prompts you for the master password instead of failing;
+a real logout still needs `lpass login`.)
 
 ### Start automatically
 
@@ -335,9 +375,10 @@ another agent.
   compromise — it only protects the key blob in transit/backups. Leaving that
   field empty is what buys the separation; see [Keeping the passphrase out of
   the vault](#keeping-the-passphrase-out-of-the-vault).
-- **The passphrase prompt shares `confirm_timeout_secs`** (30s by default),
-  which is generous for pressing a button but tight for typing a long
-  passphrase. Raise it if entry keeps timing out.
+- **Secret prompts share `confirm_timeout_secs`** (30s by default) — the key
+  passphrase and, with `lock_on_screen_lock`, the master password. Generous for
+  pressing a button, tight for typing a long secret; raise it if entry keeps
+  timing out.
 - **Suspending a `tty` passphrase prompt leaves the terminal with echo off.**
   Ctrl-Z skips the cleanup a timeout or cancellation runs, so the shell comes
   back not showing what you type and anything half-typed stays queued for it.
@@ -370,6 +411,9 @@ another agent.
 - In auto-discovery mode, an SSH Key item added to the vault is served after
   the next agent restart (discovery runs once at startup). Pin `[[keys]]` if
   you want new vault items to require an explicit opt-in instead.
+- With `lock_on_screen_lock`, the vault reopens on the first signature that
+  needs it and stays open until the next lock or `lpass`'s own hour — the lock
+  bounds exposure, it does not make each signature cost a password.
 - Auto-discovery costs one `lpass` call per vault item, eight at a time:
   `lpass ls` reports names and ids but not the note type, so every item has to
   be asked. A few hundred items are quick; a few thousand are most of a minute
@@ -476,10 +520,16 @@ thing to pin:
   `cargo-llvm-cov` without versions, matching how the dev container fetches
   them. Pinning one side only would let CI and the container drift apart.
 
-One package is held back on purpose: **`ssh-key` major and minor updates are
-off.** It is pinned to 0.6.x because `ssh-agent-lib` depends on `^0.6`; a 0.7
-pull request cannot build until that moves first, so Renovate would only
-reopen a failing one.
+Three packages are held back together: **`ssh-key`, `signature` and
+`rand_core`**, majors and minors off. One chain pins all of them —
+`ssh-agent-lib` depends on `ssh-key ^0.6`, which is built on `signature` 2 and
+`rand_core` 0.6. The latter two are declared directly here only to import the
+traits those crates implement and to guarantee the `getrandom` feature `OsRng`
+needs, so their versions are not ours to choose: bumping one alone puts two
+incompatible copies of a crate in one binary, and cargo either fails to resolve
+or compiles against the wrong traits. They lift together, once `ssh-agent-lib`
+ships on `ssh-key` 0.7+ — which is also what would retire the `rsa` advisory
+below, since `rsa` 0.10 arrives with the same wave.
 
 Renovate targets `dev` (`"baseBranchPatterns"`), not `master`. That matters
 here: every merge to `master` publishes a release, so pointing it at `master`

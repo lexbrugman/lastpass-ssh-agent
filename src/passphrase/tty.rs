@@ -221,6 +221,7 @@ mod tests {
             key_name: "tty key".into(),
             fingerprint: "SHA256:tty".into(),
             item_id: "1".into(),
+            master_password: false,
         }
     }
 

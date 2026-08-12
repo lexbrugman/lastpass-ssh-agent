@@ -21,19 +21,60 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct LpassCli {
     binary: PathBuf,
     timeout: Duration,
+    /// This binary and the config it was started with, when lpass should ask
+    /// for the master password rather than fail.
+    askpass_helper: Option<(PathBuf, PathBuf)>,
 }
+
+/// Set on the helper's environment to say which config to prompt from. Its
+/// presence is what makes this binary a password prompt instead of an agent.
+pub const ASKPASS_MARKER: &str = "LASTPASS_SSH_AGENT_ASKPASS_CONFIG";
 
 impl LpassCli {
     pub const fn new(binary: PathBuf) -> Self {
         Self {
             binary,
             timeout: DEFAULT_TIMEOUT,
+            askpass_helper: None,
         }
+    }
+
+    /// Let lpass ask for the master password by running `helper`, which is this
+    /// binary, with the config the agent was started from.
+    ///
+    /// Only the long-running agent sets this. The one-shot commands have a
+    /// terminal of their own, and `lpass` prompting there directly is better
+    /// than a dialog appearing over it.
+    /// `prompt_timeout` is added to the command timeout, because the answer now
+    /// arrives at human speed: without it a prompt left open longer than
+    /// `DEFAULT_TIMEOUT` would kill the lpass call that opened it, and any
+    /// `confirm_timeout_secs` above that could never be answered in time.
+    /// `enabled` is taken here rather than decided by the caller so that both
+    /// answers live in one testable place — a branch in the startup path could
+    /// only ever go one way on a platform that refuses the setting at load.
+    #[must_use]
+    pub fn asking_with(
+        mut self,
+        enabled: bool,
+        helper: PathBuf,
+        config: PathBuf,
+        prompt_timeout: Duration,
+    ) -> Self {
+        if !enabled {
+            return self;
+        }
+        self.askpass_helper = Some((helper, config));
+        self.timeout = self.timeout.saturating_add(prompt_timeout);
+        self
     }
 
     #[cfg(test)]
     pub const fn with_timeout(binary: PathBuf, timeout: Duration) -> Self {
-        Self { binary, timeout }
+        Self {
+            binary,
+            timeout,
+            askpass_helper: None,
+        }
     }
 
     fn command(&self, args: &[&str]) -> tokio::process::Command {
@@ -57,6 +98,24 @@ impl LpassCli {
             if pass {
                 cmd.env(key, value);
             }
+        }
+        // Where lpass asks for the master password when its agent no longer
+        // holds the derived key — which is the ordinary state after the screen
+        // has locked. Pointed at this binary, so the question is put through
+        // whichever prompt the config already selected for passphrases.
+        //
+        // Checked by lpass *before* LPASS_DISABLE_PINENTRY, so the two below
+        // are not in conflict: the fallback still applies when no helper can be
+        // named, and then a missing key fails fast rather than blocking on a
+        // prompt nobody can answer.
+        if let Some((helper, config)) = &self.askpass_helper {
+            cmd.env("LPASS_ASKPASS", helper);
+            // lpass runs the helper as `<program> "<prompt>"`, with no way to
+            // add an argument of our own, so what tells this binary to be the
+            // helper rather than the agent travels beside it. It carries the
+            // config path too: the helper has to reach for the same prompt the
+            // agent was started with, and inherits no `--config`.
+            cmd.env(ASKPASS_MARKER, config);
         }
         // Never let lpass block on an interactive master-password prompt
         // from inside the agent; with stdin closed this makes it fail fast
@@ -216,6 +275,10 @@ struct CmdOutput {
 
 #[async_trait::async_trait]
 impl LpassClient for LpassCli {
+    fn may_prompt(&self) -> bool {
+        self.askpass_helper.is_some()
+    }
+
     async fn status(&self) -> Result<LoginStatus, LpassError> {
         let out = self.run(&["status"], MAX_FIELD_BYTES).await?;
         let text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -539,6 +602,44 @@ done"#,
     #[test]
     fn ls_line_parser_rejects_empty_id() {
         assert!(parse_ls_line("name [id: ]").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_master_password_helper_is_named_to_lpass() {
+        // Both halves matter: LPASS_ASKPASS is what lpass runs, and the marker
+        // beside it is what tells that run to be a prompt rather than an agent.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(
+            dir.path(),
+            r#"printf '%s|%s' "$LPASS_ASKPASS" "$LASTPASS_SSH_AGENT_ASKPASS_CONFIG""#,
+        );
+        let value = LpassCli::new(bin)
+            .asking_with(
+                true,
+                PathBuf::from("/helper"),
+                PathBuf::from("/cfg.toml"),
+                Duration::from_secs(30),
+            )
+            .show_field("42", "x")
+            .await
+            .unwrap();
+        assert_eq!(&*value, b"/helper|/cfg.toml");
+    }
+
+    #[tokio::test]
+    async fn without_a_helper_lpass_is_told_of_none() {
+        // Not asked for, so not installed: lpass falls back to the stdin path
+        // that fails fast instead of blocking on a prompt nobody can answer.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(dir.path(), r#"printf '[%s]' "$LPASS_ASKPASS""#);
+        let client = LpassCli::new(bin).asking_with(
+            false,
+            PathBuf::from("/helper"),
+            PathBuf::from("/cfg.toml"),
+            Duration::from_secs(30),
+        );
+        assert!(!client.may_prompt());
+        assert_eq!(&*client.show_field("42", "x").await.unwrap(), b"[]");
     }
 
     #[tokio::test]

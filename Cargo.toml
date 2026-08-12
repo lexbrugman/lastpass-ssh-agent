@@ -36,10 +36,13 @@ thiserror = "2"
 dirs = "6"
 libc = "0.2"
 
-# Only the macOS Keychain store needs this, and it is declared per-target so
-# the musl Linux builds never pull an Apple framework binding in at all.
+# Only the macOS Keychain store and the screen-lock probe need these, and they
+# are declared per-target so the musl Linux builds never pull an Apple framework
+# binding in at all.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+# Reading one key out of the dictionary CGSessionCopyCurrentDictionary returns.
+core-foundation = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
