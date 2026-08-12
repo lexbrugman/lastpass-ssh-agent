@@ -116,7 +116,7 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
     );
     // Without this, a request relayed from a machine you ran `ssh -A` to is
     // indistinguishable from one you made yourself: both name the local ssh
-    // process. Each hop below proved possession of its host key.
+    // process. Each hop in the chain proved possession of its host key.
     if !ctx.bindings.is_empty() {
         let chain: Vec<String> = ctx
             .bindings

@@ -181,7 +181,7 @@ impl LpassCli {
         // has locked. Pointed at this binary, so the question is put through
         // whichever prompt the config already selected for passphrases.
         //
-        // Checked by lpass *before* LPASS_DISABLE_PINENTRY, so the two below
+        // Checked by lpass *before* LPASS_DISABLE_PINENTRY, so the two settings
         // are not in conflict: the fallback still applies when no helper can be
         // named, and then a missing key fails fast rather than blocking on a
         // prompt nobody can answer.
@@ -201,9 +201,9 @@ impl LpassCli {
         // every time, so without this the only end is our timeout, a
         // fingerprint per turn until then.
         //
-        // Beside the block above rather than inside it: there is a marker
-        // exactly when there is a helper, so nesting it would leave an arm no
-        // test on any platform could reach.
+        // Outside the `askpass_helper` block rather than inside it: there is
+        // a marker exactly when there is a helper, so nesting it would leave an
+        // arm no test on any platform could reach.
         if let Some(once) = once {
             cmd.env(ASKPASS_ONCE_MARKER, once);
         }
@@ -261,7 +261,7 @@ impl LpassCli {
             }
         }
         let diagnostics = String::from_utf8_lossy(&stderr);
-        // Looked for before the truncation below, not after: lpass can be
+        // Looked for before `stderr` is truncated, not after: lpass can be
         // talkative, and a few hundred characters of its own warnings would
         // push the signal out of the window and lose the record entirely.
         //
@@ -378,7 +378,7 @@ async fn read_diagnostics(pipe: &mut tokio::process::ChildStderr) -> std::io::Re
 }
 
 /// Parse one `lpass ls` line: `Group/Name [id: 1234]`. Uses the LAST
-/// ` [id: ` marker so names containing the marker text can't confuse it.
+/// ` [id: ` marker so names containing the marker text cannot confuse it.
 fn parse_ls_line(line: &str) -> Option<ItemSummary> {
     let line = line.trim_end();
     let rest = line.strip_suffix(']')?;
@@ -682,7 +682,7 @@ done"#,
             r#"printf '%s|%s' "$SUPER_SECRET_TOKEN" "$HOME""#,
         );
         // Env vars are process-global; the name is unique to this test so
-        // parallel tests can't collide.
+        // parallel tests cannot collide.
         std::env::set_var("SUPER_SECRET_TOKEN", "leaked");
         let client = LpassCli::new(bin);
         let value = client.show_field("42", "x").await.unwrap();

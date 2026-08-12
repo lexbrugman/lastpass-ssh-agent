@@ -51,7 +51,7 @@ pub fn install(socket_path: &Path, binary: &Path) -> Result<PathBuf> {
     //
     // Judged from `symlink_metadata`, so a symlink is refused as itself rather
     // than followed, and anything that is not a regular file — a FIFO, where a
-    // read waits for a writer that never comes — never reaches the read below.
+    // read waits for a writer that never comes — never reaches `read_marker`.
     // Deliberately not `files::open_regular`: this wants to say *whose* file is
     // in the way, and that answer is worth more here than closing the moment
     // between the check and the open, which only another process running as
@@ -78,8 +78,8 @@ pub fn install(socket_path: &Path, binary: &Path) -> Result<PathBuf> {
 /// Read just enough of a file to recognise the marker.
 ///
 /// Bounded because the path is derived from one the user chose: a collision
-/// with something enormous should produce the refusal below, not an allocation
-/// the size of whatever happened to be sitting there.
+/// with something enormous should produce `occupied`, not an allocation the
+/// size of whatever happened to be sitting there.
 fn read_marker(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read as _;
     let mut head = Vec::with_capacity(MARKER.len());
@@ -244,7 +244,7 @@ pub async fn seed(
 /// Nowhere to keep it: every read falls through to asking.
 ///
 /// Off macOS this is the only implementation there will be, and config
-/// validation refuses `keychain` there anyway. Compiled on macOS only for the
+/// validation refuses `touchid` there anyway. Compiled on macOS only for the
 /// tests, which use it to prove the portable rules around an absent store —
 /// there it is a stand-in rather than something the agent would reach.
 #[cfg(any(test, not(target_os = "macos")))]
@@ -270,13 +270,6 @@ impl MasterPasswordStore for NoStore {
     }
 }
 
-/// The master password to hand `lpass`, from wherever the config says.
-///
-/// A store that has nothing yet, or cannot be asked, falls through to the
-/// prompt rather than failing: the secret is the same one either way, and
-/// refusing would strand a vault that a typed password could open. A prompt
-/// that fails is a different matter and is reported — treating it as an empty
-/// answer would hand `lpass` a password nobody typed.
 /// Where a resolved master password actually came from.
 ///
 /// The difference matters to setup and nowhere else: a password typed at the
@@ -328,6 +321,13 @@ fn remember_store_answered(once: Option<&Path>) {
     }
 }
 
+/// The master password to hand `lpass`, from wherever the config says.
+///
+/// A store that has nothing yet, or cannot be asked, falls through to the
+/// prompt rather than failing: the secret is the same one either way, and
+/// refusing would strand a vault that a typed password could open. A prompt
+/// that fails is a different matter and is reported — treating it as an empty
+/// answer would hand `lpass` a password nobody typed.
 pub async fn resolve(
     source: MasterPassword,
     store: &dyn MasterPasswordStore,
@@ -362,7 +362,7 @@ pub async fn resolve(
             )));
         }
         match store.get().await {
-            // Nothing this agent stored can be over the cap, so a value that is
+            // Nothing this agent stored can be over the cap, so one that is
             // did not come from here. Refused rather than used, and checked on
             // this side because a store's contents are not ours to trust.
             Ok(Some(secret)) if secret.len() > crate::passphrase::MAX_PASSPHRASE_BYTES => {

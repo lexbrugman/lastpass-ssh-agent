@@ -38,8 +38,8 @@ fn release_date(version: &str) -> String {
     if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) || !(1..=12).contains(&month) {
         return UNKNOWN.into();
     }
-    // Four ASCII digits by the check above, so this cannot overflow and
-    // needs no fallible parse.
+    // `year` is four ASCII digits by the guard on entry, so this cannot
+    // overflow and needs no fallible parse.
     let year_number = year
         .bytes()
         .fold(0u32, |acc, b| acc * 10 + u32::from(b - b'0'));

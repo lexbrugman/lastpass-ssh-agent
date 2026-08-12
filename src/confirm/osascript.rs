@@ -111,7 +111,7 @@ impl Confirmer for OsascriptConfirmer {
             return Decision::Approve;
         }
 
-        // Everything below denies; the point is to say *why*. A refusal and a
+        // Every branch here denies; the point is to say *why*. A refusal and a
         // dialog that never appeared look identical from the outside — both
         // simply stop the signature — and this is the last place that can still
         // tell them apart. Reporting them alike once cost an afternoon: an

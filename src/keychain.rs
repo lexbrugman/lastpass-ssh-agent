@@ -7,12 +7,14 @@
 //!
 //! The master password is deliberately *not* here. Protecting a keychain item
 //! with user presence needs the data-protection keychain, which needs an
-//! entitlement no command line tool can carry — see `crate::enclave`, which
-//! holds it in the Secure Enclave instead and never involves the keychain.
+//! entitlement no command line tool can carry. It is held in the Secure
+//! Enclave instead, which never involves the keychain; the header of
+//! `swift/secure_enclave.swift` says why that route is open and this one is
+//! not.
 //!
 //! No decisions in this file. When to consult a store, what a failure means and
-//! what happens when nothing is there are all questions for the modules above,
-//! where they are tested on every platform.
+//! what happens when nothing is there are all questions for the modules that
+//! call this, where they are tested on every platform.
 
 use security_framework::passwords::{generic_password, set_generic_password_options};
 use security_framework::passwords_options::PasswordOptions;

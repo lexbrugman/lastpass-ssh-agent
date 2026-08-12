@@ -555,7 +555,7 @@ async fn search(client: &Arc<dyn LpassClient>, query: Option<&str>) -> Result<()
     for item in &found {
         let name = item.name.rsplit('/').next().unwrap_or(&item.name);
         // Vault names are untrusted: serialize as TOML so quotes,
-        // backslashes, and newlines can't break or extend the snippet.
+        // backslashes, and newlines cannot break or extend the snippet.
         println!(
             "\n[[keys]]\nid = {}\nname = {}",
             toml::Value::String(item.id.clone()),

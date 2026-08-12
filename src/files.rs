@@ -3,9 +3,8 @@
 //! Both are written once here rather than in each caller, because both have a
 //! detail that is easy to leave out and invisible when you do: a write that is
 //! not atomic can be read half-finished, and an open that trusts a path can
-//! block forever on something that is not a file. The askpass wrapper and the
-//! Secure Enclave store had a copy each, and the copies had already begun to
-//! differ.
+//! block forever on something that is not a file. Neither shows up in testing;
+//! both show up when something else is already going wrong.
 
 use std::path::{Path, PathBuf};
 
@@ -68,8 +67,8 @@ pub fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
 /// These are files the agent writes into its own directory, so a link at one of
 /// those names was put there by something else — and following it would let
 /// that something else choose which file the agent reads, quietly, while every
-/// check above still passed. `knownhosts` is deliberately not read this way: a
-/// symlinked `known_hosts` is an ordinary thing for a person to have.
+/// regular-file check still passed. `knownhosts` is deliberately not read this
+/// way: a symlinked `known_hosts` is an ordinary thing for a person to have.
 pub fn open_regular(path: &Path) -> Result<Option<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -85,7 +84,7 @@ pub fn open_regular(path: &Path) -> Result<Option<std::fs::File>> {
     if file.metadata()?.file_type().is_file() {
         Ok(Some(file))
     } else {
-        Err(crate::error::Error::ConfigInvalid(format!(
+        Err(crate::error::Error::State(format!(
             "{} is not a regular file — refusing to read it",
             path.display()
         )))

@@ -87,7 +87,7 @@ pub fn default_socket_path() -> Option<PathBuf> {
 ///
 /// `None` means "no answer available here" rather than "unlocked", and the
 /// caller treats it as a reason to stop asking rather than as a state. Keeping
-/// the two apart is what lets the watcher above it be one portable piece of
+/// the two apart is what lets the watcher that calls it be one portable piece of
 /// logic with no `cfg` in it.
 ///
 /// This is the entire platform surface of the screen-lock feature: a value to
