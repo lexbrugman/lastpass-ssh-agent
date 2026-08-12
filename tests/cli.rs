@@ -207,6 +207,25 @@ fn doctor_all_green() {
 }
 
 #[test]
+fn doctor_reports_the_master_password_source() {
+    // Silent when there is nothing configured, and a line once there is —
+    // otherwise the one setting that makes the agent ask for the master
+    // password would never appear in the checklist.
+    let quiet = setup(&healthy_vault_body_owned(), "");
+    assert!(!stdout(&run(&quiet, &["doctor"])).contains("master password"));
+
+    let s = setup(
+        &healthy_vault_body_owned(),
+        "master_password = \"prompt\"\n",
+    );
+    let output = run(&s, &["doctor"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("✓ master password"), "{text}");
+    assert!(text.contains("never kept"), "{text}");
+}
+
+#[test]
 fn doctor_reports_pinned_keys_and_socket_problems() {
     let s = setup(
         &healthy_vault_body_owned(),
@@ -546,14 +565,14 @@ fn start_writes_no_wrapper_when_it_was_not_asked_for() {
 }
 
 #[test]
-fn storing_a_master_password_needs_the_keychain_source() {
+fn storing_a_master_password_needs_the_touchid_source() {
     // Nothing to store without somewhere to put it, and saying so beats
     // prompting for a secret that would then have nowhere to go.
     let s = setup(&healthy_vault_body_owned(), "");
     let output = run(&s, &["store-master-password"]);
     assert!(!output.status.success());
     assert!(
-        stderr(&output).contains("master_password = \"keychain\""),
+        stderr(&output).contains("master_password = \"touchid\""),
         "{}",
         stderr(&output)
     );

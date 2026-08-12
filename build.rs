@@ -8,6 +8,7 @@
 //! a build from a source tarball that has neither.
 #![allow(clippy::doc_markdown, reason = "build script, not published docs")]
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -35,6 +36,124 @@ fn main() {
         .or_else(git_version)
         .unwrap_or_else(|| "dev".into());
     println!("cargo:rustc-env=LASTPASS_SSH_AGENT_VERSION={version}");
+
+    secure_enclave_shim();
+}
+
+/// Path to the Swift half of the Secure Enclave store.
+const SHIM: &str = "swift/secure_enclave.swift";
+
+/// Compile `swift/secure_enclave.swift` into the binary, on macOS only.
+///
+/// Skipped in two cases, and the difference between them matters:
+///
+/// - Not building for macOS. There is no such code in the crate then, since the
+///   store is behind a `cfg`, so there is nothing to link.
+/// - Building *for* macOS from somewhere else. `cargo clippy --target
+///   aarch64-apple-darwin` runs on the Linux runner and in the container to
+///   type-check the macOS-gated code, and type-checking never links — so a
+///   missing Swift toolchain must not fail it. A real cross-build would fail at
+///   the link step instead, which is honest: the release macOS binaries are
+///   built on macOS.
+fn secure_enclave_shim() {
+    println!("cargo:rerun-if-changed={SHIM}");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        println!("cargo:warning=not on macOS: skipping the Swift Secure Enclave shim (this build can be type-checked but not linked)");
+        return;
+    }
+
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("cargo always sets OUT_DIR"));
+    let object = out_dir.join("secure_enclave.o");
+    let archive = out_dir.join("liblssha_secure_enclave.a");
+
+    // Every architecture is built from one macOS runner, so the target cannot
+    // be left to swiftc's default — that would compile the host's.
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").expect("cargo always sets TARGET_ARCH");
+    let triple = match arch.as_str() {
+        "x86_64" => "x86_64-apple-macos11.0",
+        _ => "arm64-apple-macos11.0",
+    };
+
+    let sdk = xcrun(["--show-sdk-path", "--sdk", "macosx"]);
+    let swiftc = xcrun(["--find", "swiftc"]);
+    let ar = xcrun(["--find", "ar"]);
+
+    run(
+        &swiftc,
+        &[
+            "-emit-object".as_ref(),
+            "-parse-as-library".as_ref(),
+            "-O".as_ref(),
+            "-target".as_ref(),
+            triple.as_ref(),
+            "-sdk".as_ref(),
+            sdk.as_ref(),
+            "-o".as_ref(),
+            object.as_os_str(),
+            SHIM.as_ref(),
+        ],
+    );
+    run(
+        &ar,
+        &["rcs".as_ref(), archive.as_os_str(), object.as_os_str()],
+    );
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=lssha_secure_enclave");
+    // The Swift runtime ships with the OS from 10.14.4 on, so this links
+    // against the copy in the SDK rather than carrying one along.
+    println!("cargo:rustc-link-search=native={sdk}/usr/lib/swift");
+    // Not the same directory, and both are needed. Building for a deployment
+    // target older than the toolchain makes swiftc emit references to
+    // back-deployment shims — `swiftCompatibility56` and friends — which exist
+    // only in the toolchain, never in the SDK. Without this the link fails on
+    // undefined `__swift_FORCE_LOAD_$_swiftCompatibility56`.
+    let toolchain = Path::new(&swiftc)
+        .ancestors()
+        .nth(2)
+        .expect("swiftc lives at <toolchain>/usr/bin/swiftc")
+        .join("lib/swift/macosx");
+    println!("cargo:rustc-link-search=native={}", toolchain.display());
+    println!("cargo:rustc-link-lib=framework=CryptoKit");
+    println!("cargo:rustc-link-lib=framework=Security");
+    // For the one sentence the Touch ID sheet shows.
+    println!("cargo:rustc-link-lib=framework=LocalAuthentication");
+}
+
+/// Ask the active toolchain where something is, by absolute path.
+///
+/// `/usr/bin/xcrun` rather than a bare `xcrun`, so nothing earlier on `PATH`
+/// can substitute a swiftc of its own into an object file that gets linked into
+/// the released binary. The idea is GoDaddy's `hardware-enclave`, which
+/// documents it as build-time trust; it costs nothing to copy.
+fn xcrun<const N: usize>(args: [&str; N]) -> String {
+    let output = Command::new("/usr/bin/xcrun")
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run /usr/bin/xcrun {}: {e}", args.join(" ")));
+    assert!(
+        output.status.success(),
+        "/usr/bin/xcrun {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("xcrun prints a path")
+        .trim()
+        .to_string()
+}
+
+/// Run one build step, failing the build with its own diagnostics.
+fn run(program: &str, args: &[&std::ffi::OsStr]) {
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| panic!("cannot run {program}: {e}"));
+    assert!(status.success(), "{program} failed");
 }
 
 /// Files whose contents decide what the two stamps resolve to.

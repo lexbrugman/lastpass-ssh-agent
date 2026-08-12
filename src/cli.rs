@@ -93,10 +93,11 @@ pub enum Command {
         /// Substring to match against item names; omit to list all SSH Key items
         query: Option<String>,
     },
-    /// Keep your `LastPass` master password in the Keychain, behind Touch ID
+    /// Keep your `LastPass` master password behind Touch ID
     ///
     /// Locks the vault, asks once, checks that the password opens it, and keeps
-    /// it only if it does. Needs `master_password = "keychain"`. macOS only.
+    /// it only if it does — encrypted to a key held in the Secure Enclave.
+    /// Needs `master_password = "touchid"`. macOS only.
     StoreMasterPassword,
     /// Ask for the `LastPass` master password and print it (used by `lpass`)
     ///

@@ -51,11 +51,13 @@ pub enum MasterPassword {
     Off,
     /// Asked for through the agent's own prompt, and never kept.
     Prompt,
-    /// Read from the macOS Keychain, released only on user presence — Touch ID
-    /// — so it cannot be taken silently by anything able to trigger a
-    /// signature. Falls back to `prompt` when there is nothing stored yet or
-    /// biometry is unavailable. macOS only; rejected at load elsewhere.
-    Keychain,
+    /// Kept encrypted to a key held in the Secure Enclave, which releases it
+    /// only on Touch ID — so it cannot be taken silently by anything able to
+    /// trigger a signature. Falls back to `prompt` when there is nothing stored
+    /// yet, when the fingerprint is declined, or when the key needs seeding
+    /// again. macOS only; rejected at load elsewhere.
+    #[serde(rename = "touchid")]
+    TouchId,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -264,9 +266,9 @@ impl Config {
             ));
         }
         #[cfg(not(target_os = "macos"))]
-        if self.master_password == MasterPassword::Keychain {
+        if self.master_password == MasterPassword::TouchId {
             return Err(Error::ConfigInvalid(
-                "master_password = \"keychain\" is only supported on macOS".into(),
+                "master_password = \"touchid\" is only supported on macOS".into(),
             ));
         }
         // Same treatment, and for the same reason: reading the screen's lock
@@ -565,22 +567,22 @@ id = "1"
 
     /// `prompt` is deliberately not macOS-only: `lpass` forgets its key on its
     /// own timeout everywhere, and being asked rather than failing is worth
-    /// having on any platform. Only the Keychain half needs a platform.
+    /// having on any platform. Only the Touch ID half needs a platform.
     #[test]
     #[cfg(target_os = "macos")]
-    fn the_keychain_source_is_accepted_here() {
+    fn the_touchid_source_is_accepted_here() {
         assert_eq!(
-            parse("master_password = \"keychain\"")
+            parse("master_password = \"touchid\"")
                 .unwrap()
                 .master_password,
-            MasterPassword::Keychain
+            MasterPassword::TouchId
         );
     }
 
     #[test]
     #[cfg(not(target_os = "macos"))]
-    fn the_keychain_source_is_refused_here_with_a_reason() {
-        let error = parse("master_password = \"keychain\"")
+    fn the_touchid_source_is_refused_here_with_a_reason() {
+        let error = parse("master_password = \"touchid\"")
             .unwrap_err()
             .to_string();
         assert!(error.contains("only supported on macOS"), "{error}");

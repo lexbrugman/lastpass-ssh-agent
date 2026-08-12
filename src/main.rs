@@ -1,11 +1,18 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod agent;
+// Excluded from coverage: one `spawn_blocking` shared by the two macOS stores,
+// whose failure is a panicking Apple call that a test cannot arrange.
+#[cfg(target_os = "macos")]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod apple;
 mod askpass;
 mod cli;
 mod config;
 mod confirm;
+mod enclave;
 mod error;
+mod files;
 mod interaction;
 // Excluded from coverage as a whole, which is the point of it being this small:
 // every line talks to the real Keychain of whoever runs the tests. The rules
@@ -123,7 +130,20 @@ async fn run(cli: Cli) -> Result<()> {
             print_env(&config.socket_path()?, config.vault_unlock_timeout_secs);
             Ok(())
         }
-        Command::Start => start(&config_path()?).await,
+        // Before the config path is even resolved, so nothing this command can
+        // fail on happens unannounced. A service log otherwise begins at
+        // whatever went wrong with nothing saying which build it went wrong in,
+        // and an agent restarting in a loop reads the same as an upgrade that
+        // replaced the binary but not the running process. Paired with the
+        // "shutting down" line at the other end.
+        Command::Start => {
+            tracing::info!(
+                version = env!("LASTPASS_SSH_AGENT_VERSION"),
+                commit = env!("LASTPASS_SSH_AGENT_COMMIT"),
+                "starting"
+            );
+            start(&config_path()?).await
+        }
         Command::List => {
             let config = Config::load_or_default(&config_path()?)?;
             let client: Arc<dyn LpassClient> = Arc::new(client_from(&config)?);
@@ -164,8 +184,8 @@ async fn run(cli: Cli) -> Result<()> {
 /// presence prompt — so setting this up proves the whole arrangement works
 /// rather than only that a password was typed.
 ///
-/// Excluded from coverage: it needs a real vault to lock, a real Keychain to
-/// write and a fingerprint to release it, and the one branch a test could take
+/// Excluded from coverage: it needs a real vault to lock, a real Secure Enclave
+/// to write to and a fingerprint to release it, and the one branch a test could take
 /// is the one platform where the rest is refused at config load. What it
 /// decides is `askpass::seed`'s, tested with fakes on every platform; that it
 /// refuses without somewhere to store is covered end to end by the CLI tests.
@@ -200,17 +220,17 @@ fn refuse_while_an_agent_runs(socket_path: &Path) -> Result<()> {
 /// The rest: lock the vault, ask, and keep the answer if it opens it.
 ///
 /// Excluded from coverage, and only this: every line needs a real vault to
-/// lock, a real Keychain to write and a fingerprint to release it. What it
-/// decides is `askpass::seed`'s, tested with fakes on every platform.
+/// lock, a real Secure Enclave to write to and a fingerprint to release it.
+/// What it decides is `askpass::seed`'s, tested with fakes on every platform.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn seed_master_password(
     config: &Config,
     config_path: &Path,
     socket_path: &Path,
 ) -> Result<()> {
-    if config.master_password != config::MasterPassword::Keychain {
+    if config.master_password != config::MasterPassword::TouchId {
         return Err(Error::ConfigInvalid(
-            "nothing to store: set master_password = \"keychain\" in the config first".into(),
+            "nothing to store: set master_password = \"touchid\" in the config first".into(),
         ));
     }
     let client: Arc<dyn LpassClient> = Arc::new(asking_client(config, config_path, socket_path)?);
@@ -231,7 +251,7 @@ async fn seed_master_password(
         .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
 
     askpass::seed(
-        askpass::default_store().as_ref(),
+        askpass::default_store(socket_path).as_ref(),
         &secret,
         &VaultOpens(client),
     )
@@ -273,10 +293,14 @@ impl askpass::VaultUnlock for VaultOpens {
 /// wiped when this returns.
 async fn askpass(config_path: &Path) -> Result<()> {
     let config = Config::load_or_default(config_path)?;
+    // Named by the agent that spawned the lpass that spawned this, and absent
+    // when nothing asked for the guard.
+    let once = std::env::var_os(lpass::ASKPASS_ONCE_MARKER).map(std::path::PathBuf::from);
     let (secret, from) = askpass::resolve(
         config.master_password,
-        askpass::default_store().as_ref(),
+        askpass::default_store(&config.socket_path()?).as_ref(),
         passphrase::from_config(&config)?.as_ref(),
+        once.as_deref(),
     )
     .await?;
 
@@ -369,7 +393,16 @@ async fn start(config_path: &Path) -> Result<()> {
         passphrase::from_config(&config)?,
     ));
     let (listener, guard) = socket::bind(&socket_path)?;
-    print_env(&socket_path, config.vault_unlock_timeout_secs);
+    // Logged rather than printed as shell exports. `env` emits those, and they
+    // are for a shell to evaluate — which nothing can do with the output of a
+    // command that then runs until it is stopped. In a service they went
+    // straight into the log, where two `export` lines read as something to copy
+    // rather than as a record of where the agent is listening.
+    tracing::info!(
+        socket = %socket_path.display(),
+        vault_unlock_timeout_secs = ?config.vault_unlock_timeout_secs,
+        "listening"
+    );
 
     // Runs beside the agent rather than inside a request: the screen locks when
     // nobody is asking for a signature, which is the whole point of it. Spawned
@@ -612,6 +645,13 @@ async fn doctor(config_path: &Path, test_confirm: bool) -> Result<()> {
 
     if let Some(config) = &config {
         report(check_socket(config));
+        if let Some(check) = master_password_check(
+            config.master_password,
+            askpass::store_available(),
+            master_password_seeded(config),
+        ) {
+            report(check);
+        }
     }
 
     if test_confirm {
@@ -748,6 +788,51 @@ fn check_socket(config: &Config) -> Check {
     }
 }
 
+/// Whether a master password is already stored, which is a question about a
+/// file and never about a fingerprint — `doctor` must not cost one.
+///
+/// A socket path that will not resolve, or a file that will not decode, both
+/// come out as "nothing stored": the first is `check_socket`'s to report and
+/// the second is answered by the same instruction as an empty store.
+fn master_password_seeded(config: &Config) -> bool {
+    config
+        .socket_path()
+        .and_then(|socket| enclave::load(&enclave::path_for(&socket)))
+        .is_ok_and(|stored| stored.is_some())
+}
+
+/// The master-password line of the checklist.
+///
+/// Takes the two facts rather than looking them up, so every arm is exercised
+/// on both platforms — `touchid` cannot even be parsed into a config off macOS,
+/// which would otherwise leave most of this untestable there.
+fn master_password_check(
+    source: config::MasterPassword,
+    available: bool,
+    seeded: bool,
+) -> Option<Check> {
+    const LABEL: &str = "master password";
+    match source {
+        config::MasterPassword::Off => None,
+        config::MasterPassword::Prompt => Some(Check::passed(
+            LABEL,
+            "asked when the vault needs reopening, and never kept".into(),
+        )),
+        config::MasterPassword::TouchId if !available => Some(Check::failed(
+            LABEL,
+            "no Secure Enclave on this machine — use master_password = \"prompt\"".into(),
+        )),
+        config::MasterPassword::TouchId if !seeded => Some(Check::failed(
+            LABEL,
+            "nothing stored yet — run `lastpass-ssh-agent store-master-password`".into(),
+        )),
+        config::MasterPassword::TouchId => Some(Check::passed(
+            LABEL,
+            "stored, and released only on Touch ID".into(),
+        )),
+    }
+}
+
 /// Pop the configured prompt once, for `--test-confirm`.
 async fn check_confirmation(config: &Config) -> Result<Check> {
     if config.confirm == config::ConfirmMode::Off {
@@ -801,6 +886,7 @@ mod tests {
         // the check is only honest when there is no way back.
         assert!(wants_login_checked(config::MasterPassword::Off));
         assert!(!wants_login_checked(config::MasterPassword::Prompt));
+        assert!(!wants_login_checked(config::MasterPassword::TouchId));
     }
 
     #[test]
@@ -813,6 +899,85 @@ mod tests {
         let _listening = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let error = refuse_while_an_agent_runs(&socket).unwrap_err().to_string();
         assert!(error.contains("an agent is running"), "{error}");
+    }
+
+    /// A config that names a socket in `dir`, so the stored-master-password
+    /// lookup has somewhere to look.
+    fn config_with_socket(dir: &Path) -> Config {
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!("socket = \"{}/agent.sock\"\n", dir.display()),
+        )
+        .unwrap();
+        Config::load_or_default(&path).unwrap()
+    }
+
+    #[test]
+    fn nothing_is_stored_until_something_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_socket(dir.path());
+        assert!(!master_password_seeded(&config));
+
+        let stored = enclave::Stored {
+            blob: vec![1, 2, 3],
+            cipher: vec![4, 5, 6],
+        };
+        let path = dir.path().join("agent.sock.master");
+        enclave::save(&path, &stored).unwrap();
+        assert!(master_password_seeded(&config));
+    }
+
+    #[test]
+    fn a_file_that_will_not_decode_counts_as_nothing_stored() {
+        // `store-master-password` is the answer either way, and the socket
+        // check reports anything wrong with the path itself.
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_socket(dir.path());
+        std::fs::write(dir.path().join("agent.sock.master"), b"not ours").unwrap();
+        assert!(!master_password_seeded(&config));
+    }
+
+    fn expect_check(source: config::MasterPassword, available: bool, seeded: bool) -> Check {
+        master_password_check(source, available, seeded)
+            .unwrap_or_else(|| panic!("{source:?} should report a line"))
+    }
+
+    #[test]
+    fn an_unconfigured_master_password_reports_nothing() {
+        assert!(master_password_check(config::MasterPassword::Off, true, true).is_none());
+    }
+
+    #[test]
+    fn the_prompt_source_passes_without_needing_anything() {
+        let check = expect_check(config::MasterPassword::Prompt, false, false);
+        assert!(check.ok, "{}", check.detail);
+        assert!(check.detail.contains("never kept"), "{}", check.detail);
+    }
+
+    #[test]
+    fn touchid_without_an_enclave_fails_and_names_the_alternative() {
+        let check = expect_check(config::MasterPassword::TouchId, false, false);
+        assert!(!check.ok);
+        assert!(check.detail.contains("\"prompt\""), "{}", check.detail);
+    }
+
+    #[test]
+    fn touchid_with_nothing_stored_fails_and_says_what_to_run() {
+        let check = expect_check(config::MasterPassword::TouchId, true, false);
+        assert!(!check.ok);
+        assert!(
+            check.detail.contains("store-master-password"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn touchid_once_seeded_passes() {
+        let check = expect_check(config::MasterPassword::TouchId, true, true);
+        assert!(check.ok, "{}", check.detail);
+        assert!(check.detail.contains("Touch ID"), "{}", check.detail);
     }
 
     #[test]

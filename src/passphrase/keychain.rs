@@ -7,8 +7,9 @@
 //!
 //! Read without a presence prompt on purpose: the agent already asks for
 //! approval on every signature, and a second system prompt on top of each one
-//! would make normal SSH use impractical. The master password beside it is
-//! protected differently, because it unlocks everything rather than one key.
+//! would make normal SSH use impractical. The master password is kept somewhere
+//! else entirely and behind Touch ID, because it unlocks the whole vault rather
+//! than one key.
 //!
 //! Only the passphrase is stored. The private key stays in `LastPass`, fetched
 //! for every signature.
@@ -16,12 +17,12 @@
 use zeroize::Zeroizing;
 
 use super::PassphraseStore;
-use crate::keychain::{Item, Presence};
+use crate::keychain::Item;
 
 pub struct Keychain;
 
 fn item(fingerprint: &str) -> Item {
-    Item::new(fingerprint.to_string(), Presence::NotRequired)
+    Item::new(fingerprint.to_string())
 }
 
 #[async_trait::async_trait]

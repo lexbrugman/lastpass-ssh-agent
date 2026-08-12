@@ -13,12 +13,13 @@
 //! belongs to rather than silently behaving like a password prompt.
 
 // Excluded from coverage as a whole, which is the point of it being this
-// small: every line talks to the real Keychain of whoever runs the tests, and
-// asks for a fingerprint. The rules around it are covered through
-// `MasterPasswordStore` fakes on every platform.
+// small: every line crosses into the Secure Enclave of whoever runs the tests,
+// and asks for a fingerprint. What the answers mean is in `crate::enclave`,
+// tested on every platform; the rules around the store are covered through
+// `MasterPasswordStore` fakes, likewise everywhere.
 #[cfg(target_os = "macos")]
 #[cfg_attr(coverage_nightly, coverage(off))]
-mod keychain;
+mod enclave;
 
 use std::path::{Path, PathBuf};
 
@@ -39,9 +40,6 @@ use crate::passphrase::{PassphrasePrompt, PassphraseRequest};
 /// running now, so an upgrade or a move corrects itself without anyone noticing
 /// there was a file to correct.
 pub fn install(socket_path: &Path, binary: &Path) -> Result<PathBuf> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
     let mut name = socket_path.as_os_str().to_os_string();
     name.push(".askpass");
     let path = PathBuf::from(name);
@@ -50,10 +48,14 @@ pub fn install(socket_path: &Path, binary: &Path) -> Result<PathBuf> {
     // something that was already there. Replacing our own wrapper is the point;
     // replacing anything else would be quietly destroying a file nobody asked
     // us to touch. `socket::bind` refuses an unexpected file in the same way.
-    // Without following symlinks, and only ever reading a regular file: the
-    // path could be a FIFO, where a plain read waits for a writer that never
-    // comes and hangs startup — the hazard `knownhosts::read_small` guards
-    // against for the same reason.
+    //
+    // Judged from `symlink_metadata`, so a symlink is refused as itself rather
+    // than followed, and anything that is not a regular file — a FIFO, where a
+    // read waits for a writer that never comes — never reaches the read below.
+    // Deliberately not `files::open_regular`: this wants to say *whose* file is
+    // in the way, and that answer is worth more here than closing the moment
+    // between the check and the open, which only another process running as
+    // this user could exploit and only to hang a startup.
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
@@ -65,34 +67,11 @@ pub fn install(socket_path: &Path, binary: &Path) -> Result<PathBuf> {
         Ok(_) => return Err(occupied(&path)),
     }
 
-    // Written somewhere else and moved into place, never opened with O_TRUNC on
-    // the path lpass runs. A second agent starting while the first is being
-    // asked for a password would otherwise truncate the file mid-exec — the
-    // executable-write race AGENTS.md describes, which surfaces as ETXTBSY or
-    // as a half-written script. `rename` swaps the name over in one step, so a
-    // running exec keeps the file it already opened.
-    //
-    // The staging name carries this process's id, so two agents starting at
-    // once stage into files of their own: a shared one would let each truncate
-    // what the other was still writing, or rename it out from under them.
-    let mut staging = path.as_os_str().to_os_string();
-    staging.push(format!(".{}", std::process::id()));
-    let staging = PathBuf::from(staging);
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        // 0700 from the moment it exists, never world-readable for an instant
-        .mode(0o700)
-        .open(&staging)?;
-    file.write_all(&script_for(binary))?;
-    // Closed before the rename: a descriptor still open for writing is exactly
-    // what makes an exec of that file fail.
-    drop(file);
-    // Said again for a staging file left behind by a crash, which keeps its mode.
-    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::rename(&staging, &path)?;
+    // 0700 because lpass execs this one. The staged write matters more here
+    // than anywhere else — a second agent starting while the first is being
+    // asked for a password would otherwise truncate the file mid-exec — and
+    // `files::write_private` says why it is done that way.
+    crate::files::write_private(&path, &script_for(binary), 0o700)?;
     Ok(path)
 }
 
@@ -165,10 +144,10 @@ fn script_for(binary: &Path) -> Vec<u8> {
 /// could read silently would hand over the entire vault; one that needs a
 /// fingerprint cannot.
 ///
-/// Portable on purpose, though the macOS Keychain is the only implementation:
-/// it keeps the rules around it — prefer what is stored, fall back to asking,
-/// never treat a failure as an empty answer — testable everywhere, leaving only
-/// the calls into Apple's API behind a `cfg`.
+/// Portable on purpose, though the macOS Secure Enclave is the only
+/// implementation: it keeps the rules around it — prefer what is stored, fall
+/// back to asking, never treat a failure as an empty answer — testable
+/// everywhere, leaving only the calls into Apple's API behind a `cfg`.
 #[async_trait::async_trait]
 pub trait MasterPasswordStore: Send + Sync {
     /// How a log line names this store.
@@ -197,7 +176,7 @@ pub trait VaultUnlock: Send + Sync {
 ///
 /// Stored before it is checked, because the only way to check is to let `lpass`
 /// use it, and the only channel `lpass` reads from is the helper — which reads
-/// the store. So the secret is in the Keychain for as long as one vault call
+/// the store. So the secret is in the store for as long as one vault call
 /// takes, and is taken back out again if it turns out to be wrong. The
 /// alternative is passing a candidate through argv, the environment or a
 /// temporary file, and none of those are places a master password may go.
@@ -206,12 +185,14 @@ pub async fn seed(
     secret: &[u8],
     vault: &dyn VaultUnlock,
 ) -> Result<()> {
-    // What is there now, so a failed replacement is not a destroyed one. A
-    // store that cannot be read yields `None`, which is the same as empty for
-    // this purpose: there is nothing to put back.
-    // A store that will not say — presence declined, Keychain unavailable —
-    // stops this before anything is overwritten: guessing "nothing was there"
-    // and rolling back to nothing would delete a password that worked.
+    // What is there now, so a failed replacement is not a destroyed one.
+    //
+    // The distinction the store draws is the one this turns on. Holding
+    // something that can never be opened again counts as empty — there is
+    // nothing to put back, and seeding over it is the documented repair. Being
+    // unable to *say* what is there — a declined fingerprint, no Enclave —
+    // stops this before anything is overwritten, because guessing "nothing was
+    // there" and rolling back to nothing would delete a password that worked.
     let previous = store.get().await.map_err(|e| {
         Error::ConfigInvalid(format!(
             "cannot read what is already stored in {}, so nothing was changed: {e}",
@@ -227,7 +208,7 @@ pub async fn seed(
         Ok(()) => {
             tracing::info!(
                 "the master password opens the vault and is stored in {} — released only \
-                 on Touch ID or your login password, never silently",
+                 on Touch ID, never silently and never for your login password",
                 store.name()
             );
             Ok(())
@@ -247,8 +228,10 @@ pub async fn seed(
                 // prove presence and then fail with it.
                 return Err(Error::ConfigInvalid(format!(
                     "that master password did not open the vault ({why}), and the store \
-                     could not be put back as it was ({e}) — remove the \
-                     `lastpass-ssh-agent` entry in Keychain Access and try again"
+                     could not be put back as it was ({e}) — {} now holds a password that \
+                     does not work, so run `lastpass-ssh-agent store-master-password` \
+                     again to replace it",
+                    store.name()
                 )));
             }
             Err(Error::ConfigInvalid(format!(
@@ -318,10 +301,38 @@ impl Source {
     }
 }
 
+/// Whether the store has already answered this `lpass`.
+///
+/// `None` when no marker was named — nothing to remember, so nothing is
+/// refused. That is the honest reading of an agent that did not ask for the
+/// guard, and it leaves the older behaviour intact.
+fn store_already_answered(once: Option<&Path>) -> bool {
+    once.is_some_and(Path::exists)
+}
+
+/// Record that it has, so a second ask can be told apart from the first.
+///
+/// A failure here only costs the guard, never the answer that is already in
+/// hand, so it is reported and not propagated.
+fn remember_store_answered(once: Option<&Path>) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let Some(path) = once else { return };
+    if let Err(e) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+    {
+        tracing::warn!("cannot record that the store answered, so it may answer again: {e}");
+    }
+}
+
 pub async fn resolve(
     source: MasterPassword,
     store: &dyn MasterPasswordStore,
     prompt: &dyn PassphrasePrompt,
+    once: Option<&Path>,
 ) -> Result<(Zeroizing<Vec<u8>>, Source)> {
     // Nothing to resolve: the agent was told not to handle this secret at all.
     // Reachable when a running agent's config is changed under it — the helper
@@ -334,7 +345,22 @@ pub async fn resolve(
                 .into(),
         ));
     }
-    if source == MasterPassword::Keychain {
+    if source == MasterPassword::TouchId {
+        // Asked twice by one `lpass` means the first answer was refused, and
+        // the store holds only that one answer — so giving it again cannot
+        // help, and would cost another fingerprint for each turn of a loop
+        // that ends only at our timeout. Refused outright rather than falling
+        // through to the prompt: during `store-master-password` a password
+        // typed here would open the vault and be taken as proof that the
+        // *stored* one works, quietly keeping one that does not.
+        if store_already_answered(once) {
+            return Err(Error::ConfigInvalid(format!(
+                "{} has already given this `lpass` the stored master password once and it \
+                 was not accepted — run `lastpass-ssh-agent store-master-password` to \
+                 replace it",
+                store.name()
+            )));
+        }
         match store.get().await {
             // Nothing this agent stored can be over the cap, so a value that is
             // did not come from here. Refused rather than used, and checked on
@@ -347,6 +373,7 @@ pub async fn resolve(
             }
             Ok(Some(secret)) => {
                 tracing::debug!(source = store.name(), "master password resolved");
+                remember_store_answered(once);
                 return Ok((secret, Source::Store));
             }
             Ok(None) => tracing::info!(
@@ -366,16 +393,31 @@ pub async fn resolve(
     Ok((typed, Source::Prompt))
 }
 
-/// The store this platform has.
+/// Whether this platform's store could work at all, so `doctor` can say so
+/// rather than letting the first signature discover it.
 #[cfg(target_os = "macos")]
-pub fn default_store() -> std::sync::Arc<dyn MasterPasswordStore> {
-    std::sync::Arc::new(keychain::Keychain)
+pub fn store_available() -> bool {
+    enclave::available()
 }
 
-/// Nowhere to keep it, so `keychain` behaves as `prompt` — which config
+/// Nowhere to keep it, so nothing to check.
+#[cfg(not(target_os = "macos"))]
+pub const fn store_available() -> bool {
+    false
+}
+
+/// The store this platform has, keeping its state beside the socket.
+#[cfg(target_os = "macos")]
+pub fn default_store(socket: &Path) -> std::sync::Arc<dyn MasterPasswordStore> {
+    std::sync::Arc::new(enclave::SecureEnclave::new(crate::enclave::path_for(
+        socket,
+    )))
+}
+
+/// Nowhere to keep it, so `touchid` behaves as `prompt` — which config
 /// validation refuses to configure here anyway.
 #[cfg(not(target_os = "macos"))]
-pub fn default_store() -> std::sync::Arc<dyn MasterPasswordStore> {
+pub fn default_store(_socket: &Path) -> std::sync::Arc<dyn MasterPasswordStore> {
     std::sync::Arc::new(NoStore)
 }
 
@@ -645,7 +687,7 @@ mod tests {
     async fn a_stored_master_password_is_used_without_asking() {
         let store = FakeStore::holding(Ok(Some(b"from the keychain")));
         let prompt = FakePrompt::answering(b"typed");
-        let (secret, from) = resolve(MasterPassword::Keychain, &store, &prompt)
+        let (secret, from) = resolve(MasterPassword::TouchId, &store, &prompt, None)
             .await
             .unwrap();
         assert_eq!(&*secret, b"from the keychain");
@@ -659,7 +701,7 @@ mod tests {
         // behaves as `prompt` rather than refusing.
         let store = FakeStore::holding(Ok(None));
         let prompt = FakePrompt::answering(b"typed");
-        let (secret, from) = resolve(MasterPassword::Keychain, &store, &prompt)
+        let (secret, from) = resolve(MasterPassword::TouchId, &store, &prompt, None)
             .await
             .unwrap();
         assert_eq!(&*secret, b"typed");
@@ -673,7 +715,7 @@ mod tests {
         // secret is still reachable by typing it, so none of these refuse.
         let store = FakeStore::holding(Err("no biometry here"));
         let prompt = FakePrompt::answering(b"typed");
-        let (secret, _from) = resolve(MasterPassword::Keychain, &store, &prompt)
+        let (secret, _from) = resolve(MasterPassword::TouchId, &store, &prompt, None)
             .await
             .unwrap();
         assert_eq!(&*secret, b"typed");
@@ -684,7 +726,7 @@ mod tests {
     async fn the_prompt_source_never_looks_at_the_store() {
         let store = FakeStore::holding(Ok(Some(b"should not be read")));
         let prompt = FakePrompt::answering(b"typed");
-        let (secret, _from) = resolve(MasterPassword::Prompt, &store, &prompt)
+        let (secret, _from) = resolve(MasterPassword::Prompt, &store, &prompt, None)
             .await
             .unwrap();
         assert_eq!(&*secret, b"typed");
@@ -695,9 +737,78 @@ mod tests {
         // Handing lpass an empty password would be a wrong one, tried silently.
         let store = FakeStore::holding(Ok(None));
         let prompt = FakePrompt::refusing();
-        assert!(resolve(MasterPassword::Keychain, &store, &prompt)
+        assert!(resolve(MasterPassword::TouchId, &store, &prompt, None)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn the_store_answers_one_lpass_only_once() {
+        // lpass loops forever on a wrong password and cannot tell the helper it
+        // is retrying, so the second ask must not spend another fingerprint
+        // handing over the same rejected answer.
+        let dir = tempfile::tempdir().unwrap();
+        let once = dir.path().join("once");
+        let store = FakeStore::holding(Ok(Some(b"stored")));
+        let prompt = FakePrompt::answering(b"typed");
+
+        let (secret, from) = resolve(MasterPassword::TouchId, &store, &prompt, Some(&once))
+            .await
+            .unwrap();
+        assert_eq!(&*secret, b"stored");
+        assert_eq!(from, Source::Store);
+        assert!(once.exists(), "the first answer is recorded");
+
+        // And refuses outright rather than prompting: a password typed here
+        // would open the vault and be mistaken for proof that the stored one
+        // works, so `store-master-password` would keep one that does not.
+        let error = resolve(MasterPassword::TouchId, &store, &prompt, Some(&once))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("store-master-password"), "{error}");
+        assert_eq!(prompt.asked(), 0, "and does not ask instead");
+    }
+
+    #[tokio::test]
+    async fn a_store_with_nothing_in_it_leaves_the_prompt_free_to_retry() {
+        // Only an answer is remembered. With nothing stored the helper falls
+        // through to the prompt, and lpass asking again must reach the prompt
+        // again — a typo there is the user's to correct.
+        let dir = tempfile::tempdir().unwrap();
+        let once = dir.path().join("once");
+        let store = FakeStore::holding(Ok(None));
+        let prompt = FakePrompt::answering(b"typed");
+
+        for _ in 0..2 {
+            let (secret, from) = resolve(MasterPassword::TouchId, &store, &prompt, Some(&once))
+                .await
+                .unwrap();
+            assert_eq!(&*secret, b"typed");
+            assert_eq!(from, Source::Prompt);
+        }
+        assert!(
+            !once.exists(),
+            "nothing was answered, so nothing is recorded"
+        );
+        assert_eq!(prompt.asked(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unrecordable_answer_is_still_an_answer() {
+        // The guard is worth less than the password already in hand: if the
+        // marker cannot be written, say so and carry on rather than failing a
+        // signature over it.
+        let dir = tempfile::tempdir().unwrap();
+        let once = dir.path().join("no-such-directory").join("once");
+        let store = FakeStore::holding(Ok(Some(b"stored")));
+        let prompt = FakePrompt::answering(b"typed");
+
+        let (secret, from) = resolve(MasterPassword::TouchId, &store, &prompt, Some(&once))
+            .await
+            .unwrap();
+        assert_eq!(&*secret, b"stored");
+        assert_eq!(from, Source::Store);
     }
 
     #[tokio::test]
@@ -706,7 +817,9 @@ mod tests {
         // says now: "off" means this agent does not handle the master password.
         let store = FakeStore::holding(Ok(Some(b"stored")));
         let prompt = FakePrompt::answering(b"typed");
-        assert!(resolve(MasterPassword::Off, &store, &prompt).await.is_err());
+        assert!(resolve(MasterPassword::Off, &store, &prompt, None)
+            .await
+            .is_err());
         assert_eq!(prompt.asked(), 0, "and does not ask either");
     }
 
@@ -717,7 +830,7 @@ mod tests {
         static HUGE: &[u8] = &[b'x'; crate::passphrase::MAX_PASSPHRASE_BYTES + 1];
         let store = FakeStore::holding(Ok(Some(HUGE)));
         let prompt = FakePrompt::answering(b"typed");
-        let (secret, _from) = resolve(MasterPassword::Keychain, &store, &prompt)
+        let (secret, _from) = resolve(MasterPassword::TouchId, &store, &prompt, None)
             .await
             .unwrap();
         assert_eq!(&*secret, b"typed", "it asks instead");
@@ -725,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_store_that_will_not_take_it_fails_before_the_vault_is_touched() {
-        // A Keychain that refuses to write: there is nothing to check against
+        // A store that refuses to write: there is nothing to check against
         // the vault, and nothing to roll back either.
         let store = FakeStore {
             set_fails: true,
@@ -796,8 +909,13 @@ mod tests {
         // listening — so it is asserted here rather than assumed.
         assert!(NoStore.name().contains("no master password store"));
         // And the factory that hands one out, which otherwise only runs inside
-        // the helper process the CLI tests spawn.
-        assert!(!default_store().name().is_empty());
+        // the helper process the CLI tests spawn. `store_available` goes with
+        // it: off macOS it is the constant false, and on macOS it answers from
+        // the hardware, so all this can assert is that it answers.
+        assert!(!default_store(Path::new("/tmp/agent.sock"))
+            .name()
+            .is_empty());
+        let _: bool = store_available();
         assert!(NoStore.set(b"secret").await.is_err());
         assert!(NoStore.forget().await.is_err());
     }
@@ -805,7 +923,7 @@ mod tests {
     #[tokio::test]
     async fn without_a_platform_store_it_asks() {
         let prompt = FakePrompt::answering(b"typed");
-        let (secret, _from) = resolve(MasterPassword::Keychain, &NoStore, &prompt)
+        let (secret, _from) = resolve(MasterPassword::TouchId, &NoStore, &prompt, None)
             .await
             .unwrap();
         assert_eq!(&*secret, b"typed");

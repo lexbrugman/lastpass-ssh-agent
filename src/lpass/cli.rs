@@ -50,6 +50,50 @@ pub const ASKPASS_SIGNAL: &str = "lastpass-ssh-agent: master password supplied";
 /// correct answer typed there would otherwise certify a stored typo as working.
 pub const ASKPASS_FROM_STORE: &str = " (from store)";
 
+/// Names the file the helper touches once it has answered from the store.
+///
+/// Its path rather than its contents is what matters, and it holds nothing —
+/// so it travels in the environment beside the config path, which the helper
+/// already reads from there.
+pub const ASKPASS_ONCE_MARKER: &str = "LASTPASS_SSH_AGENT_ASKPASS_ONCE";
+
+/// A path unique to one `lpass` run, cleared at both ends by whoever owns it.
+///
+/// Not a lock and not a secret: it exists so a helper invoked twice by the same
+/// `lpass` can tell the second time from the first. Removing it on `Drop` as
+/// well as up front means every way out of `run` — including a timeout — leaves
+/// nothing behind for the next invocation to trip over.
+struct OnceMarker(Option<std::path::PathBuf>);
+
+impl OnceMarker {
+    /// Beside the askpass wrapper, which already lives in the agent's own
+    /// directory. Named for this process and this call, so two runs at once
+    /// cannot answer for each other.
+    fn beside(helper: Option<&std::path::PathBuf>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(helper.map(|helper| {
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut name = helper.as_os_str().to_os_string();
+            name.push(format!(".once.{}.{n}", std::process::id()));
+            let path = std::path::PathBuf::from(name);
+            let _ = std::fs::remove_file(&path);
+            path
+        }))
+    }
+
+    fn path(&self) -> Option<&std::path::Path> {
+        self.0.as_deref()
+    }
+}
+
+impl Drop for OnceMarker {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 impl LpassCli {
     pub const fn new(binary: PathBuf) -> Self {
         Self {
@@ -110,7 +154,7 @@ impl LpassCli {
         }
     }
 
-    fn command(&self, args: &[&str]) -> tokio::process::Command {
+    fn command(&self, args: &[&str], once: Option<&std::path::Path>) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.binary);
         cmd.args(args)
             .stdin(Stdio::null())
@@ -150,6 +194,19 @@ impl LpassCli {
             // agent was started with, and inherits no `--config`.
             cmd.env(ASKPASS_MARKER, config);
         }
+        // Where the helper records that it has already handed the stored
+        // password to *this* lpass. It asks again on a wrong password —
+        // `agent.c` loops forever and discards the "incorrect" text before the
+        // helper could ever see it — and the store would answer the same way
+        // every time, so without this the only end is our timeout, a
+        // fingerprint per turn until then.
+        //
+        // Beside the block above rather than inside it: there is a marker
+        // exactly when there is a helper, so nesting it would leave an arm no
+        // test on any platform could reach.
+        if let Some(once) = once {
+            cmd.env(ASKPASS_ONCE_MARKER, once);
+        }
         if let Some(seconds) = self.vault_unlock_timeout {
             cmd.env("LPASS_AGENT_TIMEOUT", seconds.to_string());
         }
@@ -161,7 +218,13 @@ impl LpassCli {
     }
 
     async fn run(&self, args: &[&str], max_bytes: usize) -> Result<CmdOutput, LpassError> {
-        let mut child = self.command(args).spawn().map_err(LpassError::Spawn)?;
+        // Cleared before the run as well as after it, so a marker some earlier
+        // crash left behind cannot make this invocation skip the store.
+        let once = OnceMarker::beside(self.askpass_helper.as_ref().map(|(helper, _)| helper));
+        let mut child = self
+            .command(args, once.path())
+            .spawn()
+            .map_err(LpassError::Spawn)?;
         let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
         let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
 

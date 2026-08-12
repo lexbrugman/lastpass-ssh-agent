@@ -51,14 +51,20 @@ What it **cannot** guarantee:
   refusal, socket `0600`, lpass environment allowlisted, `ssh_agent_lib` debug
   logging capped (its request dumps could contain a private key a client tried
   to add).
-- **Your master password**, specifically. By default the agent never sees it:
+- **Your master password**, specifically, and how far you take this is a
+  setting. By default (`master_password = "off"`) the agent never sees it:
   lpass's own pinentry is disabled, so a vault that has forgotten its key fails
-  the signature and you run `lpass login` yourself. Turning on
-  [`master_password`](#being-asked-for-the-master-password) trades that
-  away deliberately — it prompts for the master password and passes it to
-  `lpass` over a pipe, in a zeroizing buffer, never logged, written, cached, or
-  placed in argv or the environment. Leave the setting off (the default) and
-  none of that happens.
+  the signature and you run `lpass login` yourself.
+  [`"prompt"`](#being-asked-for-the-master-password) lets the agent ask and pass
+  it to `lpass` over a pipe, in a zeroizing buffer, never logged, never written
+  and never placed in argv or the environment.
+  [`"touchid"`](#keeping-it-behind-touch-id) goes further and is the only one
+  of the three that keeps the master password at rest: it is written to disk,
+  encrypted to a key held in this Mac's Secure Enclave that the system will not
+  use without your fingerprint. That is a deliberate trade of a stored secret
+  for a hardware-enforced gate, and worth reading that section before turning
+  it on. (Key *passphrases* are a separate setting with a store of its own —
+  see [`passphrase_fallback`](#keeping-the-passphrase-out-of-the-vault).)
 
 ## Install
 
@@ -186,7 +192,7 @@ vault scan) or tuning behavior:
 
 # Where the master password comes from when lpass has forgotten its key.
 # "off" (default) fails the signature; "prompt" asks you, any platform;
-# "keychain" (macOS) releases it on Touch ID, falling back to asking.
+# "touchid" (macOS) releases it on Touch ID, falling back to asking.
 # master_password = "off"
 
 # Shut the vault when the screen locks, not just the display. macOS only.
@@ -277,7 +283,7 @@ the setting below is for, and why the two are usually turned on together.
 ### Being asked for the master password
 
 ```toml
-master_password = "prompt"     # or "keychain" on macOS
+master_password = "prompt"     # or "touchid" on macOS
 ```
 
 `lpass` forgets its cached key on its own hourly timeout as readily as it does
@@ -290,7 +296,7 @@ handled.
 ### Keeping it behind Touch ID
 
 ```toml
-master_password = "keychain"     # macOS only
+master_password = "touchid"      # macOS only
 ```
 
 ```sh
@@ -303,17 +309,27 @@ stored credential, and setting it up proves the whole arrangement works rather
 than only that a password was typed.
 
 After that a locked vault costs a fingerprint instead of typing your master
-password. The item is created requiring **user presence**, so it is released
-only on Touch ID or your login password: something able to trigger signatures
-can make the prompt appear, but cannot answer it. That is the difference between
-this and simply storing the password — without the constraint, anything running
-as you could take the key to the whole vault silently.
+password. The password is encrypted to a key generated inside this Mac's
+**Secure Enclave**, which will not use that key until the fingerprint sensor
+says so. The enforcement is the system's, not this agent's: something able to
+trigger signatures can make the prompt appear, but cannot answer it, and copying
+the files away gains nothing because the key cannot leave the Enclave. That is
+the difference between this and simply storing the password — without the
+constraint, anything running as you could take the key to the whole vault
+silently.
+
+The Touch ID sheet says what it is for — *unlock your LastPass vault* — rather
+than appearing unexplained, so one you were not expecting is one you can refuse.
+
+The key is bound to the fingerprints enrolled when you set it up. Adding or
+removing one invalidates it by design, and the agent says so and falls back to
+asking until you run `store-master-password` again.
 
 Two things it does not change. The confirmation dialog still runs, separately
 and unchanged, naming the key, fingerprint, requester and host — Touch ID
 authorises opening the vault, never a signature. And until you have run
-`store-master-password`, or when biometry is unavailable, it behaves exactly
-like `"prompt"`.
+`store-master-password`, or on a Mac with no Secure Enclave, or whenever the
+fingerprint is declined, it behaves exactly like `"prompt"`.
 
 Deliberately a separate setting from `lock_on_screen_lock`, and deliberately not
 macOS-only: nothing about being asked for a password is platform-specific, and
@@ -358,10 +374,11 @@ keeping it in `.zshrc` as well and the two drifting apart.
 
 ```sh
 lastpass-ssh-agent start
-# it prints: SSH_AUTH_SOCK='...'; export SSH_AUTH_SOCK;
+# it logs where it is listening, then serves until stopped
 ```
 
-In another shell (or via `lastpass-ssh-agent env`):
+In another shell (`start` runs until stopped, so its output is a log rather
+than something to evaluate — `env` is what a shell reads):
 
 ```sh
 eval "$(lastpass-ssh-agent env)"

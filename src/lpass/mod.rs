@@ -1,6 +1,6 @@
 mod cli;
 
-pub use cli::{LpassCli, ASKPASS_FROM_STORE, ASKPASS_MARKER, ASKPASS_SIGNAL};
+pub use cli::{LpassCli, ASKPASS_FROM_STORE, ASKPASS_MARKER, ASKPASS_ONCE_MARKER, ASKPASS_SIGNAL};
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
