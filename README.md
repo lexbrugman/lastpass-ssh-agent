@@ -147,6 +147,12 @@ recompiles, where a release install unpacks a prebuilt binary. And
 when a new version is released, so a plain `brew upgrade` leaves a dev install
 sitting on the commit it was built from.
 
+On macOS a HEAD build also compiles a small Swift file — the part of
+`master_password = "touchid"` that only CryptoKit can do. Apple's Command Line
+Tools are enough for it; Xcode is not required. `xcode-select --install` if
+`swiftc` is missing. A release install compiles nothing, so none of this
+applies there, and Linux has no Swift in the build at all.
+
 `brew list --versions` shows `HEAD-<sha>` for a dev install, and `--version`
 reports the real commit either way, so it is always clear what is running.
 Switching tracks replaces the binary but not the running agent, so restart the
