@@ -45,6 +45,9 @@ impl Confirmer for TtyConfirmer {
                 if answered {
                     Decision::Approve
                 } else {
+                    // Said, not left silent: "denied" in the agent's log should
+                    // always have a line saying which kind of denial it was.
+                    tracing::info!("confirmation declined at the terminal, denying");
                     Decision::Deny
                 }
             }
@@ -151,11 +154,22 @@ mod tests {
         }
     }
 
+    /// Long enough that it can only expire if something is badly wrong.
+    ///
+    /// These cases are about what an answer *means*, never how quickly it
+    /// arrives — but an expired prompt denies, so a deadline tight enough to be
+    /// reached under load turns into a wrong-looking decision rather than a
+    /// timeout. The answer is read one byte per readiness wakeup, so the longest
+    /// of them needs sixty-odd round trips and is the first to feel a loaded
+    /// machine; that is what used to fail here, roughly one run in ten with a
+    /// second instrumented build running alongside.
+    const UNHURRIED: Duration = Duration::from_secs(120);
+
     /// Shared body for the plain answer cases, so each stays one line and still
     /// gets its own name and `cargo test` filter.
     async fn expect_decision(typed: &'static [u8], expected: Decision) {
         let (mut master, _keepalive, slave_path) = open_pty();
-        let confirmer = TtyConfirmer::with_tty(slave_path, Duration::from_secs(10));
+        let confirmer = TtyConfirmer::with_tty(slave_path, UNHURRIED);
         let answer = tokio::task::spawn_blocking(move || {
             answer_prompt(&mut master, typed);
             master
@@ -187,7 +201,7 @@ mod tests {
     /// As `expect_decision`, for a line built rather than written out.
     async fn expect_decision_for(typed: Vec<u8>, expected: Decision) {
         let (mut master, _keepalive, slave_path) = open_pty();
-        let confirmer = TtyConfirmer::with_tty(slave_path, Duration::from_secs(10));
+        let confirmer = TtyConfirmer::with_tty(slave_path, UNHURRIED);
         let answer = tokio::task::spawn_blocking(move || {
             answer_prompt(&mut master, &typed);
             master
@@ -277,8 +291,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_prompts_are_serialized_one_answer_each() {
         let (master, _keepalive, slave_path) = open_pty();
-        let confirmer =
-            std::sync::Arc::new(TtyConfirmer::with_tty(slave_path, Duration::from_secs(10)));
+        let confirmer = std::sync::Arc::new(TtyConfirmer::with_tty(slave_path, UNHURRIED));
         // Answer each prompt as it appears: input queued before a prompt is
         // discarded by design, and the second prompt only starts once the
         // first has been answered.

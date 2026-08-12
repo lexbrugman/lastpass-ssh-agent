@@ -43,7 +43,14 @@ impl Confirmer for AskpassConfirmer {
         };
         match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
             Ok(Ok(output)) if output.status.success() => Decision::Approve,
-            Ok(Ok(_)) => Decision::Deny,
+            Ok(Ok(output)) => {
+                // The convention gives one channel for both, so this cannot
+                // tell a refusal from a helper that failed to ask — the exit
+                // code is all there is, and it is worth logging.
+                tracing::info!(code = ?output.status.code(),
+                    "askpass helper did not approve, denying");
+                Decision::Deny
+            }
             Ok(Err(e)) => {
                 tracing::warn!("askpass helper failed, denying: {e}");
                 Decision::Deny

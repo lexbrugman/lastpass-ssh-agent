@@ -283,8 +283,12 @@ impl Session for LpassAgent {
             match self.confirmer.confirm(&ctx).await {
                 Decision::Approve => {}
                 Decision::Deny => {
+                    // Not "denied by user": a prompt that could not be shown
+                    // denies too, and claiming a refusal that never happened
+                    // sends whoever reads this looking in the wrong place. The
+                    // confirmer has just logged which it was.
                     tracing::info!(item = %entry.item_id, key = %entry.name,
-                        "signature DENIED by user");
+                        "signature denied");
                     return Err(AgentError::Failure);
                 }
             }

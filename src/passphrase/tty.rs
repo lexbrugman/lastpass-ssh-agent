@@ -216,6 +216,11 @@ mod tests {
     use std::path::Path;
     use std::time::Instant;
 
+    /// See `confirm::tty`'s equivalent: these cases are about the secret that
+    /// comes back, not about how fast it does, and an expired prompt reports a
+    /// cancellation that never happened.
+    const UNHURRIED: Duration = Duration::from_secs(120);
+
     fn request() -> PassphraseRequest {
         PassphraseRequest {
             key_name: "tty key".into(),
@@ -257,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn a_typed_line_is_returned_and_never_echoed() {
         let (mut master, keepalive, slave_path) = open_pty();
-        let prompt = TtyPrompt::with_tty(slave_path, Duration::from_secs(10));
+        let prompt = TtyPrompt::with_tty(slave_path, UNHURRIED);
         let typist = tokio::task::spawn_blocking(move || {
             answer_prompt(&mut master, b"correct horse\n");
             master
@@ -323,7 +328,7 @@ mod tests {
     #[tokio::test]
     async fn a_passphrase_may_contain_spaces_and_survives_verbatim() {
         let (mut master, _keepalive, slave_path) = open_pty();
-        let prompt = TtyPrompt::with_tty(slave_path, Duration::from_secs(10));
+        let prompt = TtyPrompt::with_tty(slave_path, UNHURRIED);
         let typist = tokio::task::spawn_blocking(move || {
             answer_prompt(&mut master, b"  leading and trailing  \n");
             master
@@ -338,7 +343,7 @@ mod tests {
         // Why no trailing-CR trim is needed: ICRNL is still in effect, so the
         // carriage return arrives as the newline that ends the line.
         let (mut master, _keepalive, slave_path) = open_pty();
-        let prompt = TtyPrompt::with_tty(slave_path, Duration::from_secs(10));
+        let prompt = TtyPrompt::with_tty(slave_path, UNHURRIED);
         let typist = tokio::task::spawn_blocking(move || {
             answer_prompt(&mut master, b"secret\r\n");
             master
@@ -394,11 +399,7 @@ mod tests {
         // type. The rest of the line must be consumed too, or it would answer
         // the next prompt.
         let (mut master, _keepalive, slave_path) = open_pty();
-        let prompt = std::sync::Arc::new(TtyPrompt::with_limit(
-            slave_path,
-            Duration::from_secs(10),
-            8,
-        ));
+        let prompt = std::sync::Arc::new(TtyPrompt::with_limit(slave_path, UNHURRIED, 8));
         let typist = tokio::task::spawn_blocking(move || {
             answer_prompt(&mut master, b"far too long to be accepted\n");
             answer_prompt(&mut master, b"short\n");
@@ -417,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn a_line_exactly_at_the_cap_is_accepted() {
         let (mut master, _keepalive, slave_path) = open_pty();
-        let prompt = TtyPrompt::with_limit(slave_path, Duration::from_secs(10), 8);
+        let prompt = TtyPrompt::with_limit(slave_path, UNHURRIED, 8);
         let typist = tokio::task::spawn_blocking(move || {
             answer_prompt(&mut master, b"12345678\n");
             master
@@ -457,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_entries_are_serialized_one_answer_each() {
         let (master, _keepalive, slave_path) = open_pty();
-        let prompt = std::sync::Arc::new(TtyPrompt::with_tty(slave_path, Duration::from_secs(10)));
+        let prompt = std::sync::Arc::new(TtyPrompt::with_tty(slave_path, UNHURRIED));
         let typist = tokio::task::spawn_blocking(move || {
             let mut master = master;
             answer_prompt(&mut master, b"first\n");
