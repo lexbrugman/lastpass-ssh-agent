@@ -57,11 +57,12 @@ pub fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
 ///
 /// The type is checked on the open file rather than on the path, and the open
 /// itself is non-blocking. Both matter. A FIFO opened for reading waits for a
-/// writer that may never come, and this runs on the single thread the agent
-/// serves every connection from, so one would wedge the whole agent — checking
-/// the path first and opening second leaves a window in which the answer can
-/// change between the two. `knownhosts::read_small` guards its own read the
-/// same way, and for the same reason.
+/// writer that may never come, and every caller here is a process that exists to
+/// do one thing, so one would hang that process outright with nothing left
+/// running to say why. Checking the path first and opening second leaves a
+/// window in which the answer can change between the two.
+/// `knownhosts::read_small` guards its own read the same way, and for the same
+/// reason.
 ///
 /// A symlink is refused outright, which is why `O_NOFOLLOW` is here as well.
 /// These are files the agent writes into its own directory, so a link at one of

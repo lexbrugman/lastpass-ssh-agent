@@ -25,9 +25,11 @@ pub struct HostNames {
 
 /// A few small files take microseconds, so anything near this is a filesystem
 /// that has stopped answering — `O_NONBLOCK` does not help for a regular file
-/// on a stalled mount. The names are worth less than the deadline: this is
-/// awaited under the one-signature-at-a-time gate, so a hung read without one
-/// would stall every later signature rather than letting it time out.
+/// on a stalled mount. The names are worth less than the deadline: without one a
+/// hung read leaves the client that asked waiting as long as the mount stays
+/// wedged, for a label on a prompt. Only that client — the lookup is awaited
+/// before the interaction gate is taken, so it holds nothing another signature
+/// needs.
 const LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Default for HostNames {
@@ -258,10 +260,10 @@ fn read_small(path: &Path) -> Option<String> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    // O_NONBLOCK, and the type read from the handle: a read-only open of a
-    // FIFO otherwise waits for a writer that never comes, and this runs under
-    // the one-signature gate, so anything but a file would wedge every later
-    // signature.
+    // O_NONBLOCK, and the type read from the handle: a read-only open of a FIFO
+    // otherwise waits for a writer that never comes, stranding the blocking-pool
+    // thread it runs on for good — `LOOKUP_DEADLINE` frees the request that
+    // asked, never the thread underneath it.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -491,9 +493,9 @@ mod tests {
     #[test]
     fn a_known_hosts_that_is_not_a_file_is_ignored_rather_than_waited_on() {
         // A FIFO would block a read-only open until a writer showed up, and
-        // this runs while the one-signature-at-a-time gate is held: every
-        // later signature would stall rather than time out. Reaching the
-        // assertion at all is the test.
+        // `LOOKUP_DEADLINE` frees the request but never the thread — so the open
+        // must never be allowed to wait. Reaching the assertion at all is the
+        // test.
         use std::os::unix::ffi::OsStrExt as _;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("known_hosts");

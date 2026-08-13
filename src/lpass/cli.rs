@@ -118,9 +118,11 @@ impl LpassCli {
     /// Let lpass ask for the master password by running `helper`, which is this
     /// binary, with the config the agent was started from.
     ///
-    /// Only the long-running agent sets this. The one-shot commands have a
-    /// terminal of their own, and `lpass` prompting there directly is better
-    /// than a dialog appearing over it.
+    /// Only the long-running agent sets this, and nothing else can: `command`
+    /// withholds an inherited one, so a helper named here is the only one lpass
+    /// ever runs. A one-shot command has nowhere to put such a prompt anyway, so
+    /// a locked vault fails there in lpass's own words — the right answer for a
+    /// command that runs and exits.
     /// `prompt_timeout` is added to the command timeout, because the answer now
     /// arrives at human speed: without it a prompt left open longer than
     /// `DEFAULT_TIMEOUT` would kill the lpass call that opened it, and any
@@ -167,6 +169,16 @@ impl LpassCli {
         // environment should leak into it.
         for (key, value) in std::env::vars_os() {
             let name = key.to_string_lossy();
+            // Withheld rather than forwarded, unlike every other `LPASS_`: lpass
+            // consults it before `LPASS_DISABLE_PINENTRY` can rule a prompt out,
+            // so an inherited one opens somebody else's prompt from inside a
+            // fetch — outside the interaction gate, and against a timeout with
+            // no allowance for a human. Only `askpass_helper` may name one,
+            // which leaves `master_password` deciding whether this agent handles
+            // that secret at all.
+            if name.as_ref() == "LPASS_ASKPASS" {
+                continue;
+            }
             let pass = matches!(
                 name.as_ref(),
                 "HOME" | "PATH" | "TMPDIR" | "LANG" | "LC_ALL"
@@ -760,6 +772,11 @@ done"#,
     async fn without_a_helper_lpass_is_told_of_none() {
         // Not asked for, so not installed: lpass falls back to the stdin path
         // that fails fast instead of blocking on a prompt nobody can answer.
+        //
+        // Exported into this process first: with nothing set, the assertion
+        // holds on any machine and proves nothing. Safe to leave behind only
+        // because of the rule under test — no lpass call sees this variable.
+        std::env::set_var("LPASS_ASKPASS", "/nonexistent/inherited-askpass");
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_lpass(dir.path(), r#"printf '[%s]' "$LPASS_ASKPASS""#);
         let client = LpassCli::new(bin).asking_with(
