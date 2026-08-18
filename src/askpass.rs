@@ -272,8 +272,9 @@ impl MasterPasswordStore for NoStore {
 
 /// Where a resolved master password actually came from.
 ///
-/// The difference matters to setup and nowhere else: a password typed at the
-/// fallback prompt proves nothing about what is stored.
+/// The difference matters to setup, which trusts only the store's own answer — a
+/// password typed at the fallback prompt proves nothing about what is stored —
+/// and to the agent's log, which names whichever one answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     Store,

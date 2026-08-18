@@ -278,10 +278,21 @@ impl LpassCli {
         // push the signal out of the window and lose the record entirely.
         //
         // The agent never sees the prompt itself — it happens inside a process
-        // lpass spawned — so without this, the one moment it handles a master
+        // lpass spawned — so without this, the moments it handles a master
         // password would pass unrecorded.
-        if diagnostics.contains(ASKPASS_SIGNAL) {
-            if diagnostics.contains(ASKPASS_FROM_STORE) {
+        //
+        // Per line rather than a search over the whole diagnostic, because lpass
+        // asks again after a wrong password: one run can hand over more than one,
+        // and each line says for itself which source answered. `store` is a
+        // secret at rest being released, which should have cost a fingerprint —
+        // one of those while nobody was at the machine is worth chasing — where
+        // `prompt` is somebody having typed it.
+        for line in diagnostics
+            .lines()
+            .filter(|line| line.contains(ASKPASS_SIGNAL))
+        {
+            let from_store = line.contains(ASKPASS_FROM_STORE);
+            if from_store {
                 self.master_password_from_store
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -289,7 +300,10 @@ impl LpassCli {
             // handed the password over, which is before lpass has judged it, so
             // claiming the vault reopened would announce a success that a typo
             // is about to turn into a failure.
-            tracing::info!("a master password was supplied to lpass through this agent's prompt");
+            tracing::info!(
+                source = if from_store { "store" } else { "prompt" },
+                "a master password was supplied to lpass through this agent"
+            );
         }
         // Our own line, dropped before `classify` sees any of this: it would
         // otherwise spend part of the 300-character window, and pushing lpass's
@@ -823,6 +837,26 @@ done"#,
         let client = LpassCli::new(bin);
         client.show_field("42", "x").await.unwrap();
         assert!(!client.master_password_came_from_store());
+    }
+
+    #[tokio::test]
+    async fn a_run_that_supplies_twice_reports_each_line() {
+        // lpass asks again after a password it did not accept, so one run can
+        // hand over more than one. Whether the store answered at all is what
+        // setup turns on, whichever order the two arrive in.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(
+            dir.path(),
+            &format!(
+                "echo '{}' >&2; echo '{}{}' >&2; printf 'v'",
+                super::ASKPASS_SIGNAL,
+                super::ASKPASS_SIGNAL,
+                super::ASKPASS_FROM_STORE
+            ),
+        );
+        let client = LpassCli::new(bin);
+        client.show_field("42", "x").await.unwrap();
+        assert!(client.master_password_came_from_store());
     }
 
     #[tokio::test]
