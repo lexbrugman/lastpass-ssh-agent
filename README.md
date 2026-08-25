@@ -156,8 +156,8 @@ applies there, and Linux has no Swift in the build at all.
 `brew list --versions` shows `HEAD-<sha>` for a dev install, and `--version`
 reports the real commit either way, so it is always clear what is running.
 Switching tracks replaces the binary but not the running agent, so restart the
-service afterwards; saved Keychain passphrases are keyed by key fingerprint and
-are unaffected. A config using a dev-only setting will stop an older release
+service afterwards; saved passphrases are keyed by key fingerprint and are
+unaffected. A config using a dev-only setting will stop an older release
 from starting at all, since unknown values are rejected rather than ignored.
 
 ## Setup
@@ -191,7 +191,8 @@ vault scan) or tuning behavior:
 
 # Where an encrypted key's passphrase comes from when the item's own
 # Passphrase field is empty. "prompt" (default) asks you every time;
-# "keychain" (macOS) asks once and remembers; "error" refuses to sign.
+# "keychain" (macOS) and "secretservice" (Linux) ask once and remember;
+# "error" refuses to sign.
 # passphrase_fallback = "prompt"
 
 # How long the vault stays unlocked once lpass has derived its key. Unset
@@ -203,7 +204,8 @@ vault scan) or tuning behavior:
 # "touchid" (macOS) releases it on Touch ID, falling back to asking.
 # master_password = "off"
 
-# Shut the vault when the screen locks, not just the display. macOS only.
+# Shut the vault when the screen locks, not just the display. macOS and
+# Linux (through logind's LockedHint).
 # lock_on_screen_lock = false
 
 # Pin items (disables auto-discovery); `search` prints these snippets.
@@ -232,28 +234,35 @@ prompts does not mean you cannot be reached. Set
 `passphrase_fallback = "error"` if an encrypted key with an empty `Passphrase`
 field should simply refuse to sign instead.
 
-On macOS, `passphrase_fallback = "keychain"` asks once and remembers the
-answer, so the separation costs one prompt per key rather than one per
-session:
+The agent can also remember the answer, so the separation costs one prompt per
+key rather than one per session. Each platform has its own store, and each name
+is accepted only where it works — rejected at startup elsewhere, rather than
+silently doing nothing:
 
 ```toml
-passphrase_fallback = "keychain"
+passphrase_fallback = "keychain"       # macOS: the login keychain
+passphrase_fallback = "secretservice"  # Linux: gnome-keyring, KWallet, KeePassXC
 ```
 
 Neither store then holds both halves, so compromising one alone yields nothing
-usable. Each key gets its own generic-password entry under the service
-`lastpass-ssh-agent`, keyed by the key's SHA-256 fingerprint — so renaming or
-recreating the vault item still finds the passphrase, several keys are
-remembered independently, and deleting one entry in Keychain Access revokes just
-that key.
+usable. Each key gets its own entry under the service `lastpass-ssh-agent`,
+keyed by the key's SHA-256 fingerprint — so renaming or recreating the vault item
+still finds the passphrase, several keys are remembered independently, and
+deleting one entry in Keychain Access or Seahorse revokes just that key.
 
 A passphrase is stored only *after* it has decrypted the key, so a typo never
 becomes a stored credential, and one that stops working prompts for a
-correction rather than locking the key. The entry takes the login keychain's
-ordinary protection, deliberately without a per-signature authorization dialog
-on top of the agent's own confirmation.
+correction rather than locking the key. The entry takes the surrounding store's
+ordinary protection — the login keychain's, or the desktop collection's —
+deliberately without a per-signature authorization dialog on top of the agent's
+own confirmation.
 
-This mode is macOS-only and rejected at startup elsewhere.
+On Linux this speaks `org.freedesktop.secrets`, so whichever of gnome-keyring,
+KWallet or KeePassXC is running will answer; the secret is encrypted for the
+session rather than crossing the bus in the clear. It needs a session bus and a
+collection that can be unlocked, which a headless `ssh` login has neither of —
+there the agent simply asks you for the passphrase instead, the same as it does
+when a store cannot be read for any other reason.
 
 Two properties are what stop a local prompt from becoming a way around the
 vault:
@@ -263,8 +272,8 @@ vault:
   otherwise anything able to draw a dialog could override a passphrase you
   pinned in the vault.
 - Nothing is cached, in any mode. Each signature fetches the key, resolves the
-  passphrase, decrypts, signs, and wipes both. The Keychain is a passphrase
-  store, not a key store.
+  passphrase, decrypts, signs, and wipes both. These are passphrase stores, not
+  key stores.
 
 ### Locking the vault with the screen
 
@@ -282,8 +291,16 @@ it locks. The LastPass *session* survives, so the way back is your master
 password, not a fresh login with a second factor — and you are not asked for it
 on unlock, only when a signature actually needs the vault again.
 
-macOS only, and refused at startup elsewhere: reading the screen's lock state is
-the one part of this a platform has to provide, and only macOS does so far.
+Reading the screen's lock state is the one part of this a platform has to
+provide, and two do: macOS through its window server, Linux through logind's
+`LockedHint`. Elsewhere the setting is refused at startup rather than ignored.
+
+The Linux side is only as good as the desktop's reporting: GNOME and KDE both
+set `LockedHint` when they lock, but a session that never sets it looks
+permanently unlocked and nothing here can tell that apart from a screen nobody
+has locked. There is also nothing to read without logind — a container, or a
+plain `ssh` login — and the agent then logs that it is not watching instead of
+pretending to.
 
 On its own, though, a lock costs you a failed `ssh` afterwards — which is what
 the setting below is for, and why the two are usually turned on together.
@@ -642,6 +659,12 @@ incompatible copies of a crate in one binary, and cargo either fails to resolve
 or compiles against the wrong traits. They lift together, once `ssh-agent-lib`
 ships on `ssh-key` 0.7+ — which is also what would retire the `rsa` advisory
 below, since `rsa` 0.10 arrives with the same wave.
+
+**`zbus` tracks `secret-service`** for the same kind of reason, on Linux only.
+`secret-service` is the passphrase store and depends on `zbus ^5`; `zbus` is
+declared directly on top of it purely to read one property off logind. Two zbus
+majors in one binary would each open a bus connection of their own, so the two
+entries move as a pair.
 
 Renovate targets `dev` (`"baseBranchPatterns"`), not `master`. That matters
 here: every merge to `master` publishes a release, so pointing it at `master`

@@ -35,6 +35,12 @@ pub enum PassphraseFallback {
     /// Remember it in the macOS Keychain, asking only when it is not there
     /// yet — or no longer works. macOS only; rejected at load elsewhere.
     Keychain,
+    /// The same, in whichever secret service the desktop runs — gnome-keyring,
+    /// `KWallet`, `KeePassXC`. Needs a session bus and a collection that can be
+    /// unlocked, so a headless login falls back to asking. Linux only; rejected
+    /// at load elsewhere.
+    #[serde(rename = "secretservice")]
+    SecretService,
 }
 
 /// Where the vault's master password comes from when `lpass` has forgotten the
@@ -256,13 +262,20 @@ impl Config {
         // thing to write in a config shared between machines and deserves an
         // answer naming the platform.
         //
-        // Compiled out on macOS, where it could only ever be false. A runtime
-        // `cfg!` would leave a branch no test on either platform can take,
-        // which the coverage gate refuses.
+        // Each check is compiled out on the platform that supports the mode,
+        // where it could only ever be false. A runtime `cfg!` would leave a
+        // branch no test on either platform can take, which the coverage gate
+        // refuses.
         #[cfg(not(target_os = "macos"))]
-        if self.uses_keychain() {
+        if self.uses_fallback(PassphraseFallback::Keychain) {
             return Err(Error::ConfigInvalid(
                 "passphrase_fallback = \"keychain\" is only supported on macOS".into(),
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        if self.uses_fallback(PassphraseFallback::SecretService) {
+            return Err(Error::ConfigInvalid(
+                "passphrase_fallback = \"secretservice\" is only supported on Linux".into(),
             ));
         }
         #[cfg(not(target_os = "macos"))]
@@ -273,24 +286,28 @@ impl Config {
         }
         // Same treatment, and for the same reason: reading the screen's lock
         // state is the one part of that feature a platform has to provide, and
-        // only macOS does so far. Refused at load rather than ignored, since a
-        // setting silently doing nothing is worse than one that says so.
-        #[cfg(not(target_os = "macos"))]
+        // macOS and Linux are the two that do. Refused at load rather than
+        // ignored, since a setting silently doing nothing is worse than one that
+        // says so.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         if self.lock_on_screen_lock {
             return Err(Error::ConfigInvalid(
-                "lock_on_screen_lock is only supported on macOS".into(),
+                "lock_on_screen_lock is only supported on macOS and Linux".into(),
             ));
         }
         Ok(())
     }
 
-    /// Whether any key would actually reach for the Keychain.
-    #[cfg(not(target_os = "macos"))]
-    fn uses_keychain(&self) -> bool {
+    /// Whether any key would actually reach for one particular fallback.
+    ///
+    /// Portable, though each caller is behind a `cfg`: macOS asks about the
+    /// secret service and Linux about the Keychain, so both platforms compile
+    /// and exercise it.
+    fn uses_fallback(&self, wanted: PassphraseFallback) -> bool {
         // With no [[keys]] the agent discovers items and every one of them
         // inherits the global setting, so that setting decides on its own.
         if self.keys.is_empty() {
-            return self.passphrase_fallback == PassphraseFallback::Keychain;
+            return self.passphrase_fallback == wanted;
         }
         // Otherwise only the effective per-key values matter: a global value
         // every key overrides is never used, and rejecting a config for
@@ -298,7 +315,7 @@ impl Config {
         // replace rather than cap each other.
         self.keys
             .iter()
-            .any(|key| self.passphrase_fallback(key) == PassphraseFallback::Keychain)
+            .any(|key| self.passphrase_fallback(key) == wanted)
     }
 
     /// Resolved socket path (config override or platform default).
@@ -591,23 +608,28 @@ id = "1"
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn lock_on_screen_lock_is_accepted_here() {
         assert!(
             parse("lock_on_screen_lock = true")
                 .unwrap()
                 .lock_on_screen_lock
         );
+        // and the default is off, so an ordinary config never watches
+        assert!(!parse("").unwrap().lock_on_screen_lock);
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn lock_on_screen_lock_is_refused_here_with_a_reason() {
         // Reading the screen's lock state is the one part a platform has to
-        // provide, and only macOS does. Refused at load, named in the message.
+        // provide: macOS through its window server, Linux through logind.
+        // Refused at load elsewhere, named in the message.
         let error = parse("lock_on_screen_lock = true").unwrap_err().to_string();
-        assert!(error.contains("only supported on macOS"), "{error}");
-        // and the default is off everywhere, so an ordinary config is fine
+        assert!(
+            error.contains("only supported on macOS and Linux"),
+            "{error}"
+        );
         assert!(!parse("").unwrap().lock_on_screen_lock);
     }
 
@@ -638,6 +660,40 @@ id = "1"
         // not grounds for refusing the config.
         assert!(parse(
             "passphrase_fallback = \"keychain\"\n\
+             [[keys]]\nid = \"1\"\npassphrase_fallback = \"prompt\"\n\
+             [[keys]]\nid = \"2\"\npassphrase_fallback = \"error\""
+        )
+        .is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_secret_service_is_accepted_here() {
+        let config = parse("passphrase_fallback = \"secretservice\"").unwrap();
+        assert_eq!(
+            config.passphrase_fallback,
+            PassphraseFallback::SecretService
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn the_secret_service_is_refused_here_with_a_reason() {
+        // The same shape as the Keychain's check, so the two modes cannot drift
+        // apart: globally, per key, and per key over a global this platform can
+        // do.
+        for text in [
+            "passphrase_fallback = \"secretservice\"",
+            "passphrase_fallback = \"secretservice\"\n[[keys]]\nid = \"1\"",
+            "[[keys]]\nid = \"1\"\npassphrase_fallback = \"secretservice\"",
+            "passphrase_fallback = \"prompt\"\n[[keys]]\nid = \"1\"\npassphrase_fallback = \"secretservice\"",
+        ] {
+            let error = parse(text).unwrap_err().to_string();
+            assert!(error.contains("only supported on Linux"), "{text}: {error}");
+        }
+        // and a global value every pinned key overrides is never reached
+        assert!(parse(
+            "passphrase_fallback = \"secretservice\"\n\
              [[keys]]\nid = \"1\"\npassphrase_fallback = \"prompt\"\n\
              [[keys]]\nid = \"2\"\npassphrase_fallback = \"error\""
         )

@@ -19,6 +19,10 @@ mod askpass;
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod keychain;
 mod osascript;
+// Not excluded as a whole: only the two calls that reach the bus are, and what
+// identifies a stored item is decided and tested beside them.
+#[cfg(target_os = "linux")]
+mod secretservice;
 mod tty;
 
 pub use askpass::AskpassPrompt;
@@ -209,10 +213,10 @@ pub trait PassphrasePrompt: Send + Sync {
 /// Holds *only* passphrases, so the second signature need not ask again. The
 /// private key never goes near it and stays fetched per signature.
 ///
-/// Portable on purpose, though the Keychain is the only implementation: it is
-/// what keeps the rules around it — prefer the vault, verify before saving,
-/// re-ask when a saved passphrase stops working — testable on any platform,
-/// leaving only the calls into Apple's API behind a `cfg`.
+/// Portable on purpose: it is what keeps the rules around it — prefer the vault,
+/// verify before saving, re-ask when a saved passphrase stops working — testable
+/// on any platform, leaving only the calls into the Keychain or onto the bus
+/// behind a `cfg`.
 #[async_trait::async_trait]
 pub trait PassphraseStore: Send + Sync {
     /// How a log line names this store — "the macOS Keychain". A line saying a
@@ -295,7 +299,12 @@ impl Unlocker {
                 let typed = self.ask(entry, gate).await?;
                 decrypt(encrypted, &typed)
             }
-            PassphraseFallback::Keychain => self.unlock_from_store(entry, encrypted, gate).await,
+            // One path for both: which store a platform has is `default_store`'s
+            // business, and config validation has already refused the name that
+            // does not belong here.
+            PassphraseFallback::Keychain | PassphraseFallback::SecretService => {
+                self.unlock_from_store(entry, encrypted, gate).await
+            }
         }
     }
 
@@ -330,11 +339,13 @@ impl Unlocker {
         encrypted: &ssh_key::PrivateKey,
         gate: &mut crate::interaction::InteractionGate,
     ) -> Result<ssh_key::PrivateKey, String> {
-        // Before the read, not just before the prompt: a locked Keychain puts a
-        // system dialog on screen and waits (see `crate::apple::blocking`), so the
-        // read is itself an interaction. Outside the gate it could share the
-        // screen with another request's confirmation, and two requests missing
-        // at once would queue duplicate passphrase prompts behind it.
+        // Before the read, not just before the prompt: a locked store puts a
+        // system dialog on screen and waits — the Keychain through
+        // `crate::apple::blocking`, a secret-service collection when it is
+        // unlocked — so the read is itself an interaction. Outside the gate it
+        // could share the screen with another request's confirmation, and two
+        // requests missing at once would queue duplicate passphrase prompts
+        // behind it.
         gate.enter().await;
         let fingerprint = entry.fingerprint();
         match self.store.get(&fingerprint).await {
@@ -405,21 +416,27 @@ fn default_store() -> std::sync::Arc<dyn PassphraseStore> {
     std::sync::Arc::new(keychain::Keychain)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn default_store() -> std::sync::Arc<dyn PassphraseStore> {
+    std::sync::Arc::new(secretservice::SecretServiceStore)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn default_store() -> std::sync::Arc<dyn PassphraseStore> {
     std::sync::Arc::new(NoStore)
 }
 
-/// There is nowhere to save a passphrase off macOS.
+/// There is nowhere to save a passphrase on a platform with neither a Keychain
+/// nor a secret service.
 ///
-/// A running agent never reaches this: `passphrase_fallback = "keychain"` is
-/// refused at config load on these platforms. It exists because an unreadable
-/// store already means "ask instead", so the portable rules stay honest here
-/// rather than depending on a store that cannot fail.
-#[cfg(not(target_os = "macos"))]
+/// A running agent never reaches this: both store modes are refused at config
+/// load on these platforms. It exists because an unreadable store already means
+/// "ask instead", so the portable rules stay honest here rather than depending
+/// on a store that cannot fail.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 struct NoStore;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[async_trait::async_trait]
 impl PassphraseStore for NoStore {
     fn name(&self) -> &'static str {
@@ -692,6 +709,7 @@ mod tests {
             PassphraseFallback::Prompt,
             PassphraseFallback::Error,
             PassphraseFallback::Keychain,
+            PassphraseFallback::SecretService,
         ] {
             let prompt = FakePrompt::answering(WRONG);
             let store = FakeStore::holding(WRONG);
@@ -710,7 +728,11 @@ mod tests {
     async fn a_wrong_field_fails_without_reaching_any_fallback() {
         // Fallback happens on absence, never on failure. Otherwise a local
         // prompt or a planted store entry could override what the vault pins.
-        for fallback in [PassphraseFallback::Prompt, PassphraseFallback::Keychain] {
+        for fallback in [
+            PassphraseFallback::Prompt,
+            PassphraseFallback::Keychain,
+            PassphraseFallback::SecretService,
+        ] {
             let prompt = FakePrompt::answering(RIGHT);
             let store = FakeStore::holding(RIGHT);
             let unlocker = unlocker(vault_holding(WRONG), prompt.clone(), store.clone());
@@ -1129,12 +1151,14 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[tokio::test]
     async fn without_a_platform_store_keychain_mode_falls_back_to_asking() {
-        // Config validation refuses this mode off macOS, so a running agent
-        // never gets here — but the default store must still behave, and an
-        // unreadable one means "ask".
+        // Config validation refuses the store modes on a platform with neither a
+        // Keychain nor a secret service, so a running agent never gets here —
+        // but the default store must still behave, and an unreadable one means
+        // "ask". Not run where a real store exists: `Unlocker::new` would reach
+        // it, and the suite must never touch the store of whoever runs it.
         let prompt = FakePrompt::answering(RIGHT);
         let unlocker = Unlocker::new(Arc::new(empty_field()), prompt.clone());
         let key = unlocker

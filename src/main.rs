@@ -22,6 +22,12 @@ mod interaction;
 mod keychain;
 mod keystore;
 mod knownhosts;
+// Excluded from coverage, and kept small for it: every line talks to the system
+// bus of whoever runs the tests. What an answer means is `vaultlock`'s business,
+// and covered there on every platform.
+#[cfg(target_os = "linux")]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod logind;
 mod lpass;
 mod passphrase;
 mod platform;
@@ -409,7 +415,7 @@ async fn start(config_path: &Path) -> Result<()> {
     // unconditionally, because whether to watch at all is `watch`'s decision.
     tokio::task::spawn(vaultlock::watch(
         config.lock_on_screen_lock,
-        Arc::new(platform::screen_is_locked),
+        Arc::new(platform::SessionScreen),
         Arc::new(lpass::LpassAgentProcess),
         vaultlock::POLL_INTERVAL,
     ));

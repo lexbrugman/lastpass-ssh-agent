@@ -82,19 +82,38 @@ pub fn default_socket_path() -> Option<PathBuf> {
     default_socket_dir().map(|d| d.join("agent.sock"))
 }
 
-/// Whether the login session's screen is locked right now, when the platform
-/// can say at all.
+/// The login session's screen, as this platform can see it.
 ///
-/// `None` means "no answer available here" rather than "unlocked", and the
-/// caller treats it as a reason to stop asking rather than as a state. Keeping
-/// the two apart is what lets the watcher that calls it be one portable piece of
-/// logic with no `cfg` in it.
-///
-/// This is the entire platform surface of the screen-lock feature: a value to
-/// look up, with every decision taken by portable code around it.
+/// This is the entire platform surface of the screen-lock feature: one value to
+/// look up, with every decision about what it means taken by `vaultlock`.
+pub struct SessionScreen;
+
+#[async_trait::async_trait]
+impl crate::vaultlock::ScreenLock for SessionScreen {
+    async fn is_locked(&self) -> Option<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            session_dictionary_says_locked()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            crate::logind::locked_hint().await
+        }
+        // No way to ask here, so nothing watches. Config validation refuses
+        // `lock_on_screen_lock` on these platforms, so a running agent never
+        // reaches this.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+}
+
+/// What `CGSessionCopyCurrentDictionary` says about the screen, if it says
+/// anything.
 #[cfg(target_os = "macos")]
 #[cfg_attr(coverage_nightly, coverage(off))]
-pub fn screen_is_locked() -> Option<bool> {
+fn session_dictionary_says_locked() -> Option<bool> {
     use core_foundation::base::{CFType, TCFType as _};
     use core_foundation::boolean::CFBoolean;
     use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
@@ -125,13 +144,6 @@ pub fn screen_is_locked() -> Option<bool> {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGSessionCopyCurrentDictionary() -> core_foundation::dictionary::CFDictionaryRef;
-}
-
-/// No way to ask on this platform, so nothing watches. Config validation
-/// refuses `lock_on_screen_lock` here, so a running agent never calls it.
-#[cfg(not(target_os = "macos"))]
-pub const fn screen_is_locked() -> Option<bool> {
-    None
 }
 
 #[cfg(test)]
@@ -176,12 +188,13 @@ mod tests {
         assert_eq!(socket_dir_from(None, None), None);
     }
 
-    #[test]
-    fn the_lock_state_is_either_an_answer_or_unavailable() {
+    #[tokio::test]
+    async fn the_lock_state_is_either_an_answer_or_unavailable() {
         // Both outcomes are correct: a platform that cannot say returns None,
         // and one that can answers without failing. The point is that asking
         // is always safe — the watcher decides what the answer means.
-        let _ = screen_is_locked();
+        use crate::vaultlock::ScreenLock as _;
+        let _ = SessionScreen.is_locked().await;
     }
 
     #[test]
