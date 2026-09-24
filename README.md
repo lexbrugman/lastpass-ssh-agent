@@ -17,8 +17,9 @@ What this agent **guarantees**:
   over a pipe, parsed in memory, used for one signature, and zeroized. It is
   never written to disk, never passed through a shell, argv, or environment.
 - **No caching.** There is deliberately no private-key cache. Each signature
-  is a fresh fetch (public keys and item metadata are cached for the agent's
-  lifetime — they are not secrets).
+  is a fresh fetch. (Public keys and item metadata are written down beside the
+  socket between starts — they are not secrets; see [Starting without the
+  vault](#starting-without-the-vault).)
 - **User-visible signing.** By default every signature asks first — a native
   dialog on macOS, a `/dev/tty` prompt on Linux — naming the key and the
   requesting process, with *Deny* as the default and cancel button. Timeouts,
@@ -418,6 +419,25 @@ not need a restart. (With
 [`master_password`](#being-asked-for-the-master-password) set, a vault
 that has only forgotten its key prompts you instead of failing; a real logout
 still needs `lpass login`.)
+
+### Starting without the vault
+
+The agent writes the identities it serves — item ids, names and public keys,
+nothing secret — to `agent.sock.identities` beside the socket. The next start
+reads that instead of the vault, so it binds at once whether the vault is open
+or not, and the vault is opened only when a signature needs it. That is also
+what makes a short `vault_unlock_timeout_secs` mean what it looks like: nothing
+but signing touches the vault.
+
+After a signature succeeds the agent refreshes its set and the file in the
+background, at most once an hour — so a key added to the vault appears on the
+first signature that falls outside that hour, without a restart. A start does
+the same if the vault is open at the time. A new key cannot announce itself, so
+if nothing is signing with an existing key and the vault is locked: unlock it,
+run `list`, which rewrites the file, and restart. A running agent keeps its own
+set until its next refresh. A signature that finds the vault contradicting the file — a key
+rotated inside its item, or the item gone — discards it, and the next start reads
+the vault again. `doctor` reports what is written down.
 
 ### Start automatically
 

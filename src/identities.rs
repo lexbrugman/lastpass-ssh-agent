@@ -93,6 +93,24 @@ pub fn remove(path: &Path) -> Result<()> {
     }
 }
 
+/// Write them down if that can be done, and say so if not. For the callers that
+/// must go on either way: a start that cannot write beside its own socket still
+/// serves, and a refresh that cannot is still a refresh of what is served.
+pub fn save_best_effort(path: &Path, remembered: &Remembered) {
+    save(path, remembered).unwrap_or_else(could_not_save);
+}
+
+/// Writing beside a socket that is bound cannot fail in practice, so the edge
+/// is excluded from coverage rather than pretended testable.
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "by value is what unwrap_or_else hands a function"
+)]
+fn could_not_save(e: Error) {
+    tracing::warn!("could not write the identities down for the next start: {e}");
+}
+
 /// Serialising three strings per key cannot fail for a value this code built,
 /// so the edge is excluded from coverage rather than pretended testable.
 #[cfg_attr(coverage_nightly, coverage(off))]

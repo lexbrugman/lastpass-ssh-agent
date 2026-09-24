@@ -457,6 +457,61 @@ async fn a_second_start_with_pinned_keys_needs_no_vault_call() {
 }
 
 #[tokio::test]
+async fn a_second_start_with_auto_discovery_needs_no_vault_call_either() {
+    // Discovery is the expensive scan; the file spares the second start all of
+    // it — `ls`, every probe, every public key — and an lpass that answers
+    // nothing at all proves it.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let script = write_fake_lpass(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "socket = \"{}\"\nconfirm = \"off\"\nlpass_path = \"{}\"\n",
+            socket.display(),
+            script.display()
+        ),
+    )
+    .unwrap();
+
+    let first = spawn_agent(&config_path, &socket);
+    wait_for_socket(&socket, true, "first start never bound the socket");
+    assert_eq!(served_identities(&socket).await, 2);
+    drop(first);
+    wait_for_socket(&socket, false, "the first agent never unlinked its socket");
+
+    std::fs::write(dir.path().join("lpass"), "#!/bin/sh\nexit 1\n").unwrap();
+    let second = spawn_agent(&config_path, &socket);
+    wait_for_socket(&socket, true, "second start never bound the socket");
+    assert_eq!(
+        served_identities(&socket).await,
+        2,
+        "both discovered keys served from the file"
+    );
+    drop(second);
+}
+
+#[tokio::test]
+async fn a_start_that_skipped_an_item_writes_nothing_down() {
+    // Item 2's public key cannot be fetched. The agent still serves item 1 —
+    // better some keys than none — but a file missing a key is not one the
+    // next start may trust, so none is written.
+    let (dir, socket, config_path) = pinned_setup();
+    std::fs::remove_file(dir.path().join("key2.pub")).unwrap();
+
+    let agent = spawn_agent(&config_path, &socket);
+    wait_for_socket(&socket, true, "agent never bound the socket");
+    assert_eq!(served_identities(&socket).await, 1);
+    assert!(
+        !dir.path().join("agent.sock.identities").exists(),
+        "a set missing a key must not be written down"
+    );
+    drop(agent);
+}
+
+#[tokio::test]
 async fn a_file_that_lacks_a_pinned_key_sends_the_start_back_to_the_vault() {
     // The file knows key 1 only, the config pins 1 and 2. Only the vault can
     // supply the second, so the start must scan — and rewrite the file with both.

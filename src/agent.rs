@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::confirm::{ConfirmContext, Confirmer, Decision, PeerInfo, SessionBinding};
 use crate::interaction::InteractionGate;
-use crate::keystore::{KeyEntry, KeyStore};
+use crate::keystore::{KeyEntry, Served};
 use crate::lpass::LpassClient;
 use crate::passphrase::Unlocker;
 use crate::signing;
@@ -20,7 +20,7 @@ use crate::signing;
 /// Cloned once per client connection; shared state lives behind `Arc`s.
 #[derive(Clone)]
 pub struct LpassAgent {
-    store: Arc<KeyStore>,
+    store: Served,
     lpass: Arc<dyn LpassClient>,
     confirmer: Arc<dyn Confirmer>,
     /// Decrypts the fetched key, resolving a passphrase the vault does not
@@ -45,6 +45,9 @@ pub struct LpassAgent {
     /// The file the served identities may have been read from, so a signature
     /// that finds the vault contradicting it can discard it.
     remembered: Option<std::path::PathBuf>,
+    /// Told after every signature that succeeds, since that is the moment the
+    /// vault is known to be reachable.
+    refresher: Option<Arc<crate::refresh::Refresher>>,
 }
 
 /// A forwarded connection is driven by whoever holds the far end, and they
@@ -55,7 +58,7 @@ const MAX_SESSION_BINDINGS: usize = 16;
 
 impl LpassAgent {
     pub fn new(
-        store: Arc<KeyStore>,
+        store: Served,
         lpass: Arc<dyn LpassClient>,
         confirmer: Arc<dyn Confirmer>,
         unlocker: Arc<Unlocker>,
@@ -71,7 +74,15 @@ impl LpassAgent {
             peer: None,
             bindings: Vec::new(),
             remembered: None,
+            refresher: None,
         }
+    }
+
+    /// Keep the served set current between starts; see `refresh`.
+    #[must_use]
+    pub fn with_refresher(mut self, refresher: Arc<crate::refresh::Refresher>) -> Self {
+        self.refresher = Some(refresher);
+        self
     }
 
     /// Name the file an earlier start wrote the identities to.
@@ -312,6 +323,7 @@ impl Session for LpassAgent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
         Ok(self
             .store
+            .current()
             .entries()
             .map(|entry| Identity {
                 credential: entry.public.key_data().clone().into(),
@@ -332,8 +344,11 @@ impl Session for LpassAgent {
         // `InteractionGate`.
         let mut gate = InteractionGate::new(self.interaction.clone());
 
+        // One snapshot for the whole request: a refresh landing mid-signature
+        // must not change which key this is about.
+        let store = self.store.current();
         let key_data = request.credential.key_data();
-        let Some(entry) = self.store.lookup(key_data) else {
+        let Some(entry) = store.lookup(key_data) else {
             tracing::warn!("sign request for a key this agent does not hold");
             return Err(AgentError::Failure);
         };
@@ -362,6 +377,9 @@ impl Session for LpassAgent {
             Ok(signature) => {
                 tracing::info!(item = %entry.item_id, key = %entry.name,
                     algorithm = %signature.algorithm(), "signature issued");
+                if let Some(refresher) = &self.refresher {
+                    refresher.after_signature();
+                }
                 Ok(signature)
             }
             Err(reason) => {
@@ -380,6 +398,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::confirm::NoConfirmer;
+    use crate::keystore::KeyStore;
     use crate::lpass::mock::MockLpass;
     use crate::passphrase::{NoPrompt, PassphrasePrompt, PassphraseRequest, PromptError};
     use signature::Verifier;
@@ -444,7 +463,7 @@ mod tests {
         init_tracing();
         let config: Config = toml::from_str(keys_toml).unwrap();
         let client = Arc::new(client);
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -577,7 +596,7 @@ mod tests {
             .with_field("1", "Private Key", ED25519.as_bytes());
         let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
         let client = Arc::new(client);
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -610,7 +629,7 @@ mod tests {
         // Store loaded while logged in; then simulate logout by swapping the client.
         let loaded = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
         let config: Config = toml::from_str("confirm = \"off\"\n[[keys]]\nid = \"1\"").unwrap();
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&loaded, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -676,7 +695,7 @@ mod tests {
         // still advertised, but the item is gone from the vault
         let loaded = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
         let config: Config = toml::from_str("confirm = \"off\"\n[[keys]]\nid = \"1\"").unwrap();
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&loaded, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -713,6 +732,83 @@ mod tests {
             !remembered.exists(),
             "the next start must learn the item is gone"
         );
+    }
+
+    #[tokio::test]
+    async fn a_signature_that_succeeds_tells_the_refresher() {
+        // The moment the vault is known reachable is the moment to bring the
+        // remembered identities up to date — in the background.
+        let dir = tempfile::tempdir().unwrap();
+        let config: Arc<Config> = Arc::new(toml::from_str("confirm = \"off\"").unwrap());
+        let vault = Arc::new(
+            MockLpass::logged_in()
+                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+                .with_field("1", "Private Key", ED25519.as_bytes())
+                .with_field("1", "NoteType", b"SSH Key")
+                .with_field("2", "Public Key", ECDSA_PUB.as_bytes())
+                .with_field("2", "NoteType", b"SSH Key"),
+        );
+        let mut two = MockLpass::logged_in();
+        two.items = vec![
+            crate::lpass::ItemSummary {
+                id: "1".into(),
+                name: "one".into(),
+            },
+            crate::lpass::ItemSummary {
+                id: "2".into(),
+                name: "two".into(),
+            },
+        ];
+        // the refresher's own view of the vault lists both items
+        let listing = Arc::new(
+            two.with_field("1", "NoteType", b"SSH Key")
+                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+                .with_field("2", "NoteType", b"SSH Key")
+                .with_field("2", "Public Key", ECDSA_PUB.as_bytes()),
+        );
+        // served: key 1 only, as an earlier start remembered it
+        let served = Served::new(
+            KeyStore::load(
+                &*vault,
+                &[crate::config::KeyConfig {
+                    id: "1".into(),
+                    name: None,
+                    confirm: None,
+                    passphrase_fallback: None,
+                }],
+                &config,
+            )
+            .await
+            .unwrap(),
+        );
+        let refresher = Arc::new(crate::refresh::Refresher::new(
+            served.clone(),
+            dir.path().join("agent.sock.identities"),
+            config,
+            listing,
+            std::time::Duration::ZERO,
+        ));
+        let mut agent = LpassAgent::new(
+            served.clone(),
+            vault.clone(),
+            Arc::new(NoConfirmer),
+            unlocking(&vault, Arc::new(NoPrompt)),
+            no_host_names(),
+        )
+        .with_refresher(refresher);
+
+        assert!(agent
+            .sign(sign_request(ED25519_PUB, b"payload", 0))
+            .await
+            .is_ok());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while served.current().len() != 2 {
+            assert!(
+                deadline > std::time::Instant::now(),
+                "the refresh never landed"
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]
@@ -977,7 +1073,7 @@ mod tests {
         );
         // confirmation left on, so every request confirms *and* prompts
         let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -1041,7 +1137,7 @@ mod tests {
         );
         let config: Config =
             toml::from_str("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"\nconfirm = false").unwrap();
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -1094,7 +1190,7 @@ mod tests {
                 .with_field("1", "Passphrase", b""),
         );
         let config: Config = toml::from_str(PW_KEY).unwrap();
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -1133,7 +1229,7 @@ mod tests {
                 .with_field("1", "Private Key", ED25519.as_bytes()),
         );
         let config: Config = toml::from_str(PW_KEY).unwrap();
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -1240,7 +1336,7 @@ mod tests {
                 .with_field("1", "Private Key", ED25519.as_bytes()),
         );
         let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -1455,7 +1551,7 @@ mod tests {
             .with_field("1", "Private Key", ED25519.as_bytes());
         let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
         let client = Arc::new(client);
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
                 .await
                 .unwrap(),

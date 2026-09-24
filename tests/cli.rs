@@ -103,12 +103,67 @@ fn list_shows_discovered_keys() {
     assert!(text.contains("SHA256:"), "{text}");
     assert!(text.contains("[id: 1]"));
     assert!(text.contains("confirm=on"));
+    // and it is the on-demand refresh of what a start reads
+    let remembered = std::fs::read_to_string(s.dir.path().join("agent.sock.identities")).unwrap();
+    assert!(remembered.contains("id = \"1\""), "{remembered}");
 }
 
 // helper indirection: healthy_vault_body needs a dir that outlives setup()
 fn healthy_vault_body_owned() -> String {
     let keep = Box::leak(Box::new(tempfile::tempdir().unwrap()));
     healthy_vault_body(keep.path())
+}
+
+#[test]
+fn list_on_a_fresh_install_creates_the_socket_directory_and_writes_the_file() {
+    // Nothing has ever bound here, so the directory does not exist. `list` is
+    // the documented way to write the identities down before a first start
+    // against a locked vault, so it has to make the directory itself.
+    let s = setup(&healthy_vault_body_owned(), "");
+    let fresh = s.dir.path().join("fresh");
+    let config = std::fs::read_to_string(&s.config).unwrap();
+    let config = regex_replace_socket(&config, &format!("{}/agent.sock", fresh.display()));
+    std::fs::write(&s.config, config).unwrap();
+    assert!(!fresh.exists());
+
+    let output = run(&s, &["list"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o700,
+        "the directory is private, as `start` makes it"
+    );
+    assert!(fresh.join("agent.sock.identities").exists());
+}
+
+#[test]
+fn list_writes_nothing_down_from_a_scan_with_a_skipped_item() {
+    // Item 2 is pinned but the vault has no such item. The listing still shows
+    // item 1; the file a start would trust is left alone.
+    let keep = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    std::fs::write(keep.path().join("pub"), ED25519_PUB).unwrap();
+    let body = format!(
+        r#"case "$1" in
+  status) echo "Logged in as test@example.com.";;
+  show)
+    case "$3" in
+      1) cat "{}/pub";;
+      *) echo 'Error: Could not find specified account(s).' >&2; exit 1;;
+    esac;;
+esac"#,
+        keep.path().display()
+    );
+    let s = setup(&body, "[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"\n");
+    let output = run(&s, &["list"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("[id: 1]"));
+    assert!(
+        stderr(&output).contains("not writing the remembered identities down"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!s.dir.path().join("agent.sock.identities").exists());
 }
 
 #[test]

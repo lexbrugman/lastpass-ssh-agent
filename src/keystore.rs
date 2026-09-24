@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use ssh_key::public::KeyData;
 use ssh_key::PublicKey;
 
 use crate::config::{Config, KeyConfig, PassphraseFallback};
 use crate::error::{Error, Result};
 use crate::identities::{Remembered, RememberedKey};
-use crate::lpass::LpassClient;
+use crate::lpass::{LpassClient, LpassError};
 
 /// Why a configured/discovered item cannot be served. Shared by startup and
 /// `doctor` so the diagnostic command cannot drift from the real policy.
@@ -112,6 +114,64 @@ pub async fn inspect_keys(
     inspected
 }
 
+/// The keys the agent should serve: the configured [[keys]] if any,
+/// otherwise every SSH Key item discovered in the vault.
+pub async fn effective_keys(
+    client: &Arc<dyn LpassClient>,
+    config: &Config,
+) -> Result<Vec<KeyConfig>> {
+    if !config.keys.is_empty() {
+        return Ok(config.keys.clone());
+    }
+    tracing::info!("no [[keys]] configured — discovering SSH Key items in the vault");
+    let found = crate::lpass::discover_ssh_key_items(client.clone(), None).await?;
+    if found.is_empty() {
+        return Err(Error::ConfigInvalid(
+            "no SSH Key items found in the vault (create one in LastPass, or pin items with [[keys]] in the config)"
+                .into(),
+        ));
+    }
+    Ok(found
+        .into_iter()
+        .map(|item| KeyConfig {
+            id: item.id,
+            name: Some(item.name),
+            // No per-key overrides for a discovered item: there is no config
+            // entry to have written one in, so both fall back to the globals.
+            confirm: None,
+            passphrase_fallback: None,
+        })
+        .collect())
+}
+
+/// The served set as the running agent holds it, replaceable whole.
+///
+/// A request takes a snapshot and works from that, so a refresh landing while
+/// it runs changes nothing for it; the next request sees the new set. Cheap to
+/// take: one reference count, never a copy of the keys.
+#[derive(Debug, Clone)]
+pub struct Served(Arc<std::sync::RwLock<Arc<KeyStore>>>);
+
+impl Served {
+    pub fn new(store: KeyStore) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(Arc::new(store))))
+    }
+
+    pub fn current(&self) -> Arc<KeyStore> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn replace(&self, store: KeyStore) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(store);
+    }
+}
+
 /// What one public key has to pass to be served, wherever it came from: it is
 /// there, it parses, and this agent can sign with it. One function, so the
 /// vault path and the remembered path cannot drift apart.
@@ -146,6 +206,23 @@ fn unique(
     }
     seen.push((public.key_data().clone(), item_id.to_string()));
     Ok(public)
+}
+
+/// Whether an issue is the vault's verdict on a key — there is nothing there, or
+/// nothing this agent can serve — as opposed to the vault being unavailable to
+/// ask. Startup skips both; a refresh may skip only a verdict, since a set that
+/// lost a key because the vault was shut halfway is a loss, not an update.
+///
+/// Listed positively so that a failure this does not know is treated as the
+/// vault being unavailable, which is the side to err on.
+const fn is_verdict(issue: &KeyIssue) -> bool {
+    matches!(
+        issue,
+        KeyIssue::Empty
+            | KeyIssue::Malformed(_)
+            | KeyIssue::Unsupported(_)
+            | KeyIssue::Fetch(LpassError::ItemNotFound(_) | LpassError::FieldNotFound { .. })
+    )
 }
 
 /// What a remembered file yields for one config: the store it can serve at
@@ -281,8 +358,49 @@ impl KeyStore {
         Ok(Self { entries })
     }
 
+    /// As `load`, for a refresh that will replace a set already being served.
+    ///
+    /// Stricter on one point: nothing the vault *could not answer* is skipped.
+    /// `load` drops an item the vault would not serve and carries on, which is
+    /// right for a start — better some keys than none. A refresh replacing a
+    /// complete set with one missing a key because the vault shut halfway would
+    /// be a loss dressed as an update, so any such item makes the whole scan
+    /// `None`, and the caller keeps what it has. The vault's own verdicts on a
+    /// key — empty, malformed, a type this agent cannot sign with — are still
+    /// skipped, as they are at startup.
+    pub async fn load_complete(
+        client: &dyn LpassClient,
+        keys: &[KeyConfig],
+        config: &Config,
+    ) -> Option<Self> {
+        let mut entries = Vec::new();
+        for inspection in inspect_keys(client, keys, config).await {
+            match inspection {
+                KeyInspection::Usable(entry) => entries.push(entry),
+                KeyInspection::Unusable { item_id, issue, .. } if !is_verdict(&issue) => {
+                    tracing::debug!(item = %item_id,
+                        "keeping the served set as it is, this scan cannot replace it: {issue}");
+                    return None;
+                }
+                KeyInspection::Unusable {
+                    item_id,
+                    name,
+                    issue,
+                } => {
+                    tracing::warn!(item = %item_id, name = %name, "skipping: {issue}");
+                }
+            }
+        }
+        // A scan that found nothing to serve is not one to replace a set with.
+        (!entries.is_empty()).then_some(Self { entries })
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = &KeyEntry> {
         self.entries.iter()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     pub fn lookup(&self, key_data: &KeyData) -> Option<&KeyEntry> {
@@ -425,6 +543,122 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn a_served_set_is_replaced_whole_and_a_snapshot_keeps_the_old_one() {
+        let ed = PublicKey::from_openssh(ED25519_PUB.trim()).unwrap();
+        let entry = |id: &str, public: &PublicKey| KeyEntry {
+            item_id: id.into(),
+            name: id.into(),
+            public: public.clone(),
+            confirm: false,
+            passphrase_fallback: PassphraseFallback::default(),
+        };
+        let served = Served::new(KeyStore {
+            entries: vec![entry("1", &ed)],
+        });
+        let snapshot = served.current();
+        assert_eq!(snapshot.len(), 1);
+
+        let rsa = PublicKey::from_openssh(RSA_PUB.trim()).unwrap();
+        served.replace(KeyStore {
+            entries: vec![entry("1", &ed), entry("2", &rsa)],
+        });
+        assert_eq!(
+            served.current().len(),
+            2,
+            "the next request sees the new set"
+        );
+        assert_eq!(snapshot.len(), 1, "a request already running keeps its own");
+    }
+
+    #[tokio::test]
+    async fn a_complete_scan_yields_a_store() {
+        let client = MockLpass::logged_in()
+            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_field("2", "Public Key", RSA_PUB.as_bytes());
+        let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
+        let store = KeyStore::load_complete(&client, &config.keys, &config)
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_scan_the_vault_could_not_answer_yields_nothing() {
+        // The set being served is complete; a scan missing a key because the
+        // vault shut halfway must not replace it.
+        let client = MockLpass::logged_in()
+            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_broken_item("2");
+        let both = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
+        assert!(KeyStore::load_complete(&client, &both.keys, &both)
+            .await
+            .is_none());
+
+        let shut = MockLpass::logged_in()
+            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_logged_out_field("1", "Public Key");
+        let one = config("[[keys]]\nid = \"1\"");
+        assert!(KeyStore::load_complete(&shut, &one.keys, &one)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_scan_with_a_duplicate_yields_nothing() {
+        let client = MockLpass::logged_in()
+            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_field("2", "Public Key", ED25519_PUB.as_bytes());
+        let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
+        assert!(KeyStore::load_complete(&client, &config.keys, &config)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn the_vaults_own_verdicts_are_still_skipped_by_a_refresh() {
+        // Not the vault being unavailable: the vault answered, and the answer
+        // is a key this agent cannot serve. That is skipped as at startup.
+        const SK_PUB: &str = include_str!("../tests/fixtures/sk_ed25519.pub");
+        let client = MockLpass::logged_in()
+            .with_field("1", "Public Key", SK_PUB.as_bytes())
+            .with_field("2", "Public Key", ED25519_PUB.as_bytes());
+        let both = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
+        let store = KeyStore::load_complete(&client, &both.keys, &both)
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 1);
+
+        // and a scan that serves nothing at all is not one to replace a set with
+        let none = MockLpass::logged_in().with_field("1", "Public Key", b"not a key");
+        let one = config("[[keys]]\nid = \"1\"");
+        assert!(KeyStore::load_complete(&none, &one.keys, &one)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_item_the_vault_no_longer_has_is_a_verdict_a_refresh_acts_on() {
+        // Deleted, or stripped of its field: the vault answered, and the answer
+        // is that there is no key. Skipping it is how the refresh stops
+        // advertising it — treating it as unavailability would keep the deleted
+        // key on offer for as long as the item stayed gone.
+        let gone = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let both = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
+        let store = KeyStore::load_complete(&gone, &both.keys, &both)
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 1);
+
+        let stripped = MockLpass::logged_in()
+            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_absent_field("2", "Public Key");
+        let store = KeyStore::load_complete(&stripped, &both.keys, &both)
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 1);
     }
 
     /// The store a fresh load produces, written down and read back, serves the
