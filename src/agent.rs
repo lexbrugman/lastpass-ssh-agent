@@ -42,6 +42,9 @@ pub struct LpassAgent {
     /// Hosts this connection has bound itself to, oldest hop first. Per
     /// connection: a fresh session starts with none.
     bindings: Vec<SessionBinding>,
+    /// The file the served identities may have been read from, so a signature
+    /// that finds the vault contradicting it can discard it.
+    remembered: Option<std::path::PathBuf>,
 }
 
 /// A forwarded connection is driven by whoever holds the far end, and they
@@ -67,7 +70,19 @@ impl LpassAgent {
             interaction: Arc::new(tokio::sync::Mutex::new(())),
             peer: None,
             bindings: Vec::new(),
+            remembered: None,
         }
+    }
+
+    /// Name the file an earlier start wrote the identities to.
+    ///
+    /// Not whether this start was served from it: a start that scanned wrote
+    /// the same file, and a rotation after that would strand the next start on
+    /// it just the same.
+    #[must_use]
+    pub fn with_remembered_file(mut self, path: std::path::PathBuf) -> Self {
+        self.remembered = Some(path);
+        self
     }
 
     pub fn with_peer(&self, peer: Option<PeerInfo>) -> Self {
@@ -164,6 +179,22 @@ impl LpassAgent {
         bindings
     }
 
+    /// The vault has just contradicted what this agent advertises for one item,
+    /// so a file that would advertise it again at the next start is discarded.
+    ///
+    /// Only the vault's own verdicts reach here — a different key, or no key —
+    /// never its unavailability: a locked vault or a timeout says nothing about
+    /// the file, which would then be right and thrown away for nothing.
+    fn discard_remembered(&self, item_id: &str, why: &str) {
+        let Some(path) = &self.remembered else {
+            return;
+        };
+        crate::identities::remove(path).unwrap_or_else(could_not_discard);
+        tracing::warn!(item = %item_id, path = %path.display(),
+            "{why}, so the remembered identities were discarded — restart the agent to \
+             serve what the vault holds");
+    }
+
     /// Everything that touches the private key, in one place.
     async fn fetch_and_sign(
         &self,
@@ -180,11 +211,26 @@ impl LpassAgent {
         if self.lpass.may_prompt() {
             gate.enter().await;
         }
-        let pem: Zeroizing<Vec<u8>> = self
+        let pem: Zeroizing<Vec<u8>> = match self
             .lpass
             .show_field(&entry.item_id, "Private Key")
             .await
-            .map_err(|e| format!("fetching private key: {e}"))?;
+        {
+            Ok(pem) => pem,
+            Err(e) => {
+                // Absence is the vault's verdict on the key, where a locked vault
+                // or a timeout is only the vault being unavailable and says
+                // nothing about it.
+                if matches!(
+                    e,
+                    crate::lpass::LpassError::ItemNotFound(_)
+                        | crate::lpass::LpassError::FieldNotFound { .. }
+                ) {
+                    self.discard_remembered(&entry.item_id, "the vault no longer holds this key");
+                }
+                return Err(format!("fetching private key: {e}"));
+            }
+        };
         if pem.is_empty() {
             return Err("item has an empty Private Key field".into());
         }
@@ -202,6 +248,10 @@ impl LpassAgent {
         // saving that passphrase over the one belonging to the key still being
         // advertised.
         if key.public_key().key_data() != entry.public.key_data() {
+            self.discard_remembered(
+                &entry.item_id,
+                "the vault's key no longer matches the advertised one",
+            );
             return Err("private key does not match the advertised public key — vault item changed since startup?".into());
         }
 
@@ -217,6 +267,17 @@ impl LpassAgent {
         signing::sign_with_key(&key, data, flags).map_err(|e| e.to_string())
         // `key` (and the encrypted original) zeroize on drop here.
     }
+}
+
+/// Removing a file the agent itself wrote cannot fail in practice, so the edge
+/// is excluded from coverage rather than pretended testable.
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "by value is what unwrap_or_else hands a function"
+)]
+fn could_not_discard(e: crate::error::Error) {
+    tracing::warn!("could not discard the remembered identities: {e}");
 }
 
 #[ssh_agent_lib::async_trait]
@@ -599,6 +660,83 @@ mod tests {
         assert!(
             !prompt.was_asked(),
             "a key we will not sign with must not be unlocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_item_the_vault_no_longer_has_discards_the_remembered_identities() {
+        // Deleted, or unshared: the private key fetch fails before any key is
+        // compared, so this has to be caught on its own — or every start would
+        // go on advertising an identity that cannot sign. A locked vault must
+        // not count: the file is right about the key, the vault was merely
+        // unavailable.
+        let dir = tempfile::tempdir().unwrap();
+        let remembered = dir.path().join("agent.sock.identities");
+
+        // still advertised, but the item is gone from the vault
+        let loaded = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let config: Config = toml::from_str("confirm = \"off\"\n[[keys]]\nid = \"1\"").unwrap();
+        let store = Arc::new(
+            KeyStore::load(&loaded, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let agent = |vault: MockLpass| {
+            let vault = Arc::new(vault);
+            LpassAgent::new(
+                store.clone(),
+                vault.clone(),
+                Arc::new(NoConfirmer),
+                unlocking(&vault, Arc::new(NoPrompt)),
+                no_host_names(),
+            )
+            .with_remembered_file(remembered.clone())
+        };
+
+        std::fs::write(&remembered, "[[keys]]\n").unwrap();
+        let mut locked = agent(MockLpass::default());
+        assert!(locked
+            .sign(sign_request(ED25519_PUB, b"payload", 0))
+            .await
+            .is_err());
+        assert!(
+            remembered.exists(),
+            "a locked vault is not a verdict on the key"
+        );
+
+        let mut deleted = agent(MockLpass::logged_in());
+        assert!(deleted
+            .sign(sign_request(ED25519_PUB, b"payload", 0))
+            .await
+            .is_err());
+        assert!(
+            !remembered.exists(),
+            "the next start must learn the item is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vault_that_contradicts_the_remembered_identities_discards_them() {
+        // A key pair rotated inside the same item: the file goes on advertising
+        // the old public key, so every start would refuse every signature until
+        // someone found the file. The refusal itself has to clear the way.
+        let dir = tempfile::tempdir().unwrap();
+        let remembered = dir.path().join("agent.sock.identities");
+        std::fs::write(&remembered, "[[keys]]\n").unwrap();
+
+        let client = MockLpass::logged_in()
+            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_field("1", "Private Key", ECDSA.as_bytes());
+        let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"")
+            .await
+            .with_remembered_file(remembered.clone());
+        assert!(agent
+            .sign(sign_request(ED25519_PUB, b"payload", 0))
+            .await
+            .is_err());
+        assert!(
+            !remembered.exists(),
+            "the next start must read the vault, not the file"
         );
     }
 

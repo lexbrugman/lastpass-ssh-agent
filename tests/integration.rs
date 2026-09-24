@@ -376,6 +376,116 @@ async fn routine_traffic_is_not_logged_as_errors() {
     assert!(log.contains("serving key"), "{log}");
 }
 
+/// A directory of its own with the fake vault and a config pinning keys 1 and
+/// 2, owned by the test rather than by any agent started in it: these tests
+/// start more than one agent against the same files.
+fn pinned_setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let script = write_fake_lpass(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "socket = \"{}\"\nconfirm = \"off\"\nlpass_path = \"{}\"\n\
+             [[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"\n",
+            socket.display(),
+            script.display()
+        ),
+    )
+    .unwrap();
+    (dir, socket, config_path)
+}
+
+/// Start an agent against an existing config. It owns a throwaway directory,
+/// since the real one belongs to the test.
+fn spawn_agent(config_path: &Path, socket: &Path) -> AgentUnderTest {
+    AgentUnderTest {
+        child: Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
+            .args(["--config", config_path.to_str().unwrap(), "start"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+        socket: socket.to_path_buf(),
+        _dir: tempfile::tempdir().unwrap(),
+    }
+}
+
+fn wait_for_socket(socket: &Path, present: bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while socket.exists() != present {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn served_identities(socket: &Path) -> usize {
+    let mut client = connect(Binding::FilePath(socket.to_path_buf()).try_into().unwrap()).unwrap();
+    client.request_identities().await.unwrap().len()
+}
+
+#[tokio::test]
+async fn a_second_start_with_pinned_keys_needs_no_vault_call() {
+    // The first start writes the identities down. Then the vault is made
+    // unreadable — every `show` fails — and the second start must still bind
+    // and serve both keys, from the file alone.
+    let (dir, socket, config_path) = pinned_setup();
+
+    let first = spawn_agent(&config_path, &socket);
+    wait_for_socket(&socket, true, "first start never bound the socket");
+    let remembered = dir.path().join("agent.sock.identities");
+    assert!(remembered.exists(), "the first start must write the file");
+    let mode = std::fs::metadata(&remembered).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    drop(first);
+    wait_for_socket(&socket, false, "the first agent never unlinked its socket");
+
+    // an lpass that answers nothing at all — `status` included, since a locked
+    // vault reports as logged out and that is exactly the start the file is for
+    std::fs::write(dir.path().join("lpass"), "#!/bin/sh\nexit 1\n").unwrap();
+    let second = spawn_agent(&config_path, &socket);
+    wait_for_socket(&socket, true, "second start never bound the socket");
+    assert_eq!(
+        served_identities(&socket).await,
+        2,
+        "both pinned keys served from the file"
+    );
+    drop(second);
+}
+
+#[tokio::test]
+async fn a_file_that_lacks_a_pinned_key_sends_the_start_back_to_the_vault() {
+    // The file knows key 1 only, the config pins 1 and 2. Only the vault can
+    // supply the second, so the start must scan — and rewrite the file with both.
+    let (dir, socket, config_path) = pinned_setup();
+    let remembered = dir.path().join("agent.sock.identities");
+    std::fs::write(
+        &remembered,
+        format!(
+            "[[keys]]\nid = \"1\"\nname = \"test ed25519\"\npublic = \"{}\"\n",
+            ED25519_PUB.trim()
+        ),
+    )
+    .unwrap();
+
+    let agent = spawn_agent(&config_path, &socket);
+    wait_for_socket(&socket, true, "agent never bound the socket");
+    assert_eq!(
+        served_identities(&socket).await,
+        2,
+        "the vault supplied the second key"
+    );
+    let rewritten = std::fs::read_to_string(&remembered).unwrap();
+    assert!(
+        rewritten.contains("id = \"2\""),
+        "the file was not brought up to date:\n{rewritten}"
+    );
+    drop(agent);
+}
+
 #[tokio::test]
 async fn sigterm_removes_socket() {
     let mut agent = start_agent();

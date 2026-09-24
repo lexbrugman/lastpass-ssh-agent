@@ -13,6 +13,7 @@ mod confirm;
 mod enclave;
 mod error;
 mod files;
+mod identities;
 mod interaction;
 // Excluded from coverage as a whole, which is the point of it being this small:
 // every line talks to the real Keychain of whoever runs the tests. The rules
@@ -345,6 +346,45 @@ fn write_answer(bytes: &[u8]) -> Result<()> {
     out.flush().map_err(Error::Io)
 }
 
+/// The store a remembered file can stand in for the vault with, or `None` when
+/// the vault has to be asked after all.
+///
+/// Refused for a discovered set even when the file has one: a start that trusted
+/// it would never notice a key added to the vault since. Refused too when any
+/// pinned key is not in the file, since only the vault can supply it.
+fn remembered_store(path: &Path, config: &Config) -> Result<Option<keystore::KeyStore>> {
+    if config.keys.is_empty() {
+        return Ok(None);
+    }
+    let Some(remembered) = identities::load(path)? else {
+        return Ok(None);
+    };
+    let from = keystore::KeyStore::from_remembered(&remembered, config);
+    // At info like the other outcome, for the same reason: it says why this
+    // start is the slow kind. Pinning a new key earns exactly one such start.
+    if !from.missing.is_empty() {
+        tracing::info!(path = %path.display(), missing = from.missing.len(),
+            "the remembered identities do not cover every pinned key; asking the vault");
+        return Ok(None);
+    }
+    tracing::info!(path = %path.display(),
+        "serving the identities the last start wrote down — no vault call needed");
+    Ok(Some(from.store))
+}
+
+/// Writing beside a socket that was just bound cannot fail in practice, so the
+/// edge is excluded from coverage rather than pretended testable. The file is
+/// the socket's name plus `.identities`, which the "listening" line that
+/// follows already places.
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "by value is what unwrap_or_else hands a function"
+)]
+fn could_not_remember(e: Error) {
+    tracing::warn!("could not write the identities down for the next start: {e}");
+}
+
 /// The keys the agent should serve: the configured [[keys]] if any,
 /// otherwise every SSH Key item discovered in the vault.
 async fn effective_keys(client: &Arc<dyn LpassClient>, config: &Config) -> Result<Vec<KeyConfig>> {
@@ -376,12 +416,29 @@ async fn start(config_path: &Path) -> Result<()> {
     let config = Config::load_or_default(config_path)?;
     let socket_path = config.socket_path()?;
     let client: Arc<dyn LpassClient> = Arc::new(asking_client(&config, config_path, &socket_path)?);
-    if wants_login_checked(config.master_password) {
-        require_login(client.as_ref()).await?;
-    }
 
-    let keys = effective_keys(&client, &config).await?;
-    let store = Arc::new(keystore::KeyStore::load(client.as_ref(), &keys, &config).await?);
+    // From what the last start wrote down when that covers every pinned key, so
+    // binding costs no vault call; otherwise from the vault, and written down
+    // for next time. Only a pinned set is trusted from the file: the config
+    // fixes it, so nothing can have been added behind its back — where a
+    // discovered set has to be read again to notice a new item.
+    //
+    // The login check travels with the vault calls. Ahead of them it would fail
+    // a start that needs no vault at all — a locked vault is the very case the
+    // file is for, and a signature that then finds it locked fails in the same
+    // words it always has.
+    let remembered_at = identities::path_for(&socket_path);
+    let (store, freshly_loaded) = if let Some(store) = remembered_store(&remembered_at, &config)? {
+        (store, false)
+    } else {
+        if wants_login_checked(config.master_password) {
+            require_login(client.as_ref()).await?;
+        }
+        let keys = effective_keys(&client, &config).await?;
+        let store = keystore::KeyStore::load(client.as_ref(), &keys, &config).await?;
+        (store, true)
+    };
+    let store = Arc::new(store);
     for entry in store.entries() {
         tracing::info!(
             key = %entry.name,
@@ -399,6 +456,11 @@ async fn start(config_path: &Path) -> Result<()> {
         passphrase::from_config(&config)?,
     ));
     let (listener, guard) = socket::bind(&socket_path)?;
+    // After the bind, which is what guarantees the directory exists. Best
+    // effort: a start that cannot write beside its own socket still serves.
+    if freshly_loaded {
+        identities::save(&remembered_at, &store.remember()).unwrap_or_else(could_not_remember);
+    }
     // Logged rather than printed as shell exports. `env` emits those, and they
     // are for a shell to evaluate — which nothing can do with the output of a
     // command that then runs until it is stopped. In a service they went
@@ -427,7 +489,8 @@ async fn start(config_path: &Path) -> Result<()> {
             confirmer,
             unlocker,
             Arc::new(knownhosts::HostNames::default()),
-        ),
+        )
+        .with_remembered_file(remembered_at),
     };
     let result = tokio::select! {
         result = ssh_agent_lib::agent::listen(listener, factory) => {
