@@ -60,7 +60,7 @@ What it **cannot** guarantee:
 - **Your master password** is handled by this agent, the way 1Password's
   agent handles its vault key: asked for when the vault is locked, held in
   memory while it is unlocked, and forgotten when the screen locks, when it
-  has gone unused for `vault_unlock_timeout_secs`, and when the agent stops.
+  has gone unused for `master_password_idle_secs`, and when the agent stops.
   Each `lpass` call is fed it over a pipe and told not to start `lpass`'s own
   agent, so nothing this agent does leaves the vault open machine-wide — see
   [How the vault is opened](#how-the-vault-is-opened). It lives in a
@@ -205,7 +205,7 @@ vault scan) or tuning behavior:
 # How long the agent keeps the master password once it has asked for it,
 # counted from the last signature that used it. Unset is an hour; 0 keeps
 # it until the screen locks or the agent stops.
-# vault_unlock_timeout_secs = 3600
+# master_password_idle_secs = 3600
 
 # Where the master password comes from when the vault is locked. "prompt"
 # (default) asks you, any platform; "touchid" (macOS) releases it on Touch
@@ -400,7 +400,7 @@ the config does not name.
 ### How long the master password is held
 
 ```toml
-vault_unlock_timeout_secs = 3600     # the default; 0 means until lock or exit
+master_password_idle_secs = 3600     # the default; 0 means until lock or exit
 ```
 
 Counted from the last signature that used it, not from when it was typed, so a
@@ -540,7 +540,7 @@ remember_approvals = true
 With this on, approving a signature answers the same question the next time
 it is asked — the same key, for the same process started from the same chain,
 bound to the same hosts — until the vault locks: the screen locks, the master
-password goes unused for `vault_unlock_timeout_secs`, the agent has to ask for
+password goes unused for `master_password_idle_secs`, the agent has to ask for
 it again for any reason, or the agent stops. (A vault your shell unlocked
 expires without telling the agent; the request that finds it locked asks for
 the master password, and approvals end there.) A
@@ -614,7 +614,7 @@ unlocking — do not run `lpass` yourself — and every lock is one it sees.
   is that large.
 - The vault is asked for the master password by the first signature that
   needs it, and stays open to this agent until the next screen lock or
-  `vault_unlock_timeout_secs` of disuse — the lock bounds exposure, it does not
+  `master_password_idle_secs` of disuse — the lock bounds exposure, it does not
   make each signature cost a password. A shell where you ran `lpass` yourself
   keeps the vault open machine-wide for the hour `lpass` gives it; this agent
   neither extends nor cuts that.

@@ -308,16 +308,9 @@ fn take(bytes: &[u8], max: usize) -> Result<(&[u8], &[u8])> {
         .ok_or_else(|| malformed("truncated value"))
 }
 
-/// Where the blob and ciphertext live, given the socket.
-///
-/// Named after the socket for the same reason the identities file is: the
-/// socket path is the one thing the user chooses that every part of a running
-/// agent already agrees on, so nothing else has to be configured to keep them
-/// together.
+/// Where the blob and ciphertext live, given the socket; see `files::beside`.
 pub fn path_for(socket: &Path) -> PathBuf {
-    let mut name = socket.as_os_str().to_os_string();
-    name.push(".master");
-    PathBuf::from(name)
+    crate::files::beside(socket, ".master")
 }
 
 /// Read it back, or `None` when there is nothing stored yet.

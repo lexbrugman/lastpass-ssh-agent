@@ -123,7 +123,7 @@ pub struct Config {
     /// until the screen locks or the agent stops — a deliberate footgun rather
     /// than one to forbid. See `master_password_idle`.
     #[serde(default)]
-    pub vault_unlock_timeout_secs: Option<u64>,
+    pub master_password_idle_secs: Option<u64>,
 
     /// Where the master password comes from when the agent needs the vault
     /// and holds none.
@@ -166,7 +166,7 @@ const fn default_lock_on_screen_lock() -> bool {
     false
 }
 
-/// What `vault_unlock_timeout_secs` means when unset.
+/// What `master_password_idle_secs` means when unset.
 const DEFAULT_MASTER_PASSWORD_IDLE: Duration = Duration::from_secs(3600);
 
 /// An hour is already far longer than anyone waits at a signing prompt, and
@@ -214,6 +214,7 @@ impl Config {
                 })
             }
         };
+        refuse_misnamed(&raw)?;
         let mut config: Self = toml::from_str(&raw).map_err(|e| Error::ConfigParse {
             path: path.to_path_buf(),
             source: Box::new(e),
@@ -322,7 +323,7 @@ impl Config {
     /// How long a held master password may go unused: the configured idle
     /// time, an hour when none is, and no limit for `0`.
     pub const fn master_password_idle(&self) -> Option<Duration> {
-        match self.vault_unlock_timeout_secs {
+        match self.master_password_idle_secs {
             None => Some(DEFAULT_MASTER_PASSWORD_IDLE),
             Some(0) => None,
             Some(seconds) => Some(Duration::from_secs(seconds)),
@@ -352,6 +353,24 @@ impl Config {
     }
 }
 
+/// Names a setting that is written under another name, and says which.
+///
+/// Ahead of the parse, because "unknown field" is what the parse would say,
+/// and a reader who spelt the idle time as the vault's own timeout would
+/// otherwise have nothing pointing at the setting that does what they meant.
+fn refuse_misnamed(raw: &str) -> Result<()> {
+    const MISNAMED: &str = "vault_unlock_timeout_secs";
+    let names_it =
+        toml::from_str::<toml::Table>(raw).is_ok_and(|table| table.contains_key(MISNAMED));
+    if names_it {
+        return Err(Error::ConfigInvalid(format!(
+            "`{MISNAMED}` is not a setting: how long the master password is kept is \
+             `master_password_idle_secs`"
+        )));
+    }
+    Ok(())
+}
+
 /// Reachable only when the platform reports no home directory at all,
 /// which cannot be simulated in tests — excluded from coverage.
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -375,6 +394,7 @@ mod tests {
     use super::*;
 
     fn parse(s: &str) -> Result<Config> {
+        refuse_misnamed(s)?;
         let mut config: Config = toml::from_str(s).map_err(|e| Error::ConfigParse {
             path: PathBuf::from("<test>"),
             source: Box::new(e),
@@ -553,18 +573,28 @@ id = "1"
             Some(Duration::from_secs(3600))
         );
         assert_eq!(
-            parse("vault_unlock_timeout_secs = 300")
+            parse("master_password_idle_secs = 300")
                 .unwrap()
                 .master_password_idle(),
             Some(Duration::from_secs(300))
         );
         // a footgun, but one a config is entitled to ask for
         assert_eq!(
-            parse("vault_unlock_timeout_secs = 0")
+            parse("master_password_idle_secs = 0")
                 .unwrap()
                 .master_password_idle(),
             None
         );
+    }
+
+    #[test]
+    fn the_idle_time_written_as_a_vault_timeout_is_refused_with_its_name() {
+        let error = parse("vault_unlock_timeout_secs = 300")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("master_password_idle_secs"), "{error}");
+        // a broken file is left to the parse to describe
+        assert!(parse("not = valid = toml").is_err());
     }
 
     #[test]

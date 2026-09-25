@@ -38,13 +38,9 @@ pub struct RememberedKey {
 /// fails to decode rather than being cut to a length that happens to parse.
 const MAX_BYTES: usize = 1024 * 1024;
 
-/// Beside the socket, for the same reason the Secure Enclave file is: the
-/// socket path is the one thing every part of a running agent already agrees
-/// on.
+/// Beside the socket; see `files::beside`.
 pub fn path_for(socket: &Path) -> PathBuf {
-    let mut name = socket.as_os_str().to_os_string();
-    name.push(".identities");
-    PathBuf::from(name)
+    crate::files::beside(socket, ".identities")
 }
 
 /// What the last start wrote down, or `None` when nothing is there yet.

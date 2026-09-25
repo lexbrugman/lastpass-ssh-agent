@@ -26,6 +26,15 @@ use crate::error::Result;
 /// world-readable even for an instant, and once afterwards, because a staging
 /// file left behind by an earlier crash is reopened rather than created and
 /// keeps whatever mode it already had.
+/// A file of the agent's own, named after its socket: the socket path is the
+/// one thing every part of a running agent already agrees on, so nothing else
+/// has to be configured to keep them together.
+pub fn beside(socket: &Path, suffix: &str) -> PathBuf {
+    let mut name = socket.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 pub fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -95,6 +104,14 @@ pub fn open_regular(path: &Path) -> Result<Option<std::fs::File>> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_beside_the_socket_takes_its_name_and_a_suffix() {
+        assert_eq!(
+            beside(Path::new("/run/user/1000/agent.sock"), ".identities"),
+            PathBuf::from("/run/user/1000/agent.sock.identities")
+        );
+    }
     use std::io::Read as _;
     use std::os::unix::fs::PermissionsExt as _;
 
