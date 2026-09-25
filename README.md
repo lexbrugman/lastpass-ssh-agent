@@ -35,7 +35,9 @@ What this agent **guarantees**:
   a relayed request looks identical to one you made yourself. Bindings whose
   signature does not verify are refused and never displayed.
 - **Read-only agent.** `ssh-add` (add/remove/lock/unlock) is refused. The
-  agent serves the vault's SSH Key items discovered at startup — or, with
+  agent serves every usable SSH Key item the account can see, shared folders
+  included — what you can use in the vault, you can use here, for the key
+  types listed under [Notes & limitations](#notes--limitations) — or, with
   `[[keys]]` pinned in the config, exactly those and nothing else.
 
 What it **cannot** guarantee:
@@ -589,9 +591,19 @@ unlocking — do not run `lpass` yourself — and every lock is one it sees.
   safe and duplicate names are ambiguity-free. If the vault item's key is
   edited while the agent runs, the agent notices the public-key mismatch and
   refuses to sign until restarted.
-- In auto-discovery mode, an SSH Key item added to the vault is served after
-  the next agent restart (discovery runs once at startup). Pin `[[keys]]` if
-  you want new vault items to require an explicit opt-in instead.
+- In auto-discovery mode, an SSH Key item added to the vault — or shared with
+  you — is served after the next refresh (see [Starting without the
+  vault](#starting-without-the-vault)). Pin `[[keys]]` if you want new vault
+  items to require an explicit opt-in instead.
+- **More than six keys can fail against a server.** `ssh` offers every
+  identity the agent has, in turn, and `sshd` refuses after `MaxAuthTries`
+  failed attempts — six by default — with *Too many authentication
+  failures*. So a host whose key is offered seventh or later is refused,
+  while one whose key comes up earlier works, and which is which depends on
+  the order the agent lists them in. Pin a few in `[[keys]]`, or tell `ssh`
+  which key a host takes with `IdentitiesOnly yes` and an `IdentityFile`
+  pointing at its public key in `ssh_config`. `doctor` says so when the set
+  is that large.
 - The vault is asked for the master password by the first signature that
   needs it, and stays open to this agent until the next screen lock or
   `vault_unlock_timeout_secs` of disuse — the lock bounds exposure, it does not

@@ -613,7 +613,9 @@ async fn doctor(config_path: &Path, test_confirm: bool) -> Result<()> {
 
     if let Some(config) = &config {
         report(check_socket(config));
-        report(check_remembered(config));
+        for check in check_remembered(config) {
+            report(check);
+        }
         report(master_password_check(
             config.master_password,
             master::store_available(),
@@ -725,7 +727,7 @@ async fn check_keys(client: &Arc<dyn LpassClient>, config: &Config) -> Vec<Check
         Ok(keys) => keys,
         Err(e) => return vec![Check::failed("keys", e.to_string())],
     };
-    keystore::inspect_keys(client.as_ref(), &keys, config)
+    let mut checks: Vec<Check> = keystore::inspect_keys(client.as_ref(), &keys, config)
         .await
         .into_iter()
         .map(|inspection| match inspection {
@@ -739,7 +741,30 @@ async fn check_keys(client: &Arc<dyn LpassClient>, config: &Config) -> Vec<Check
                 issue,
             } => Check::failed(&format!("key {name} [id: {item_id}]"), issue.to_string()),
         })
-        .collect()
+        .collect();
+    let served = checks.iter().filter(|check| check.ok).count();
+    checks.extend(too_many_keys("key count", served));
+    checks
+}
+
+/// How many keys `ssh` may offer before a server with `sshd`'s default
+/// `MaxAuthTries` drops the connection.
+const MAX_AUTH_TRIES: usize = 6;
+
+/// A line for a served set larger than a server will try, since the failure it
+/// causes — "Too many authentication failures", on a host whose key is in the
+/// set — names neither this agent nor the count.
+fn too_many_keys(label: &str, served: usize) -> Option<Check> {
+    (served > MAX_AUTH_TRIES).then(|| {
+        Check::passed(
+            label,
+            format!(
+                "{served} served, and a server tries {MAX_AUTH_TRIES} by default before \
+                 refusing — pin a few in [[keys]], or set `IdentitiesOnly yes` and an \
+                 `IdentityFile` per host in ssh_config"
+            ),
+        )
+    })
 }
 
 /// The same invariants `start` enforces on the socket directory. A directory
@@ -760,31 +785,42 @@ fn check_socket(config: &Config) -> Check {
     }
 }
 
-/// What an earlier start wrote down beside the socket, if anything.
-fn check_remembered(config: &Config) -> Check {
+/// What an earlier start wrote down beside the socket, if anything — and,
+/// since a start can serve from it with no vault at all, the key-count line
+/// for it too.
+fn check_remembered(config: &Config) -> Vec<Check> {
     const LABEL: &str = "remembered identities";
     let found = config.socket_path().and_then(|socket| {
         let path = identities::path_for(&socket);
         identities::load(&path).map(|found| (path, found))
     });
     match found {
-        Ok((path, Some(remembered))) => Check::passed(
-            LABEL,
-            format!(
-                "{} at {} — a running agent refreshes them after a signature; `list` rewrites \
-                 them for the next start",
-                remembered.keys.len(),
-                path.display()
-            ),
-        ),
-        Ok((path, None)) => Check::passed(
+        Ok((path, Some(remembered))) => {
+            let mut checks = vec![Check::passed(
+                LABEL,
+                format!(
+                    "{} at {} — a running agent refreshes them after a signature; `list` \
+                     rewrites them for the next start",
+                    remembered.keys.len(),
+                    path.display()
+                ),
+            )];
+            // Counted as a start would serve them: pinned keys narrow the file.
+            let served = keystore::KeyStore::from_remembered(&remembered, config)
+                .store
+                .entries()
+                .count();
+            checks.extend(too_many_keys("remembered key count", served));
+            checks
+        }
+        Ok((path, None)) => vec![Check::passed(
             LABEL,
             format!(
                 "none yet at {} — the first start writes them",
                 path.display()
             ),
-        ),
-        Err(e) => Check::failed(LABEL, e.to_string()),
+        )],
+        Err(e) => vec![Check::failed(LABEL, e.to_string())],
     }
 }
 
@@ -946,7 +982,7 @@ mod tests {
     fn doctor_reports_the_remembered_identities() {
         let dir = tempfile::tempdir().unwrap();
         let config = config_with_socket(dir.path());
-        let none = check_remembered(&config);
+        let none = check_remembered(&config).remove(0);
         assert!(none.ok);
         assert!(none.detail.contains("none yet"), "{}", none.detail);
 
@@ -954,14 +990,14 @@ mod tests {
             dir.path(),
             "[[keys]]\nid = \"1\"\nname = \"n\"\npublic = \"p\"\n",
         );
-        let some = check_remembered(&config);
+        let some = check_remembered(&config).remove(0);
         assert!(some.ok);
         assert!(some.detail.starts_with("1 at "), "{}", some.detail);
 
         // a directory where the file should be cannot be read as one
         std::fs::remove_file(dir.path().join("agent.sock.identities")).unwrap();
         std::fs::create_dir(dir.path().join("agent.sock.identities")).unwrap();
-        assert!(!check_remembered(&config).ok);
+        assert!(!check_remembered(&config)[0].ok);
     }
 
     #[test]
@@ -1023,6 +1059,14 @@ mod tests {
         let check = expect_check(config::MasterPassword::TouchId, true, true);
         assert!(check.ok, "{}", check.detail);
         assert!(check.detail.contains("Touch ID"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_served_set_larger_than_a_server_tries_gets_a_line() {
+        assert!(too_many_keys("key count", MAX_AUTH_TRIES).is_none());
+        let line = too_many_keys("key count", MAX_AUTH_TRIES + 1).unwrap();
+        assert!(line.ok, "a warning, not a failure");
+        assert!(line.detail.contains("IdentitiesOnly"), "{}", line.detail);
     }
 
     #[test]
