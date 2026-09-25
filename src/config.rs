@@ -136,6 +136,15 @@ pub struct Config {
     #[serde(default = "default_lock_on_screen_lock")]
     pub lock_on_screen_lock: bool,
 
+    /// Once a signature is approved, approve the same key for the same
+    /// requester and hosts without asking, until the vault locks.
+    ///
+    /// Opt-in: it trades a prompt per signature for a prompt per application
+    /// per unlock, and anything driving that application can then sign
+    /// unasked while the vault is open.
+    #[serde(default)]
+    pub remember_approvals: bool,
+
     #[serde(default)]
     pub keys: Vec<KeyConfig>,
 }
@@ -555,6 +564,16 @@ id = "1"
                 .unwrap()
                 .master_password_idle(),
             None
+        );
+    }
+
+    #[test]
+    fn approvals_are_not_remembered_unless_asked_for() {
+        assert!(!parse("").unwrap().remember_approvals);
+        assert!(
+            parse("remember_approvals = true")
+                .unwrap()
+                .remember_approvals
         );
     }
 

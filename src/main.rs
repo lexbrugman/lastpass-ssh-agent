@@ -1,6 +1,7 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod agent;
+mod approvals;
 // Excluded from coverage: one `spawn_blocking` shared by the two macOS stores,
 // whose failure is a panicking Apple call that a test cannot arrange.
 #[cfg(target_os = "macos")]
@@ -434,6 +435,7 @@ async fn start(config_path: &Path) -> Result<()> {
         unlock.clone(),
         vaultlock::POLL_INTERVAL,
     ));
+    let lock_epoch = unlock.lock_epoch();
     tokio::task::spawn(unlock::expire_when_idle(unlock, vaultlock::POLL_INTERVAL));
 
     let factory = AgentFactory {
@@ -444,6 +446,10 @@ async fn start(config_path: &Path) -> Result<()> {
             unlocker,
             Arc::new(knownhosts::HostNames::default()),
         )
+        .with_approvals(Arc::new(approvals::Approvals::new(
+            config.remember_approvals,
+            lock_epoch,
+        )))
         .with_remembered_file(remembered_at)
         .with_refresher(refresher),
     };
@@ -832,17 +838,17 @@ async fn check_confirmation(config: &Config) -> Result<Check> {
         ));
     }
     let confirmer = confirm::from_config(config)?;
-    let ctx = confirm::ConfirmContext {
-        key_name: "doctor test (no real key)".into(),
-        fingerprint: "SHA256:this-is-only-a-test".into(),
-        item_id: "0".into(),
-        peer: Some(confirm::PeerInfo {
+    let ctx = confirm::ConfirmContext::describing(
+        "doctor test (no real key)".into(),
+        "SHA256:this-is-only-a-test".into(),
+        "0".into(),
+        Some(confirm::PeerInfo {
             pid: Some(std::process::id().cast_signed()),
             // SAFETY: getuid cannot fail and touches no memory.
             uid: unsafe { libc::getuid() },
         }),
-        bindings: Vec::new(),
-    };
+        Vec::new(),
+    );
     Ok(match confirmer.confirm(&ctx).await {
         confirm::Decision::Approve => {
             Check::passed("confirmation", "user approved the test prompt".into())

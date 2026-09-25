@@ -150,6 +150,7 @@ mod tests {
                 pid: None,
                 uid: 501,
             }),
+            requester: None,
             bindings: Vec::new(),
         }
     }

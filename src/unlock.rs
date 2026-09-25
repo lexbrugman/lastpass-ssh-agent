@@ -22,12 +22,16 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
+use crate::approvals::LockEpoch;
 use crate::config::MasterPassword;
 use crate::master::{self, MasterPasswordStore, Source};
 use crate::passphrase::PassphrasePrompt;
 
 pub struct Unlock {
     held: tokio::sync::Mutex<Option<Held>>,
+    /// Bumped whenever the password is dropped, so what should not outlive the
+    /// unlock — remembered approvals — can tell.
+    epoch: Arc<LockEpoch>,
     source: MasterPassword,
     store: Arc<dyn MasterPasswordStore>,
     prompt: Arc<dyn PassphrasePrompt>,
@@ -54,6 +58,7 @@ impl Unlock {
     ) -> Self {
         Self {
             held: tokio::sync::Mutex::new(None),
+            epoch: Arc::new(LockEpoch::default()),
             source,
             store,
             prompt,
@@ -78,6 +83,12 @@ impl Unlock {
         if !ask {
             return Ok(None);
         }
+        // Having to ask means the vault is locked, whoever locked it: a vault a
+        // shell had open holds nothing here and expires unseen, so this is the
+        // one place that lock is learned of. Counted rather than treated as a
+        // lock here, because the request asking is the one to decide what its
+        // own approval is worth.
+        self.epoch.unlocked();
         let (secret, from) = master::resolve(
             self.source,
             self.store.as_ref(),
@@ -99,6 +110,11 @@ impl Unlock {
         Ok(Some(secret))
     }
 
+    /// The counter of vault locks, for anything that should end with one.
+    pub fn lock_epoch(&self) -> Arc<LockEpoch> {
+        self.epoch.clone()
+    }
+
     /// What is held has just been used. Nothing held is nothing to note.
     pub async fn touch(&self) {
         if let Some(current) = self.held.lock().await.as_mut() {
@@ -112,6 +128,7 @@ impl Unlock {
         let Some(was) = self.held.lock().await.take() else {
             return;
         };
+        self.epoch.bump();
         if was.from == Source::Store {
             self.store_rejected.store(true, Ordering::SeqCst);
             tracing::warn!(
@@ -123,9 +140,13 @@ impl Unlock {
         }
     }
 
-    /// Drop it. Already dropped is fine and says nothing.
+    /// Drop it. Already dropped is fine and says nothing — but counts as a
+    /// lock all the same: a vault a shell opened holds nothing here, and what
+    /// was approved while it was open should end with the screen too.
     pub async fn forget(&self, why: &str) {
-        if self.held.lock().await.take().is_some() {
+        let was_held = self.held.lock().await.take().is_some();
+        self.epoch.bump();
+        if was_held {
             tracing::info!("{why}: the master password is no longer held");
         }
     }
@@ -142,6 +163,7 @@ impl Unlock {
         {
             held.take();
             drop(held);
+            self.epoch.bump();
             tracing::info!(
                 idle_secs = idle.as_secs(),
                 "unused for the idle time: the master password is no longer held"
@@ -359,6 +381,36 @@ mod tests {
         assert_eq!(&**unlock.password(true).await.unwrap().unwrap(), b"typed");
         assert_eq!(store.asked(), 1, "not asked a second time");
         assert_eq!(prompt.asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_way_of_dropping_it_counts_as_a_lock() {
+        let prompt = FakePrompt::answering(b"secret");
+        let unlock = prompting(prompt.clone(), Some(Duration::ZERO));
+        let epoch = unlock.lock_epoch();
+        assert_eq!(epoch.current(), 0);
+        unlock.forget("nothing held").await;
+        assert_eq!(
+            epoch.current(),
+            1,
+            "a lock with nothing held still ends approvals"
+        );
+        unlock.password(true).await.unwrap();
+        assert_eq!(epoch.unlocks(), 1, "having to ask is counted");
+        unlock.password(true).await.unwrap();
+        assert_eq!(epoch.unlocks(), 1, "served from what is held: no ask");
+        assert_eq!(epoch.current(), 1, "and an ask is not itself a lock");
+        unlock.forget("held").await;
+        assert_eq!(epoch.current(), 2);
+        unlock.password(true).await.unwrap();
+        unlock.rejected().await;
+        assert_eq!(epoch.current(), 3);
+        unlock.password(true).await.unwrap();
+        unlock.expire_if_idle().await;
+        assert_eq!(epoch.current(), 4);
+        unlock.rejected().await; // nothing held: not a lock
+        assert_eq!(epoch.current(), 4);
+        assert_eq!(epoch.unlocks(), 3);
     }
 
     #[tokio::test]

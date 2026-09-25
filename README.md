@@ -214,6 +214,10 @@ vault scan) or tuning behavior:
 # On by default; macOS and Linux (through logind's LockedHint).
 # lock_on_screen_lock = true
 
+# Once you approve a signature, approve the same key for the same requester
+# and hosts without asking, until the vault locks. Off by default.
+# remember_approvals = false
+
 # Pin items (disables auto-discovery); `search` prints these snippets.
 [[keys]]
 id = "7482913650418273946"     # stable LastPass item id (names are ambiguous)
@@ -517,6 +521,33 @@ another agent.
 | `tty` (Linux default) | Prompt on the agent's own `/dev/tty`; type `yes` to approve. |
 | `askpass` | Runs the program in `askpass` with the prompt as its argument; exit 0 approves. `SSH_ASKPASS_PROMPT=confirm` is set, so OpenSSH-compatible helpers show a yes/no dialog rather than their password prompt — without it, clicking OK would approve whatever was typed. |
 | `off` | No confirmation (socket permissions are then your only guard, as with stock ssh-agent). |
+
+### Remembering approvals
+
+```toml
+remember_approvals = true
+```
+
+With this on, approving a signature answers the same question the next time
+it is asked — the same key, for the same process started from the same chain,
+bound to the same hosts — until the vault locks: the screen locks, the master
+password goes unused for `vault_unlock_timeout_secs`, the agent has to ask for
+it again for any reason, or the agent stops. (A vault your shell unlocked
+expires without telling the agent; the request that finds it locked asks for
+the master password, and approvals end there.) A
+`git push` from your editor then costs one prompt per unlock rather than one
+per push, which is the arrangement 1Password's agent offers.
+
+Off by default, because the trade is real: while an approval stands, anything
+able to drive that application can sign with that key unasked. The prompt
+itself is unchanged, and a request that differs in any of the words it shows —
+another key, another host, another place it was started from — asks again.
+
+One limit: a vault your shell keeps open is outside the agent's view. It sees
+that vault lock only when a request of its own has to ask for the master
+password, so a shell that locks and reopens the vault between two requests
+does not end approvals given before it. If that matters, let the agent do the
+unlocking — do not run `lpass` yourself — and every lock is one it sees.
 
 ## Notes & limitations
 

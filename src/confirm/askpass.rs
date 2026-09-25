@@ -82,6 +82,7 @@ mod tests {
                 pid: Some(4242),
                 uid: 501,
             }),
+            requester: None,
             bindings: Vec::new(),
         }
     }

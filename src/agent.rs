@@ -7,6 +7,7 @@ use ssh_agent_lib::proto::{Extension, Identity, Request, Response, SignRequest};
 use ssh_key::{PrivateKey, Signature};
 use zeroize::Zeroizing;
 
+use crate::approvals::Approvals;
 use crate::confirm::{ConfirmContext, Confirmer, Decision, PeerInfo, SessionBinding};
 use crate::interaction::InteractionGate;
 use crate::keystore::{KeyEntry, Served};
@@ -23,6 +24,9 @@ pub struct LpassAgent {
     store: Served,
     lpass: Arc<dyn LpassClient>,
     confirmer: Arc<dyn Confirmer>,
+    /// What has been approved since the vault last locked, when remembering
+    /// is on.
+    approvals: Arc<Approvals>,
     /// Decrypts the fetched key, resolving a passphrase the vault does not
     /// hold. Reached only for an encrypted key.
     unlocker: Arc<Unlocker>,
@@ -68,6 +72,7 @@ impl LpassAgent {
             store,
             lpass,
             confirmer,
+            approvals: Arc::new(Approvals::off()),
             unlocker,
             host_names,
             interaction: Arc::new(tokio::sync::Mutex::new(())),
@@ -76,6 +81,13 @@ impl LpassAgent {
             remembered: None,
             refresher: None,
         }
+    }
+
+    /// Remember approvals until the vault locks; see `approvals`.
+    #[must_use]
+    pub fn with_approvals(mut self, approvals: Arc<Approvals>) -> Self {
+        self.approvals = approvals;
+        self
     }
 
     /// Keep the served set current between starts; see `refresh`.
@@ -352,30 +364,106 @@ impl Session for LpassAgent {
             return Err(AgentError::Failure);
         };
 
-        if entry.confirm {
-            let ctx = ConfirmContext::new(entry, self.peer, self.named_bindings().await);
+        // The epoch a remembered approval was honoured in, when one was. The
+        // fetch below can find the vault locked — by a lock this agent never
+        // saw, a shell's unlock expiring — and a signature made past that is
+        // one the approval no longer covers: refused, not issued.
+        let mut approved_in = None;
+        // The question the user has just said yes to, and the epoch they said
+        // it in; filed once the signature is issued, so a fetch that is itself
+        // the first unlock can carry it into the epoch that begins there.
+        let mut to_remember = None;
+        // Only a client that can prompt can have unlocked the vault, and it
+        // does so holding the gate — so the gate is taken first, and every
+        // wait is over before the requester is looked at or the unlock counter
+        // read: a request that stood here while another's prompt was up sees
+        // the requester as it is now, and an unlock that other request did is
+        // not taken for one of its own.
+        // The host lookup first: it can wait on the filesystem, and nothing
+        // about it needs the user, so no other request should stand behind it.
+        let bindings = if entry.confirm {
+            self.named_bindings().await
+        } else {
+            Vec::new()
+        };
+        let may_unlock = self.lpass.may_prompt();
+        if may_unlock {
             gate.enter().await;
-            match self.confirmer.confirm(&ctx).await {
-                Decision::Approve => {}
-                Decision::Deny => {
-                    // Not "denied by user": a prompt that could not be shown
-                    // denies too, and claiming a refusal that never happened
-                    // sends whoever reads this looking in the wrong place. The
-                    // confirmer has just logged which it was.
-                    tracing::info!(item = %entry.item_id, key = %entry.name,
-                        "signature denied");
-                    return Err(AgentError::Failure);
+        }
+        if entry.confirm {
+            let mut ctx = ConfirmContext::new(entry, self.peer, bindings);
+            let mut question = crate::confirm::approval_question(&ctx);
+            let remembered = |question: &Option<String>| {
+                question
+                    .as_deref()
+                    .and_then(|question| self.approvals.remembered_in(question))
+            };
+            // Asked again once the gate is held: a second request with the same
+            // question, arriving while the first was on screen, would otherwise
+            // put a second prompt up for an answer just given. The context is
+            // rebuilt there too, so what the prompt shows and what is remembered
+            // are one snapshot of the requester, taken now rather than before
+            // the wait.
+            let mut answered = remembered(&question);
+            if answered.is_none() {
+                gate.enter().await;
+                ctx = ConfirmContext::new(entry, self.peer, ctx.bindings);
+                question = crate::confirm::approval_question(&ctx);
+                answered = remembered(&question);
+            }
+            if let Some(epoch) = answered {
+                tracing::info!(item = %entry.item_id, key = %entry.name,
+                    "signature approved as before, for the same requester and hosts");
+                approved_in = Some(epoch);
+            } else {
+                match self.confirmer.confirm(&ctx).await {
+                    Decision::Approve => {
+                        to_remember = question.map(|question| (question, self.approvals.epoch()));
+                    }
+                    Decision::Deny => {
+                        // Not "denied by user": a prompt that could not be shown
+                        // denies too, and claiming a refusal that never happened
+                        // sends whoever reads this looking in the wrong place. The
+                        // confirmer has just logged which it was.
+                        tracing::info!(item = %entry.item_id, key = %entry.name,
+                            "signature denied");
+                        return Err(AgentError::Failure);
+                    }
                 }
             }
         }
 
-        match self
+        let unlocks_before = self.approvals.unlocks();
+        let result = self
             .fetch_and_sign(entry, &request.data, request.flags, &mut gate)
-            .await
-        {
+            .await;
+        // Having had to ask for the master password means the vault was locked,
+        // by a lock nothing here saw: what was approved before it is void,
+        // whether or not the ask was answered — a prompt dismissed leaves the
+        // vault as locked as it found it.
+        let unlocked_now = may_unlock && self.approvals.unlocks() != unlocks_before;
+        if unlocked_now {
+            self.approvals.lock();
+        }
+        match result {
+            Ok(_)
+                if approved_in
+                    .is_some_and(|epoch| unlocked_now || epoch != self.approvals.epoch()) =>
+            {
+                tracing::warn!(item = %entry.item_id, key = %entry.name,
+                    "the vault locked during this request, so the remembered approval no \
+                     longer covers it — retry, and confirm");
+                Err(AgentError::Failure)
+            }
             Ok(signature) => {
                 tracing::info!(item = %entry.item_id, key = %entry.name,
                     algorithm = %signature.algorithm(), "signature issued");
+                // This request's own approval belongs to the epoch that began
+                // with its unlock.
+                if let Some((question, epoch)) = to_remember {
+                    self.approvals
+                        .remember_in(question, if unlocked_now { epoch + 1 } else { epoch });
+                }
                 if let Some(refresher) = &self.refresher {
                     refresher.after_signature();
                 }
@@ -506,6 +594,298 @@ mod tests {
         async fn confirm(&self, _ctx: &ConfirmContext) -> Decision {
             Decision::Deny
         }
+    }
+
+    /// Approves, and counts how often it was asked.
+    #[derive(Default)]
+    struct CountingConfirmer(std::sync::Mutex<usize>);
+    #[async_trait::async_trait]
+    impl Confirmer for CountingConfirmer {
+        async fn confirm(&self, _ctx: &ConfirmContext) -> Decision {
+            *self.0.lock().unwrap() += 1;
+            Decision::Approve
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remembered_approval_answers_the_same_question_until_the_vault_locks() {
+        init_tracing();
+        let client = Arc::new(
+            MockLpass::logged_in()
+                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+                .with_field("1", "Private Key", ED25519.as_bytes()),
+        );
+        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
+        let store = Served::new(
+            KeyStore::load(&*client, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let asked = Arc::new(CountingConfirmer::default());
+        let epoch = Arc::new(crate::approvals::LockEpoch::default());
+        let mut agent = LpassAgent::new(
+            store,
+            client.clone(),
+            asked.clone(),
+            unlocking(&client, Arc::new(NoPrompt)),
+            no_host_names(),
+        )
+        .with_approvals(Arc::new(Approvals::new(true, epoch.clone())))
+        .with_peer(Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        }));
+
+        agent
+            .sign(sign_request(ED25519_PUB, b"one", 0))
+            .await
+            .unwrap();
+        agent
+            .sign(sign_request(ED25519_PUB, b"two", 0))
+            .await
+            .unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 1, "the second was remembered");
+
+        epoch.bump();
+        agent
+            .sign(sign_request(ED25519_PUB, b"three", 0))
+            .await
+            .unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 2, "asked again after a lock");
+
+        // a requester that cannot be identified is asked every time, on
+        let mut anonymous = agent.with_peer(None);
+        anonymous
+            .sign(sign_request(ED25519_PUB, b"four", 0))
+            .await
+            .unwrap();
+        anonymous
+            .sign(sign_request(ED25519_PUB, b"five", 0))
+            .await
+            .unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 4);
+
+        // and off — the default — every signature asks
+        let mut plain = agent.with_peer(agent.peer);
+        plain.approvals = Arc::new(Approvals::off());
+        plain
+            .sign(sign_request(ED25519_PUB, b"six", 0))
+            .await
+            .unwrap();
+        plain
+            .sign(sign_request(ED25519_PUB, b"seven", 0))
+            .await
+            .unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 6);
+    }
+
+    /// What a private-key fetch does to the lock epoch, on top of answering.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum OnFetch {
+        Nothing,
+        /// The vault turns out locked and the master password is asked for.
+        Ask,
+        /// The screen locks while the vault is being read.
+        Lock,
+        /// The vault turns out locked, and the prompt for the master password
+        /// is dismissed.
+        AskAndFail,
+    }
+
+    /// A vault whose private-key fetch does what `OnFetch` says.
+    struct LockingOnFetch(
+        Arc<MockLpass>,
+        Arc<crate::approvals::LockEpoch>,
+        std::sync::Mutex<OnFetch>,
+    );
+    impl LockingOnFetch {
+        fn on_fetch(&self, what: OnFetch) {
+            *self.2.lock().unwrap() = what;
+        }
+    }
+    #[async_trait::async_trait]
+    impl LpassClient for LockingOnFetch {
+        /// As the agent's real client: what asks for the master password.
+        fn may_prompt(&self) -> bool {
+            true
+        }
+        async fn show_field(
+            &self,
+            item_id: &str,
+            field: &str,
+        ) -> Result<Zeroizing<Vec<u8>>, crate::lpass::LpassError> {
+            if field == "Private Key" {
+                let what = *self.2.lock().unwrap();
+                match what {
+                    OnFetch::Nothing => {}
+                    OnFetch::Ask => self.1.unlocked(),
+                    OnFetch::Lock => self.1.bump(),
+                    OnFetch::AskAndFail => {
+                        self.1.unlocked();
+                        return Err(crate::lpass::LpassError::NoMasterPassword(
+                            "dismissed".into(),
+                        ));
+                    }
+                }
+            }
+            self.0.show_field(item_id, field).await
+        }
+        async fn ls(&self) -> Result<Vec<crate::lpass::ItemSummary>, crate::lpass::LpassError> {
+            self.0.ls().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lock_discovered_during_the_fetch_voids_the_remembered_approval() {
+        init_tracing();
+        let vault = Arc::new(
+            MockLpass::logged_in()
+                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+                .with_field("1", "Private Key", ED25519.as_bytes()),
+        );
+        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
+        let store = Served::new(
+            KeyStore::load(&*vault, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let epoch = Arc::new(crate::approvals::LockEpoch::default());
+        let locking = Arc::new(LockingOnFetch(
+            vault,
+            epoch.clone(),
+            std::sync::Mutex::new(OnFetch::Ask),
+        ));
+        let client: Arc<dyn LpassClient> = locking.clone();
+        let asked = Arc::new(CountingConfirmer::default());
+        let mut agent = LpassAgent::new(
+            store,
+            client.clone(),
+            asked.clone(),
+            Arc::new(Unlocker::new(client, Arc::new(NoPrompt))),
+            no_host_names(),
+        )
+        .with_approvals(Arc::new(Approvals::new(true, epoch.clone())))
+        .with_peer(Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        }));
+        let sign = |data: &'static [u8]| sign_request(ED25519_PUB, data, 0);
+
+        // asked, approved, and the fetch is what first opens the vault — the
+        // approval is filed in the epoch that begins there, so the next
+        // request has it
+        agent.sign(sign(b"one")).await.unwrap();
+        assert_eq!(epoch.current(), 1, "the ask was turned into a lock");
+        locking.on_fetch(OnFetch::Nothing);
+        agent.sign(sign(b"two")).await.unwrap();
+        assert_eq!(
+            *asked.0.lock().unwrap(),
+            1,
+            "remembered across the first unlock"
+        );
+
+        // answered from memory, then the vault turns out locked under it:
+        // refused, not signed
+        locking.on_fetch(OnFetch::Ask);
+        assert!(agent.sign(sign(b"three")).await.is_err());
+        assert_eq!(
+            *asked.0.lock().unwrap(),
+            1,
+            "never asked, so not silently confirmed"
+        );
+        // the retry is in the new epoch: asked, and signed
+        locking.on_fetch(OnFetch::Nothing);
+        agent.sign(sign(b"four")).await.unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 2);
+
+        // the screen locking while the vault is read: the same refusal for
+        // an answer from memory
+        locking.on_fetch(OnFetch::Lock);
+        assert!(agent.sign(sign(b"five")).await.is_err());
+        assert_eq!(*asked.0.lock().unwrap(), 2);
+        // and a confirmation given just before such a lock is not carried past
+        // it: the next request asks again
+        agent.sign(sign(b"six")).await.unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 3);
+        locking.on_fetch(OnFetch::Nothing);
+        agent.sign(sign(b"seven")).await.unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 4);
+
+        // a prompt dismissed leaves the vault as locked as it was found, and
+        // ends what was approved before just the same: the request fails, and
+        // the next one asks even once the vault is open again
+        locking.on_fetch(OnFetch::AskAndFail);
+        let before = epoch.current();
+        assert!(agent.sign(sign(b"eight")).await.is_err());
+        assert_eq!(epoch.current(), before + 1);
+        locking.on_fetch(OnFetch::Nothing);
+        agent.sign(sign(b"nine")).await.unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_request_waiting_at_the_gate_takes_an_approval_given_meanwhile() {
+        // Two identical requests at once: the first is on screen, the second
+        // waits at the gate — and must not put a second prompt up for an answer
+        // the first has just been given.
+        init_tracing();
+        let client = Arc::new(
+            MockLpass::logged_in()
+                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+                .with_field("1", "Private Key", ED25519.as_bytes()),
+        );
+        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
+        let store = Served::new(
+            KeyStore::load(&*client, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let asked = Arc::new(CountingConfirmer::default());
+        let approvals = Arc::new(Approvals::new(
+            true,
+            Arc::new(crate::approvals::LockEpoch::default()),
+        ));
+        let peer = Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        });
+        let first = LpassAgent::new(
+            store.clone(),
+            client.clone(),
+            asked.clone(),
+            unlocking(&client, Arc::new(NoPrompt)),
+            no_host_names(),
+        )
+        .with_approvals(approvals.clone())
+        .with_peer(peer);
+        let mut second = first.with_peer(peer);
+
+        // the first request holds the gate, as it would while its prompt is up
+        let on_screen = first.interaction.clone().lock_owned().await;
+        let waiting = tokio::spawn(async move {
+            second
+                .sign(sign_request(ED25519_PUB, b"two", 0))
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(*asked.0.lock().unwrap(), 0, "waiting at the gate");
+
+        // the first is approved and finishes
+        let served = store.current();
+        let entry = served.entries().next().unwrap();
+        let question =
+            crate::confirm::approval_question(&ConfirmContext::new(entry, peer, Vec::new()))
+                .unwrap();
+        approvals.remember_in(question, approvals.epoch());
+        drop(on_screen);
+
+        waiting.await.unwrap();
+        assert_eq!(
+            *asked.0.lock().unwrap(),
+            0,
+            "answered by the first's approval"
+        );
     }
 
     #[tokio::test]

@@ -163,6 +163,7 @@ mod tests {
             fingerprint: "SHA256:osa".into(),
             item_id: "1".into(),
             peer: None,
+            requester: None,
             bindings: Vec::new(),
         }
     }
