@@ -34,6 +34,7 @@ mod master;
 mod passphrase;
 mod platform;
 mod refresh;
+mod requester;
 mod signing;
 mod socket;
 #[cfg(test)]
