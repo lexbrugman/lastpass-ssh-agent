@@ -47,16 +47,16 @@ What it **cannot** guarantee:
   During a signature, plaintext key material exists briefly in `lpass`, the
   pipe, and this agent's memory. An attacker who can read this process's
   memory — or who owns your user account — wins regardless.
-- Deliberately **not** done, because it would be theater given the above:
-  `mlock`/`MADV_DONTDUMP` (key material lives milliseconds and macOS swap is
-  encrypted by default) and `PT_DENY_ATTACH` (a local debugger-capable
-  attacker can read this process, which holds the master password while the
-  vault is unlocked).
-- What **is** done cheaply: core dumps disabled (`RLIMIT_CORE=0`),
+- What **is** done cheaply: no other process of yours may attach a debugger
+  to the agent or read its memory (`PR_SET_DUMPABLE=0` on Linux,
+  `PT_DENY_ATTACH` on macOS — root excepted, as with ssh-agent), the held
+  master password is pinned in RAM and excluded from dumps (`mlock`, and
+  `MADV_DONTDUMP` on Linux), core dumps disabled (`RLIMIT_CORE=0`),
   `umask 077`, socket directory forced to `0700`/owner-only with symlink
   refusal, socket `0600`, lpass environment allowlisted, `ssh_agent_lib` debug
   logging capped (its request dumps could contain a private key a client tried
-  to add).
+  to add). Key material itself is not pinned: it lives milliseconds per
+  signature.
 - **Your master password** is handled by this agent, the way 1Password's
   agent handles its vault key: asked for when the vault is locked, held in
   memory while it is unlocked, and forgotten when the screen locks, when it

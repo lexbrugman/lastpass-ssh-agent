@@ -44,9 +44,46 @@ pub struct Unlock {
 }
 
 struct Held {
+    /// Pinned in RAM for as long as it is held — see `platform::pin`. The copy
+    /// handed to each call is not: it lives for that call and is wiped after.
     secret: Zeroizing<Vec<u8>>,
     from: Source,
     last_used: Instant,
+}
+
+impl Held {
+    fn new(secret: Zeroizing<Vec<u8>>, from: Source) -> Self {
+        crate::platform::pin(secret.as_ptr(), secret.capacity()).unwrap_or_else(could_not_pin);
+        Self {
+            secret,
+            from,
+            last_used: Instant::now(),
+        }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        // Wiped while still pinned, so the pages never hold the password
+        // between being unpinned and being zeroed.
+        let (ptr, capacity) = (self.secret.as_ptr(), self.secret.capacity());
+        self.secret.zeroize();
+        crate::platform::unpin(ptr, capacity);
+    }
+}
+
+/// The password is held all the same: what pinning adds is keeping it off
+/// swap and out of dumps, and a lock limit exhausted by something else is not
+/// a reason to refuse the vault. Excluded from coverage: a test cannot arrange
+/// that limit. (`unwrap_or_else` dictates the by-value signature.)
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "unwrap_or_else requires FnOnce(io::Error)"
+)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn could_not_pin(e: std::io::Error) {
+    tracing::warn!("cannot keep the master password out of swap and dumps: {e}");
 }
 
 impl Unlock {
@@ -101,11 +138,7 @@ impl Unlock {
             source = from.name(),
             "holding the master password until the vault locks"
         );
-        *held = Some(Held {
-            secret: secret.clone(),
-            from,
-            last_used: Instant::now(),
-        });
+        *held = Some(Held::new(secret.clone(), from));
         drop(held);
         Ok(Some(secret))
     }
