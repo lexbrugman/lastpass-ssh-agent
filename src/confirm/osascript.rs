@@ -153,10 +153,6 @@ mod tests {
     use crate::confirm::PeerInfo;
     use std::path::{Path, PathBuf};
 
-    fn stub(dir: &Path, body: &str) -> PathBuf {
-        crate::testutil::write_script(dir, "osascript-stub", body)
-    }
-
     fn ctx() -> ConfirmContext {
         ConfirmContext {
             key_name: "osa test".into(),
@@ -170,7 +166,7 @@ mod tests {
 
     fn confirmer(dir: &Path, body: &str) -> OsascriptConfirmer {
         OsascriptConfirmer::with_program(
-            stub(dir, body),
+            crate::testutil::osascript_stub(dir, body),
             Duration::from_secs(5),
             Duration::from_secs(5),
         )
@@ -232,7 +228,7 @@ mod tests {
     async fn wedged_dialog_is_killed_and_denied() {
         let dir = tempfile::tempdir().unwrap();
         let c = OsascriptConfirmer::with_program(
-            stub(dir.path(), "sleep 30"),
+            crate::testutil::osascript_stub(dir.path(), "sleep 30"),
             Duration::from_millis(100),
             Duration::from_millis(100),
         );
@@ -249,7 +245,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("order.txt");
         let confirmer = std::sync::Arc::new(OsascriptConfirmer::with_program(
-            stub(
+            crate::testutil::osascript_stub(
                 dir.path(),
                 &format!(
                     "printf 'open\\n' >> {log}; sleep 0.3; printf 'close\\n' >> {log}; \
@@ -285,7 +281,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("argv.txt");
         let c = OsascriptConfirmer::with_program(
-            stub(
+            crate::testutil::osascript_stub(
                 dir.path(),
                 // argv: -e SCRIPT message giveup
                 &format!(

@@ -5,30 +5,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const ED25519_PUB: &str = include_str!("fixtures/ed25519.pub");
-const SK_ED25519_PUB: &str = include_str!("fixtures/sk_ed25519.pub");
+#[path = "common/fixtures.rs"]
+mod fixtures;
+#[path = "common/script.rs"]
+mod script;
+#[path = "common/vault.rs"]
+mod vault;
+
+use fixtures::{ED25519_PUB, SK_ED25519_PUB};
+use script::write_script;
 
 struct Setup {
     dir: tempfile::TempDir,
     config: PathBuf,
-}
-
-/// Write an executable script the way `testutil::write_script` does: staged,
-/// then copied into place by a separate process, so no descriptor open for
-/// writing exists in this process for a concurrent spawn to inherit.
-fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let staged = dir.join(format!(".{name}.staging"));
-    let path = dir.join(name);
-    std::fs::write(&staged, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let status = Command::new("cp")
-        .arg("-p")
-        .arg(&staged)
-        .arg(&path)
-        .status()
-        .unwrap();
-    assert!(status.success(), "could not copy {name} into place");
-    path
 }
 
 fn fake_lpass(dir: &Path, body: &str) -> PathBuf {
@@ -37,18 +26,20 @@ fn fake_lpass(dir: &Path, body: &str) -> PathBuf {
 
 /// The standard healthy vault: item 1 is an SSH Key, item 3 is not.
 fn healthy_vault_body(dir: &Path) -> String {
-    std::fs::write(dir.join("pub"), ED25519_PUB).unwrap();
-    format!(
-        r#"case "$1" in
-  ls) printf 'Personal/ed [id: 1]\nPersonal/Visa [id: 3]\n';;
-  show)
-    case "$2" in
-      "--field=NoteType") [ "$3" = 1 ] && echo "SSH Key" || echo "Credit Card";;
-      "--field=Public Key") cat "{}/pub";;
-      *) exit 1;;
-    esac;;
-esac"#,
-        dir.display()
+    vault::body(
+        dir,
+        &[
+            vault::Item {
+                id: "1",
+                name: "Personal/ed",
+                ssh_key: Some((ED25519_PUB, None)),
+            },
+            vault::Item {
+                id: "3",
+                name: "Personal/Visa",
+                ssh_key: None,
+            },
+        ],
     )
 }
 

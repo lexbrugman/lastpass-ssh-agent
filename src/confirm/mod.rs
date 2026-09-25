@@ -402,7 +402,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    const ED25519_PUB: &str = include_str!("../../tests/fixtures/ed25519.pub");
+    use crate::testutil::fixtures::*;
 
     fn entry() -> KeyEntry {
         KeyEntry {

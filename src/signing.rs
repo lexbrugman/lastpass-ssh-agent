@@ -108,13 +108,7 @@ mod tests {
     use super::*;
     use signature::Verifier;
 
-    const ED25519: &str = include_str!("../tests/fixtures/ed25519");
-    const ED25519_PUB: &str = include_str!("../tests/fixtures/ed25519.pub");
-    const RSA: &str = include_str!("../tests/fixtures/rsa");
-    const RSA_PUB: &str = include_str!("../tests/fixtures/rsa.pub");
-    const ECDSA: &str = include_str!("../tests/fixtures/ecdsa");
-    const ECDSA_PUB: &str = include_str!("../tests/fixtures/ecdsa.pub");
-    const ED25519_PW: &str = include_str!("../tests/fixtures/ed25519_pw");
+    use crate::testutil::fixtures::*;
 
     fn keypair(private: &str, public: &str) -> (PrivateKey, ssh_key::PublicKey) {
         (

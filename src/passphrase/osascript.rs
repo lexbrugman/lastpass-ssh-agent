@@ -150,15 +150,9 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    /// Stand-in for osascript: a shell script that ignores the `AppleScript`
-    /// arguments and produces whatever the test needs.
-    fn stub(dir: &Path, body: &str) -> PathBuf {
-        crate::testutil::write_script(dir, "osascript", body)
-    }
-
     fn prompt_with(dir: &Path, body: &str) -> OsascriptPrompt {
         OsascriptPrompt::with_program(
-            stub(dir, body),
+            crate::testutil::osascript_stub(dir, body),
             Duration::from_secs(5),
             Duration::from_millis(200),
         )
@@ -255,7 +249,7 @@ mod tests {
     async fn a_wedged_dialog_is_killed_and_reported_as_cancelled() {
         let dir = tempfile::tempdir().unwrap();
         let prompt = OsascriptPrompt::with_program(
-            stub(dir.path(), "sleep 30"),
+            crate::testutil::osascript_stub(dir.path(), "sleep 30"),
             Duration::from_millis(100),
             Duration::from_millis(100),
         );

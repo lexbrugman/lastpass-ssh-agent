@@ -16,10 +16,14 @@ use ssh_agent_lib::proto::{
 };
 use ssh_key::{PrivateKey, PublicKey};
 
-const ED25519: &str = include_str!("fixtures/ed25519");
-const ED25519_PUB: &str = include_str!("fixtures/ed25519.pub");
-const RSA: &str = include_str!("fixtures/rsa");
-const RSA_PUB: &str = include_str!("fixtures/rsa.pub");
+#[path = "common/fixtures.rs"]
+mod fixtures;
+#[path = "common/script.rs"]
+mod script;
+#[path = "common/vault.rs"]
+mod vault;
+
+use fixtures::{ED25519, ED25519_PUB, RSA, RSA_PUB};
 
 struct AgentUnderTest {
     child: Child,
@@ -44,48 +48,29 @@ impl Drop for AgentUnderTest {
     }
 }
 
+/// The vault every agent under test serves: item 1 an ed25519 key, item 2 an
+/// RSA key, item 3 not a key at all.
 fn write_fake_lpass(dir: &Path) -> PathBuf {
-    for (name, content) in [
-        ("ed25519", ED25519),
-        ("ed25519.pub", ED25519_PUB),
-        ("rsa", RSA),
-        ("rsa.pub", RSA_PUB),
-    ] {
-        std::fs::write(dir.join(name), content).unwrap();
-    }
-    let script = dir.join("lpass");
-    std::fs::write(
-        &script,
-        format!(
-            r#"#!/bin/sh
-FIX="{}"
-case "$1" in
-  status) echo "Logged in as test@example.com."; exit 0;;
-  ls)
-    printf 'Personal/ed [id: 1]\nWork/rsa [id: 2]\nPersonal/Visa [id: 3]\n';;
-  show)
-    item="$3"
-    case "$2" in
-      "--field=NoteType") if [ "$item" = 1 ] || [ "$item" = 2 ]; then echo "SSH Key"; else echo "Credit Card"; fi;;
-      "--field=Public Key") cat "$FIX/key$item.pub";;
-      "--field=Private Key") cat "$FIX/key$item";;
-      "--field=Passphrase") exit 0;;
-      *) exit 1;;
-    esac;;
-  *) exit 1;;
-esac
-"#,
-            dir.display()
-        ),
+    vault::write(
+        dir,
+        &[
+            vault::Item {
+                id: "1",
+                name: "Personal/ed",
+                ssh_key: Some((ED25519_PUB, Some(ED25519))),
+            },
+            vault::Item {
+                id: "2",
+                name: "Work/rsa",
+                ssh_key: Some((RSA_PUB, Some(RSA))),
+            },
+            vault::Item {
+                id: "3",
+                name: "Personal/Visa",
+                ssh_key: None,
+            },
+        ],
     )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // key ids map to fixture files: item 1 = ed25519, item 2 = rsa
-    std::fs::hard_link(dir.join("ed25519"), dir.join("key1")).unwrap();
-    std::fs::hard_link(dir.join("ed25519.pub"), dir.join("key1.pub")).unwrap();
-    std::fs::hard_link(dir.join("rsa"), dir.join("key2")).unwrap();
-    std::fs::hard_link(dir.join("rsa.pub"), dir.join("key2.pub")).unwrap();
-    script
 }
 
 fn start_agent() -> AgentUnderTest {
@@ -499,7 +484,7 @@ async fn a_start_that_skipped_an_item_writes_nothing_down() {
     // better some keys than none — but a file missing a key is not one the
     // next start may trust, so none is written.
     let (dir, socket, config_path) = pinned_setup();
-    std::fs::remove_file(dir.path().join("key2.pub")).unwrap();
+    std::fs::remove_file(dir.path().join("2.pub")).unwrap();
 
     let agent = spawn_agent(&config_path, &socket);
     wait_for_socket(&socket, true, "agent never bound the socket");

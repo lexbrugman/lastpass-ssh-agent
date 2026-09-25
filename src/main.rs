@@ -976,7 +976,7 @@ mod tests {
 
     #[test]
     fn a_start_serves_what_was_remembered_for_any_setup() {
-        const ED25519_PUB: &str = include_str!("../tests/fixtures/ed25519.pub");
+        use crate::testutil::fixtures::*;
         let dir = tempfile::tempdir().unwrap();
         let file = format!(
             "[[keys]]\nid = \"1\"\nname = \"one\"\npublic = \"{}\"\n",

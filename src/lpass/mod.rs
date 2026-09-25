@@ -427,6 +427,23 @@ pub mod mock {
             self
         }
 
+        /// An SSH Key item holding the ed25519 fixture, both halves.
+        pub fn with_ed25519(self, item: &str) -> Self {
+            use crate::testutil::fixtures::{ED25519, ED25519_PUB};
+            self.with_field(item, "Public Key", ED25519_PUB.as_bytes())
+                .with_field(item, "Private Key", ED25519.as_bytes())
+        }
+
+        /// An SSH Key item holding only the ed25519 fixture's public half —
+        /// enough to be served, not to sign.
+        pub fn with_ed25519_public(self, item: &str) -> Self {
+            self.with_field(
+                item,
+                "Public Key",
+                crate::testutil::fixtures::ED25519_PUB.as_bytes(),
+            )
+        }
+
         pub fn with_broken_item(mut self, item: &str) -> Self {
             self.broken_items.push(item.into());
             self
@@ -457,6 +474,11 @@ pub mod mock {
         }
     }
 
+    /// Whether `list` names this item's field.
+    fn lists(list: &[(String, String)], item: &str, field: &str) -> bool {
+        list.iter().any(|(id, f)| id == item && f == field)
+    }
+
     #[async_trait::async_trait]
     impl LpassClient for MockLpass {
         async fn show_field(
@@ -471,35 +493,20 @@ pub mod mock {
             if !self.logged_in {
                 return Err(LpassError::NotLoggedIn);
             }
-            if self
-                .logged_out_fields
-                .iter()
-                .any(|(id, f)| id == item_id && f == field)
-            {
+            if lists(&self.logged_out_fields, item_id, field) {
                 return Err(LpassError::NotLoggedIn);
             }
-            if self
-                .locked_fields
-                .iter()
-                .any(|(id, f)| id == item_id && f == field)
-            {
+            if lists(&self.locked_fields, item_id, field) {
                 return Err(LpassError::Locked);
             }
-            if self
-                .absent_fields
-                .iter()
-                .any(|(id, f)| id == item_id && f == field)
-            {
+            if lists(&self.absent_fields, item_id, field) {
                 return Err(LpassError::FieldNotFound {
                     item: item_id.into(),
                     field: field.into(),
                 });
             }
             if self.broken_items.iter().any(|id| id == item_id)
-                || self
-                    .broken_fields
-                    .iter()
-                    .any(|(id, f)| id == item_id && f == field)
+                || lists(&self.broken_fields, item_id, field)
             {
                 return Err(LpassError::CommandFailed {
                     code: Some(1),

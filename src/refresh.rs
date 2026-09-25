@@ -129,8 +129,7 @@ mod tests {
     use super::*;
     use crate::lpass::mock::MockLpass;
 
-    const ED25519_PUB: &str = include_str!("../tests/fixtures/ed25519.pub");
-    const RSA_PUB: &str = include_str!("../tests/fixtures/rsa.pub");
+    use crate::testutil::fixtures::*;
 
     /// A served set of one key, and a refresher whose vault holds two.
     fn one_served_two_in_the_vault(
@@ -166,9 +165,11 @@ mod tests {
     }
 
     fn two_keys() -> MockLpass {
-        MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("2", "Public Key", RSA_PUB.as_bytes())
+        MockLpass::logged_in().with_ed25519_public("1").with_field(
+            "2",
+            "Public Key",
+            RSA_PUB.as_bytes(),
+        )
     }
 
     #[tokio::test]
@@ -228,7 +229,7 @@ mod tests {
         // Key 2 is there but the vault would not hand it over: an incomplete
         // scan must not replace a set, even one it would have grown.
         let vault = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_ed25519_public("1")
             .with_broken_item("2");
         let (refresher, served, remembered_at, _dir) =
             one_served_two_in_the_vault(vault, REFRESH_INTERVAL);

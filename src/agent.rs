@@ -552,13 +552,7 @@ mod tests {
         }
     }
 
-    const ED25519: &str = include_str!("../tests/fixtures/ed25519");
-    const ED25519_PUB: &str = include_str!("../tests/fixtures/ed25519.pub");
-    const ED25519_PW: &str = include_str!("../tests/fixtures/ed25519_pw");
-    const ED25519_PW_PUB: &str = include_str!("../tests/fixtures/ed25519_pw.pub");
-    const RSA_PUB: &str = include_str!("../tests/fixtures/rsa.pub");
-    const ECDSA: &str = include_str!("../tests/fixtures/ecdsa");
-    const ECDSA_PUB: &str = include_str!("../tests/fixtures/ecdsa.pub");
+    use crate::testutil::fixtures::*;
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt()
@@ -577,22 +571,26 @@ mod tests {
         keys_toml: &str,
         prompt: Arc<dyn PassphrasePrompt>,
     ) -> LpassAgent {
+        agent_over(Arc::new(client), keys_toml, Arc::new(NoConfirmer), prompt).await
+    }
+
+    /// An agent serving the keys `config` names, loaded from and signing
+    /// through `vault`, confirming and asking for passphrases as given.
+    async fn agent_over(
+        vault: Arc<dyn LpassClient>,
+        config: &str,
+        confirmer: Arc<dyn Confirmer>,
+        prompt: Arc<dyn PassphrasePrompt>,
+    ) -> LpassAgent {
         init_tracing();
-        let config: Config = toml::from_str(keys_toml).unwrap();
-        let client = Arc::new(client);
+        let config: Config = toml::from_str(config).unwrap();
         let store = Served::new(
-            KeyStore::load(&*client, &config.keys, &config)
+            KeyStore::load(vault.as_ref(), &config.keys, &config)
                 .await
                 .unwrap(),
         );
-        let unlocker = Arc::new(Unlocker::new(client.clone(), prompt));
-        LpassAgent::new(
-            store,
-            client,
-            Arc::new(NoConfirmer),
-            unlocker,
-            no_host_names(),
-        )
+        let unlocker = Arc::new(Unlocker::new(vault.clone(), prompt));
+        LpassAgent::new(store, vault, confirmer, unlocker, no_host_names())
     }
 
     /// No `known_hosts` at all. Every binding then shows its fingerprint, so
@@ -639,27 +637,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_remembered_approval_answers_the_same_question_until_the_vault_locks() {
-        init_tracing();
-        let client = Arc::new(
-            MockLpass::logged_in()
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-                .with_field("1", "Private Key", ED25519.as_bytes()),
-        );
-        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
-        let store = Served::new(
-            KeyStore::load(&*client, &config.keys, &config)
-                .await
-                .unwrap(),
-        );
         let asked = Arc::new(CountingConfirmer::default());
         let epoch = Arc::new(crate::approvals::LockEpoch::default());
-        let mut agent = LpassAgent::new(
-            store,
-            client.clone(),
+        let mut agent = agent_over(
+            Arc::new(MockLpass::logged_in().with_ed25519("1")),
+            "[[keys]]\nid = \"1\"",
             asked.clone(),
-            unlocking(&client, Arc::new(NoPrompt)),
-            no_host_names(),
+            Arc::new(NoPrompt),
         )
+        .await
         .with_approvals(Arc::new(Approvals::new(true, epoch.clone())))
         .with_peer(Some(PeerInfo {
             pid: Some(std::process::id().cast_signed()),
@@ -773,11 +759,7 @@ mod tests {
     #[tokio::test]
     async fn a_lock_discovered_during_the_fetch_voids_the_remembered_approval() {
         init_tracing();
-        let vault = Arc::new(
-            MockLpass::logged_in()
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-                .with_field("1", "Private Key", ED25519.as_bytes()),
-        );
+        let vault = Arc::new(MockLpass::logged_in().with_ed25519("1"));
         let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
         let store = Served::new(
             KeyStore::load(&*vault, &config.keys, &config)
@@ -870,11 +852,7 @@ mod tests {
         // waits at the gate — and must not put a second prompt up for an answer
         // the first has just been given.
         init_tracing();
-        let client = Arc::new(
-            MockLpass::logged_in()
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-                .with_field("1", "Private Key", ED25519.as_bytes()),
-        );
+        let client = Arc::new(MockLpass::logged_in().with_ed25519("1"));
         let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
         let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
@@ -931,9 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn identities_and_ed25519_signature() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519("1");
         let mut agent = agent_with(
             client,
             "confirm = \"off\"\n[[keys]]\nid = \"1\"\nname = \"test\"",
@@ -957,9 +933,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_peer_carries_state_and_peer() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519("1");
         let agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         let mut session = agent.with_peer(Some(PeerInfo {
             pid: Some(1234),
@@ -974,9 +948,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_private_key_field_fails() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", b"");
+        let client =
+            MockLpass::logged_in()
+                .with_ed25519_public("1")
+                .with_field("1", "Private Key", b"");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -987,7 +962,7 @@ mod tests {
     #[tokio::test]
     async fn identity_comments_neutralize_vault_controlled_names() {
         // `ssh-add -l` prints these comments straight to a terminal
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(
             client,
             "confirm = \"off\"\n[[keys]]\nid = \"1\"\nname = \"spoof\\u001b[2Ksafe\"",
@@ -1000,7 +975,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_key_fails() {
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         assert!(agent
             .sign(sign_request(RSA_PUB, b"payload", sigflag::RSA_SHA2_256))
@@ -1010,24 +985,14 @@ mod tests {
 
     #[tokio::test]
     async fn denied_confirmation_blocks_and_never_touches_private_key() {
-        init_tracing();
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
-        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
-        let client = Arc::new(client);
-        let store = Served::new(
-            KeyStore::load(&*client, &config.keys, &config)
-                .await
-                .unwrap(),
-        );
-        let mut agent = LpassAgent::new(
-            store,
+        let client = Arc::new(MockLpass::logged_in().with_ed25519("1"));
+        let mut agent = agent_over(
             client.clone(),
+            "[[keys]]\nid = \"1\"",
             Arc::new(DenyAll),
-            unlocking(&client, Arc::new(NoPrompt)),
-            no_host_names(),
-        );
+            Arc::new(NoPrompt),
+        )
+        .await;
 
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -1047,7 +1012,7 @@ mod tests {
     #[tokio::test]
     async fn logged_out_mid_session_fails_but_agent_survives() {
         // Store loaded while logged in; then simulate logout by swapping the client.
-        let loaded = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let loaded = MockLpass::logged_in().with_ed25519_public("1");
         let config: Config = toml::from_str("confirm = \"off\"\n[[keys]]\nid = \"1\"").unwrap();
         let store = Served::new(
             KeyStore::load(&loaded, &config.keys, &config)
@@ -1083,7 +1048,7 @@ mod tests {
         // advertised.
         let prompt = TypedPassphrase::new(b"fixture-passphrase");
         let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_ed25519_public("1")
             // encrypted, and a different key from the advertised one
             .with_field("1", "Private Key", ED25519_PW.as_bytes());
         let mut agent = agent_prompting(
@@ -1113,7 +1078,7 @@ mod tests {
         let remembered = dir.path().join("agent.sock.identities");
 
         // still advertised, but the item is gone from the vault
-        let loaded = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let loaded = MockLpass::logged_in().with_ed25519_public("1");
         let config: Config = toml::from_str("confirm = \"off\"\n[[keys]]\nid = \"1\"").unwrap();
         let store = Served::new(
             KeyStore::load(&loaded, &config.keys, &config)
@@ -1162,8 +1127,7 @@ mod tests {
         let config: Arc<Config> = Arc::new(toml::from_str("confirm = \"off\"").unwrap());
         let vault = Arc::new(
             MockLpass::logged_in()
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-                .with_field("1", "Private Key", ED25519.as_bytes())
+                .with_ed25519("1")
                 .with_field("1", "NoteType", b"SSH Key")
                 .with_field("2", "Public Key", ECDSA_PUB.as_bytes())
                 .with_field("2", "NoteType", b"SSH Key"),
@@ -1182,7 +1146,7 @@ mod tests {
         // the refresher's own view of the vault lists both items
         let listing = Arc::new(
             two.with_field("1", "NoteType", b"SSH Key")
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+                .with_ed25519_public("1")
                 .with_field("2", "NoteType", b"SSH Key")
                 .with_field("2", "Public Key", ECDSA_PUB.as_bytes()),
         );
@@ -1240,9 +1204,11 @@ mod tests {
         let remembered = dir.path().join("agent.sock.identities");
         std::fs::write(&remembered, "[[keys]]\n").unwrap();
 
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ECDSA.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1").with_field(
+            "1",
+            "Private Key",
+            ECDSA.as_bytes(),
+        );
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"")
             .await
             .with_remembered_file(remembered.clone());
@@ -1276,9 +1242,11 @@ mod tests {
 
     #[tokio::test]
     async fn garbage_private_key_fails() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", b"this is not a PEM at all");
+        let client = MockLpass::logged_in().with_ed25519_public("1").with_field(
+            "1",
+            "Private Key",
+            b"this is not a PEM at all",
+        );
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -1550,8 +1518,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let client = Arc::new(
             MockLpass::logged_in()
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-                .with_field("1", "Private Key", ED25519.as_bytes())
+                .with_ed25519("1")
                 .with_field("2", "Public Key", ECDSA_PUB.as_bytes())
                 .with_field("2", "Private Key", ECDSA.as_bytes()),
         );
@@ -1660,24 +1627,14 @@ mod tests {
     #[tokio::test]
     async fn an_unencrypted_key_resolves_no_passphrase_at_all() {
         let prompt = TypedPassphrase::new(b"never needed");
-        let client = Arc::new(
-            MockLpass::logged_in()
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-                .with_field("1", "Private Key", ED25519.as_bytes()),
-        );
-        let config: Config = toml::from_str(PW_KEY).unwrap();
-        let store = Served::new(
-            KeyStore::load(&*client, &config.keys, &config)
-                .await
-                .unwrap(),
-        );
-        let mut agent = LpassAgent::new(
-            store,
+        let client = Arc::new(MockLpass::logged_in().with_ed25519("1"));
+        let mut agent = agent_over(
             client.clone(),
+            PW_KEY,
             Arc::new(NoConfirmer),
-            unlocking(&client, prompt.clone()),
-            no_host_names(),
-        );
+            prompt.clone(),
+        )
+        .await;
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
             .await
@@ -1701,7 +1658,7 @@ mod tests {
         // log. Extension probes arrive on every OpenSSH connection.
         use ssh_agent_lib::proto::{AddIdentity, Extension, PrivateCredential, RemoveIdentity};
 
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         let private = PrivateKey::from_openssh(ED25519).unwrap();
 
@@ -1767,26 +1724,20 @@ mod tests {
     }
 
     async fn agent_recording(confirmer: Arc<RecordingConfirmer>) -> LpassAgent {
-        let client = Arc::new(
-            MockLpass::logged_in()
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-                .with_field("1", "Private Key", ED25519.as_bytes()),
-        );
-        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
-        let store = Served::new(
-            KeyStore::load(&*client, &config.keys, &config)
-                .await
-                .unwrap(),
-        );
-        let unlocker = unlocking(&client, Arc::new(NoPrompt));
-        LpassAgent::new(store, client, confirmer, unlocker, no_host_names())
+        agent_over(
+            Arc::new(MockLpass::logged_in().with_ed25519("1")),
+            "[[keys]]\nid = \"1\"",
+            confirmer,
+            Arc::new(NoPrompt),
+        )
+        .await
     }
 
     #[tokio::test]
     async fn query_advertises_session_bind() {
         // a client that negotiates before binding must be told we bind,
         // or forwarded requests would quietly lose their host chain
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
 
         let response = agent
@@ -1983,19 +1934,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_denied_signature_answers_failure_without_erroring() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
-        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
-        let client = Arc::new(client);
-        let store = Served::new(
-            KeyStore::load(&*client, &config.keys, &config)
-                .await
-                .unwrap(),
-        );
-        let unlocker = unlocking(&client, Arc::new(NoPrompt));
-        let mut agent =
-            LpassAgent::new(store, client, Arc::new(DenyAll), unlocker, no_host_names());
+        let mut agent = agent_over(
+            Arc::new(MockLpass::logged_in().with_ed25519("1")),
+            "[[keys]]\nid = \"1\"",
+            Arc::new(DenyAll),
+            Arc::new(NoPrompt),
+        )
+        .await;
 
         let response = agent
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
@@ -2006,9 +1951,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_granted_signature_answers_with_the_signature() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         let response = agent
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
@@ -2020,7 +1963,7 @@ mod tests {
     #[tokio::test]
     async fn trait_defaults_still_refuse_direct_calls() {
         use ssh_agent_lib::proto::{AddIdentity, PrivateCredential, RemoveIdentity};
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
 
         let private = PrivateKey::from_openssh(ED25519).unwrap();

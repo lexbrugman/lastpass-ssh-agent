@@ -427,8 +427,7 @@ mod tests {
     use super::*;
     use crate::lpass::mock::MockLpass;
 
-    const ED25519_PUB: &str = include_str!("../tests/fixtures/ed25519.pub");
-    const RSA_PUB: &str = include_str!("../tests/fixtures/rsa.pub");
+    use crate::testutil::fixtures::*;
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt()
@@ -444,9 +443,11 @@ mod tests {
 
     #[tokio::test]
     async fn loads_and_looks_up_keys() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("2", "Public Key", RSA_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1").with_field(
+            "2",
+            "Public Key",
+            RSA_PUB.as_bytes(),
+        );
         let config =
             config("[[keys]]\nid = \"1\"\nname = \"one\"\n[[keys]]\nid = \"2\"\nname = \"two\"");
         let store = KeyStore::load(&client, &config.keys, &config)
@@ -465,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn failing_item_is_skipped_not_fatal() {
         let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_ed25519_public("1")
             .with_broken_item("2");
         let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
         let store = KeyStore::load(&client, &config.keys, &config)
@@ -478,7 +479,7 @@ mod tests {
     async fn empty_public_key_field_is_skipped() {
         let client = MockLpass::logged_in()
             .with_field("1", "Public Key", b"")
-            .with_field("2", "Public Key", ED25519_PUB.as_bytes());
+            .with_ed25519_public("2");
         let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
         let store = KeyStore::load(&client, &config.keys, &config)
             .await
@@ -490,10 +491,9 @@ mod tests {
     async fn keys_the_agent_cannot_sign_with_are_not_advertised() {
         // a security-key entry parses fine, but signing happens on the FIDO
         // device — offering it would guarantee a failed signature later
-        const SK_PUB: &str = include_str!("../tests/fixtures/sk_ed25519.pub");
         let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", SK_PUB.as_bytes())
-            .with_field("2", "Public Key", ED25519_PUB.as_bytes());
+            .with_field("1", "Public Key", SK_ED25519_PUB.as_bytes())
+            .with_ed25519_public("2");
         let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
         let store = KeyStore::load(&client, &config.keys, &config)
             .await
@@ -506,7 +506,7 @@ mod tests {
     async fn garbage_public_key_is_skipped() {
         let client = MockLpass::logged_in()
             .with_field("1", "Public Key", b"not a key at all")
-            .with_field("2", "Public Key", ED25519_PUB.as_bytes());
+            .with_ed25519_public("2");
         let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
         let store = KeyStore::load(&client, &config.keys, &config)
             .await
@@ -519,7 +519,7 @@ mod tests {
         // Item 1 loads, item 2 finds the vault shut. Carrying on would serve a
         // set quietly missing item 2 — worse than not starting.
         let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_ed25519_public("1")
             .with_field("2", "Public Key", RSA_PUB.as_bytes())
             .with_logged_out_field("2", "Public Key");
         let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
@@ -542,8 +542,8 @@ mod tests {
     #[tokio::test]
     async fn duplicate_public_keys_are_a_hard_error() {
         let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("2", "Public Key", ED25519_PUB.as_bytes());
+            .with_ed25519_public("1")
+            .with_ed25519_public("2");
         let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
         let err = KeyStore::load(&client, &config.keys, &config)
             .await
@@ -581,9 +581,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_complete_scan_yields_a_store() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("2", "Public Key", RSA_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1").with_field(
+            "2",
+            "Public Key",
+            RSA_PUB.as_bytes(),
+        );
         let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
         let store = KeyStore::load_complete(&client, &config.keys, &config)
             .await
@@ -596,7 +598,7 @@ mod tests {
         // The set being served is complete; a scan missing a key because the
         // vault shut halfway must not replace it.
         let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_ed25519_public("1")
             .with_broken_item("2");
         let both = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
         assert!(KeyStore::load_complete(&client, &both.keys, &both)
@@ -604,7 +606,7 @@ mod tests {
             .is_none());
 
         let shut = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_ed25519_public("1")
             .with_logged_out_field("1", "Public Key");
         let one = config("[[keys]]\nid = \"1\"");
         assert!(KeyStore::load_complete(&shut, &one.keys, &one)
@@ -615,8 +617,8 @@ mod tests {
     #[tokio::test]
     async fn a_scan_with_a_duplicate_yields_nothing() {
         let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("2", "Public Key", ED25519_PUB.as_bytes());
+            .with_ed25519_public("1")
+            .with_ed25519_public("2");
         let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
         assert!(KeyStore::load_complete(&client, &config.keys, &config)
             .await
@@ -627,10 +629,9 @@ mod tests {
     async fn the_vaults_own_verdicts_are_still_skipped_by_a_refresh() {
         // Not the vault being unavailable: the vault answered, and the answer
         // is a key this agent cannot serve. That is skipped as at startup.
-        const SK_PUB: &str = include_str!("../tests/fixtures/sk_ed25519.pub");
         let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", SK_PUB.as_bytes())
-            .with_field("2", "Public Key", ED25519_PUB.as_bytes());
+            .with_field("1", "Public Key", SK_ED25519_PUB.as_bytes())
+            .with_ed25519_public("2");
         let both = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
         let store = KeyStore::load_complete(&client, &both.keys, &both)
             .await
@@ -651,7 +652,7 @@ mod tests {
         // is that there is no key. Skipping it is how the refresh stops
         // advertising it — treating it as unavailability would keep the deleted
         // key on offer for as long as the item stayed gone.
-        let gone = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let gone = MockLpass::logged_in().with_ed25519_public("1");
         let both = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
         let store = KeyStore::load_complete(&gone, &both.keys, &both)
             .await
@@ -659,7 +660,7 @@ mod tests {
         assert_eq!(store.len(), 1);
 
         let stripped = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_ed25519_public("1")
             .with_absent_field("2", "Public Key");
         let store = KeyStore::load_complete(&stripped, &both.keys, &both)
             .await
@@ -671,9 +672,11 @@ mod tests {
     /// same keys — which is the whole point of writing it down.
     #[tokio::test]
     async fn what_a_load_remembers_serves_the_same_keys_again() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("2", "Public Key", RSA_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1").with_field(
+            "2",
+            "Public Key",
+            RSA_PUB.as_bytes(),
+        );
         let config = config("[[keys]]\nid = \"1\"\nname = \"one\"\n[[keys]]\nid = \"2\"");
         let loaded = KeyStore::load(&client, &config.keys, &config)
             .await
@@ -694,7 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pinned_key_the_file_lacks_is_reported_not_invented() {
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let one = config("[[keys]]\nid = \"1\"");
         let remembered = KeyStore::load(&client, &one.keys, &one)
             .await
@@ -752,13 +755,12 @@ mod tests {
         // A hand edit, or a key type this build no longer signs with: refused
         // under the same policy a fresh fetch faces, and handed back as missing
         // so the vault gets the last word.
-        const SK_PUB: &str = include_str!("../tests/fixtures/sk_ed25519.pub");
         let remembered = Remembered {
             keys: vec![
                 RememberedKey {
                     id: "1".into(),
                     name: "sk".into(),
-                    public: SK_PUB.trim().into(),
+                    public: SK_ED25519_PUB.trim().into(),
                 },
                 RememberedKey {
                     id: "2".into(),
@@ -792,9 +794,11 @@ mod tests {
 
     #[tokio::test]
     async fn load_never_touches_private_fields() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", b"MUST NOT BE READ");
+        let client = MockLpass::logged_in().with_ed25519_public("1").with_field(
+            "1",
+            "Private Key",
+            b"MUST NOT BE READ",
+        );
         let config = config("[[keys]]\nid = \"1\"");
         KeyStore::load(&client, &config.keys, &config)
             .await

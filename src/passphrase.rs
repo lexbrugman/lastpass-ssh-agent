@@ -519,8 +519,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    const ED25519_PW: &str = include_str!("../tests/fixtures/ed25519_pw");
-    const ED25519_PW_PUB: &str = include_str!("../tests/fixtures/ed25519_pw.pub");
+    use crate::testutil::fixtures::*;
     const RIGHT: &[u8] = b"fixture-passphrase";
     const WRONG: &[u8] = b"not the passphrase";
 
