@@ -403,10 +403,6 @@ impl CmdOutput {
 
 #[async_trait::async_trait]
 impl LpassClient for LpassCli {
-    fn may_prompt(&self) -> bool {
-        matches!(self.source, MasterPasswordSource::Unlock(_))
-    }
-
     async fn show_field(
         &self,
         item_id: &str,
@@ -569,7 +565,6 @@ done"#,
         // Nothing to feed and nobody to ask: the one attempt is the answer.
         let dir = tempfile::tempdir().unwrap();
         let client = LpassCli::new(locked_vault(dir.path()));
-        assert!(!client.may_prompt());
         let err = client.show_field("42", "Private Key").await.unwrap_err();
         assert!(matches!(err, LpassError::Locked), "{err:?}");
         assert!(matches!(
@@ -607,7 +602,6 @@ done"#,
         let (unlock, asks) = unlock_answering(dir.path(), "echo secret");
         let client = LpassCli::new(locked_vault(dir.path()))
             .feeding(MasterPasswordSource::Unlock(unlock.clone()));
-        assert!(client.may_prompt());
         assert_eq!(
             &*client.show_field("42", "x").await.unwrap(),
             b"opened with secret"
@@ -635,7 +629,6 @@ done"#,
         let (unlock, asks) = unlock_answering(dir.path(), "echo secret");
         let client = LpassCli::new(locked_vault(dir.path()))
             .feeding(MasterPasswordSource::HeldOnly(unlock.clone()));
-        assert!(!client.may_prompt());
         assert!(matches!(
             client.show_field("42", "x").await.unwrap_err(),
             LpassError::Locked

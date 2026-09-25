@@ -671,6 +671,12 @@ fn start_refuses_when_logged_out() {
         "{}",
         stderr(&output)
     );
+    // and, being a first start, says what gets past a vault it cannot read
+    assert!(
+        stderr(&output).contains("run `lastpass-ssh-agent list`"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]

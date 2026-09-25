@@ -58,20 +58,6 @@ pub enum LpassError {
 /// copy them into non-zeroizing storage.
 #[async_trait::async_trait]
 pub trait LpassClient: Send + Sync {
-    /// Whether a call to this client can put a prompt on the user's screen —
-    /// true when it may ask for the master password on finding the vault
-    /// locked.
-    ///
-    /// The signing path needs to know *before* it calls: the gate that keeps
-    /// one interaction on screen at a time is taken there, and a prompt raised
-    /// from inside a fetch would otherwise share the screen with another
-    /// request's dialog.
-    ///
-    /// Required rather than defaulted: an implementation that quietly inherited
-    /// "never prompts" while in fact prompting would put a master-password
-    /// dialog outside the gate, which is the one thing this exists to prevent.
-    fn may_prompt(&self) -> bool;
-
     /// `lpass show --field=<field> <item_id>` — the value with trailing
     /// newlines removed. An existing-but-empty field yields an empty buffer.
     async fn show_field(
@@ -418,12 +404,13 @@ pub mod mock {
         pub broken_fields: Vec<(String, String)>,
         /// (item id, field) pairs that report the vault as shut.
         pub logged_out_fields: Vec<(String, String)>,
+        /// (item id, field) pairs that report the vault as locked — what a
+        /// client fed no master password gets.
+        pub locked_fields: Vec<(String, String)>,
         /// (item id, field) pairs the item simply does not have.
         pub absent_fields: Vec<(String, String)>,
         /// Every (item, field) fetched, for assertions on what was touched.
         pub fetch_log: Mutex<Vec<(String, String)>>,
-        /// Stands in for a vault that can ask for the master password.
-        pub prompting: bool,
     }
 
     impl MockLpass {
@@ -440,13 +427,6 @@ pub mod mock {
             self
         }
 
-        /// As a client that may ask for the master password: fetches from it
-        /// may put a prompt on screen.
-        pub const fn prompting(mut self) -> Self {
-            self.prompting = true;
-            self
-        }
-
         pub fn with_broken_item(mut self, item: &str) -> Self {
             self.broken_items.push(item.into());
             self
@@ -456,6 +436,13 @@ pub mod mock {
         /// while the rest of the client still works.
         pub fn with_logged_out_field(mut self, item: &str, field: &str) -> Self {
             self.logged_out_fields.push((item.into(), field.into()));
+            self
+        }
+
+        /// As a vault that is locked for this field until the master password
+        /// is fed: what the agent's quiet client sees.
+        pub fn with_locked_field(mut self, item: &str, field: &str) -> Self {
+            self.locked_fields.push((item.into(), field.into()));
             self
         }
 
@@ -472,10 +459,6 @@ pub mod mock {
 
     #[async_trait::async_trait]
     impl LpassClient for MockLpass {
-        fn may_prompt(&self) -> bool {
-            self.prompting
-        }
-
         async fn show_field(
             &self,
             item_id: &str,
@@ -494,6 +477,13 @@ pub mod mock {
                 .any(|(id, f)| id == item_id && f == field)
             {
                 return Err(LpassError::NotLoggedIn);
+            }
+            if self
+                .locked_fields
+                .iter()
+                .any(|(id, f)| id == item_id && f == field)
+            {
+                return Err(LpassError::Locked);
             }
             if self
                 .absent_fields

@@ -354,8 +354,16 @@ async fn start(config_path: &Path) -> Result<()> {
     let config = Arc::new(Config::load_or_default(config_path)?);
     let socket_path = config.socket_path()?;
     let unlock = unlock_from(&config, &socket_path)?;
-    let client: Arc<dyn LpassClient> = Arc::new(
+    // Two views of one vault: `asking` reaches for the master password when
+    // the vault is locked, `quiet` is fed only what is already held and so
+    // can never put a prompt on screen. The agent fetches through `quiet`
+    // without taking the interaction gate, and reaches for `asking` only
+    // under it.
+    let asking: Arc<dyn LpassClient> = Arc::new(
         client_from(&config)?.feeding(lpass::MasterPasswordSource::Unlock(unlock.clone())),
+    );
+    let quiet: Arc<dyn LpassClient> = Arc::new(
+        client_from(&config)?.feeding(lpass::MasterPasswordSource::HeldOnly(unlock.clone())),
     );
 
     // From what the last start wrote down, so binding costs no vault call;
@@ -364,15 +372,20 @@ async fn start(config_path: &Path) -> Result<()> {
     // `list`.
     //
     // A locked vault is asked for the master password by the first call that
-    // needs it, which is the scan's — so a start the file spares never asks.
+    // needs it, which is the scan's — so a start the file spares never asks,
+    // and one that cannot ask says what to do instead of failing bare.
     let remembered_at = identities::path_for(&socket_path);
     // `scanned_for` is how many keys the scan set out to load, when there was
     // one: what the file is written from has to be checked against it.
     let (store, scanned_for) = if let Some(store) = remembered_store(&remembered_at, &config)? {
         (store, None)
     } else {
-        let keys = keystore::effective_keys(&client, &config).await?;
-        let store = keystore::KeyStore::load(client.as_ref(), &keys, &config).await?;
+        let keys = keystore::effective_keys(&asking, &config)
+            .await
+            .map_err(first_start_needs_the_vault)?;
+        let store = keystore::KeyStore::load(asking.as_ref(), &keys, &config)
+            .await
+            .map_err(first_start_needs_the_vault)?;
         (store, Some(keys.len()))
     };
     let store = keystore::Served::new(store);
@@ -388,8 +401,12 @@ async fn start(config_path: &Path) -> Result<()> {
     }
 
     let confirmer = confirm::from_config(&config)?;
+    // Through `quiet` as well, so an encrypted key's passphrase fetch takes no
+    // gate either. A lock landing between that fetch and the private key's
+    // fails the signature rather than asking, and the retry asks: rarer than
+    // one encrypted-key signature queueing behind another would be common.
     let unlocker = Arc::new(passphrase::Unlocker::new(
-        client.clone(),
+        quiet.clone(),
         passphrase::from_config(&config)?,
     ));
     let (listener, guard) = socket::bind(&socket_path)?;
@@ -405,9 +422,7 @@ async fn start(config_path: &Path) -> Result<()> {
         store.clone(),
         remembered_at.clone(),
         config.clone(),
-        Arc::new(
-            client_from(&config)?.feeding(lpass::MasterPasswordSource::HeldOnly(unlock.clone())),
-        ),
+        quiet.clone(),
         refresh::REFRESH_INTERVAL,
     ));
     // So a restart with the vault open picks up a key added since, off the
@@ -440,11 +455,12 @@ async fn start(config_path: &Path) -> Result<()> {
     let factory = AgentFactory {
         template: agent::LpassAgent::new(
             store,
-            client,
+            quiet,
             confirmer,
             unlocker,
             Arc::new(knownhosts::HostNames::default()),
         )
+        .with_asking(asking)
         .with_approvals(Arc::new(approvals::Approvals::new(
             config.remember_approvals,
             lock_epoch,
@@ -463,6 +479,25 @@ async fn start(config_path: &Path) -> Result<()> {
     };
     drop(guard); // unlink the socket
     result
+}
+
+/// A start with nothing written down has to read the vault, and one that
+/// cannot — locked, with no way to ask, or logged out — should say what gets
+/// past that, because under a service manager the bare failure is a restart
+/// loop with no clue in it. Any other failure is passed through as it is.
+fn first_start_needs_the_vault(e: Error) -> Error {
+    match e {
+        Error::Lpass(
+            lpass::LpassError::Locked
+            | lpass::LpassError::NoMasterPassword(_)
+            | lpass::LpassError::NotLoggedIn,
+        ) => Error::State(format!(
+            "{e} — this start has to read the vault, since nothing is written down yet: \
+             open it, or run `lastpass-ssh-agent list` while it is open, and start again; \
+             later starts need no vault"
+        )),
+        other => other,
+    }
 }
 
 struct AgentFactory {
@@ -1066,6 +1101,21 @@ mod tests {
         let line = too_many_keys("key count", MAX_AUTH_TRIES + 1).unwrap();
         assert!(line.ok, "a warning, not a failure");
         assert!(line.detail.contains("IdentitiesOnly"), "{}", line.detail);
+    }
+
+    #[test]
+    fn a_first_start_that_cannot_read_the_vault_says_what_gets_past_that() {
+        for shut in [
+            lpass::LpassError::Locked,
+            lpass::LpassError::NoMasterPassword("dismissed".into()),
+            lpass::LpassError::NotLoggedIn,
+        ] {
+            let text = first_start_needs_the_vault(shut.into()).to_string();
+            assert!(text.contains("lastpass-ssh-agent list"), "{text}");
+        }
+        // anything else is not about the vault being shut
+        let other = first_start_needs_the_vault(Error::ConfigInvalid("x".into())).to_string();
+        assert!(!other.contains("list"), "{other}");
     }
 
     #[test]

@@ -435,9 +435,13 @@ not need a restart. A vault that is merely locked
 The agent writes the identities it serves — item ids, names and public keys,
 nothing secret — to `agent.sock.identities` beside the socket. The next start
 reads that instead of the vault, so it binds at once whether the vault is open
-or not, and the vault is opened only when a signature needs it. That is also
-what makes a start never ask for the master password: nothing but signing
-touches the vault.
+or not, and the vault is opened only when a signature needs it. So only the
+very first start reads the vault, and every start after it asks for nothing:
+nothing but signing touches the vault. A first start that finds the vault
+locked asks for the master password like a signature would; one that cannot
+ask — no prompt it can show, or no login — fails and says so. Under a service
+manager that would be a restart loop, so run `list` once with the vault open
+before enabling the service: it writes the same file.
 
 After a signature succeeds the agent refreshes its set and the file in the
 background, at most once an hour — so a key added to the vault appears on the
@@ -462,7 +466,10 @@ Do **not** use `sudo brew services`: as a system daemon the agent has no GUI
 session, so every confirmation prompt fails closed and nothing is ever
 signed. On Linux a background service also has no terminal, so the default
 `tty` confirmation cannot work — set `confirm = "askpass"` with a helper such
-as `/usr/bin/ssh-askpass` before starting it.
+as `/usr/bin/ssh-askpass` before starting it. And before the first start as
+a service, run `lastpass-ssh-agent list` once with the vault open: that
+writes the identities down, so the service never has to read the vault at
+startup (see [Starting without the vault](#starting-without-the-vault)).
 
 <details>
 <summary>Managing launchd yourself instead</summary>

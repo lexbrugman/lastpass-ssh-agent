@@ -22,7 +22,13 @@ use crate::signing;
 #[derive(Clone)]
 pub struct LpassAgent {
     store: Served,
+    /// Fed only the master password already held, so a fetch through it can
+    /// never put a prompt on screen — and never needs the interaction gate.
     lpass: Arc<dyn LpassClient>,
+    /// The same vault, asking for the master password when it finds the vault
+    /// locked. Reached only after `lpass` has reported exactly that, and only
+    /// under the gate, since asking is an interaction like any other.
+    asking: Arc<dyn LpassClient>,
     confirmer: Arc<dyn Confirmer>,
     /// What has been approved since the vault last locked, when remembering
     /// is on.
@@ -70,6 +76,7 @@ impl LpassAgent {
     ) -> Self {
         Self {
             store,
+            asking: lpass.clone(),
             lpass,
             confirmer,
             approvals: Arc::new(Approvals::off()),
@@ -81,6 +88,13 @@ impl LpassAgent {
             remembered: None,
             refresher: None,
         }
+    }
+
+    /// The client to reach for when the vault turns out locked; see `asking`.
+    #[must_use]
+    pub fn with_asking(mut self, asking: Arc<dyn LpassClient>) -> Self {
+        self.asking = asking;
+        self
     }
 
     /// Remember approvals until the vault locks; see `approvals`.
@@ -219,25 +233,38 @@ impl LpassAgent {
     }
 
     /// Everything that touches the private key, in one place.
+    ///
+    /// `unlocked` is set when the vault had to be asked for the master
+    /// password on the way, answered or not — `sign` reads it as a lock
+    /// having happened.
     async fn fetch_and_sign(
         &self,
         entry: &KeyEntry,
         data: &[u8],
         flags: u32,
         gate: &mut InteractionGate,
+        unlocked: &mut bool,
     ) -> Result<Signature, String> {
-        // A fetch can itself put a prompt on screen: finding the vault locked,
-        // the client asks for the master password. That is an interaction like
-        // any other, and it happens inside the call where the gate cannot
-        // reach it — so the gate is taken here, before the call.
-        if self.lpass.may_prompt() {
-            gate.enter().await;
-        }
-        let pem: Zeroizing<Vec<u8>> = match self
-            .lpass
-            .show_field(&entry.item_id, "Private Key")
-            .await
-        {
+        // Through the client that cannot prompt first, and without the gate:
+        // with the password held, or the vault open in a shell, this is the
+        // whole fetch, and requests that never reach the user run side by
+        // side. Only a vault found locked reaches for the client that asks —
+        // under the gate, because a master-password prompt is an interaction
+        // like any other, and the gate is what keeps it off a screen another
+        // request's dialog is on.
+        let fetched = match self.lpass.show_field(&entry.item_id, "Private Key").await {
+            Err(crate::lpass::LpassError::Locked) => {
+                gate.enter().await;
+                // With the gate held, an ask counted here can only be this
+                // request's own.
+                let before = self.approvals.unlocks();
+                let fetched = self.asking.show_field(&entry.item_id, "Private Key").await;
+                *unlocked = self.approvals.unlocks() != before;
+                fetched
+            }
+            quiet => quiet,
+        };
+        let pem: Zeroizing<Vec<u8>> = match fetched {
             Ok(pem) => pem,
             Err(e) => {
                 // Absence is the vault's verdict on the key, where a locked vault
@@ -386,10 +413,6 @@ impl Session for LpassAgent {
         } else {
             Vec::new()
         };
-        let may_unlock = self.lpass.may_prompt();
-        if may_unlock {
-            gate.enter().await;
-        }
         if entry.confirm {
             let mut ctx = ConfirmContext::new(entry, self.peer, bindings);
             let mut question = crate::confirm::approval_question(&ctx);
@@ -403,7 +426,9 @@ impl Session for LpassAgent {
             // put a second prompt up for an answer just given. The context is
             // rebuilt there too, so what the prompt shows and what is remembered
             // are one snapshot of the requester, taken now rather than before
-            // the wait.
+            // the wait. A request answered from memory takes no gate here, and
+            // the one wait it can still meet — the vault turning out locked
+            // under it — voids that answer below.
             let mut answered = remembered(&question);
             if answered.is_none() {
                 gate.enter().await;
@@ -433,15 +458,20 @@ impl Session for LpassAgent {
             }
         }
 
-        let unlocks_before = self.approvals.unlocks();
+        let mut unlocked_now = false;
         let result = self
-            .fetch_and_sign(entry, &request.data, request.flags, &mut gate)
+            .fetch_and_sign(
+                entry,
+                &request.data,
+                request.flags,
+                &mut gate,
+                &mut unlocked_now,
+            )
             .await;
         // Having had to ask for the master password means the vault was locked,
         // by a lock nothing here saw: what was approved before it is void,
         // whether or not the ask was answered — a prompt dismissed leaves the
         // vault as locked as it found it.
-        let unlocked_now = may_unlock && self.approvals.unlocks() != unlocks_before;
         if unlocked_now {
             self.approvals.lock();
         }
@@ -692,46 +722,51 @@ mod tests {
         AskAndFail,
     }
 
-    /// A vault whose private-key fetch does what `OnFetch` says.
-    struct LockingOnFetch(
-        Arc<MockLpass>,
-        Arc<crate::approvals::LockEpoch>,
-        std::sync::Mutex<OnFetch>,
-    );
-    impl LockingOnFetch {
-        fn on_fetch(&self, what: OnFetch) {
-            *self.2.lock().unwrap() = what;
-        }
+    /// Which of the agent's two clients a `LockingOnFetch` stands in for.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        /// Fed only what is held: a locked vault is reported, never asked.
+        Quiet,
+        /// Asks when the vault is locked.
+        Asking,
+    }
+
+    /// A vault whose private-key fetch does what the shared `OnFetch` says,
+    /// as seen by one of the agent's two clients.
+    struct LockingOnFetch {
+        vault: Arc<MockLpass>,
+        epoch: Arc<crate::approvals::LockEpoch>,
+        mode: Arc<std::sync::Mutex<OnFetch>>,
+        role: Role,
     }
     #[async_trait::async_trait]
     impl LpassClient for LockingOnFetch {
-        /// As the agent's real client: what asks for the master password.
-        fn may_prompt(&self) -> bool {
-            true
-        }
         async fn show_field(
             &self,
             item_id: &str,
             field: &str,
         ) -> Result<Zeroizing<Vec<u8>>, crate::lpass::LpassError> {
             if field == "Private Key" {
-                let what = *self.2.lock().unwrap();
-                match what {
-                    OnFetch::Nothing => {}
-                    OnFetch::Ask => self.1.unlocked(),
-                    OnFetch::Lock => self.1.bump(),
-                    OnFetch::AskAndFail => {
-                        self.1.unlocked();
+                let what = *self.mode.lock().unwrap();
+                match (what, self.role) {
+                    (OnFetch::Nothing, _) | (OnFetch::Lock, Role::Asking) => {}
+                    (OnFetch::Lock, Role::Quiet) => self.epoch.bump(),
+                    (OnFetch::Ask | OnFetch::AskAndFail, Role::Quiet) => {
+                        return Err(crate::lpass::LpassError::Locked);
+                    }
+                    (OnFetch::Ask, Role::Asking) => self.epoch.unlocked(),
+                    (OnFetch::AskAndFail, Role::Asking) => {
+                        self.epoch.unlocked();
                         return Err(crate::lpass::LpassError::NoMasterPassword(
                             "dismissed".into(),
                         ));
                     }
                 }
             }
-            self.0.show_field(item_id, field).await
+            self.vault.show_field(item_id, field).await
         }
         async fn ls(&self) -> Result<Vec<crate::lpass::ItemSummary>, crate::lpass::LpassError> {
-            self.0.ls().await
+            self.vault.ls().await
         }
     }
 
@@ -750,20 +785,26 @@ mod tests {
                 .unwrap(),
         );
         let epoch = Arc::new(crate::approvals::LockEpoch::default());
-        let locking = Arc::new(LockingOnFetch(
-            vault,
-            epoch.clone(),
-            std::sync::Mutex::new(OnFetch::Ask),
-        ));
-        let client: Arc<dyn LpassClient> = locking.clone();
+        let mode = Arc::new(std::sync::Mutex::new(OnFetch::Ask));
+        let on_fetch = |what: OnFetch| *mode.lock().unwrap() = what;
+        let client_as = |role: Role| -> Arc<dyn LpassClient> {
+            Arc::new(LockingOnFetch {
+                vault: vault.clone(),
+                epoch: epoch.clone(),
+                mode: mode.clone(),
+                role,
+            })
+        };
+        let quiet = client_as(Role::Quiet);
         let asked = Arc::new(CountingConfirmer::default());
         let mut agent = LpassAgent::new(
             store,
-            client.clone(),
+            quiet.clone(),
             asked.clone(),
-            Arc::new(Unlocker::new(client, Arc::new(NoPrompt))),
+            Arc::new(Unlocker::new(quiet, Arc::new(NoPrompt))),
             no_host_names(),
         )
+        .with_asking(client_as(Role::Asking))
         .with_approvals(Arc::new(Approvals::new(true, epoch.clone())))
         .with_peer(Some(PeerInfo {
             pid: Some(std::process::id().cast_signed()),
@@ -776,7 +817,7 @@ mod tests {
         // request has it
         agent.sign(sign(b"one")).await.unwrap();
         assert_eq!(epoch.current(), 1, "the ask was turned into a lock");
-        locking.on_fetch(OnFetch::Nothing);
+        on_fetch(OnFetch::Nothing);
         agent.sign(sign(b"two")).await.unwrap();
         assert_eq!(
             *asked.0.lock().unwrap(),
@@ -786,7 +827,7 @@ mod tests {
 
         // answered from memory, then the vault turns out locked under it:
         // refused, not signed
-        locking.on_fetch(OnFetch::Ask);
+        on_fetch(OnFetch::Ask);
         assert!(agent.sign(sign(b"three")).await.is_err());
         assert_eq!(
             *asked.0.lock().unwrap(),
@@ -794,31 +835,31 @@ mod tests {
             "never asked, so not silently confirmed"
         );
         // the retry is in the new epoch: asked, and signed
-        locking.on_fetch(OnFetch::Nothing);
+        on_fetch(OnFetch::Nothing);
         agent.sign(sign(b"four")).await.unwrap();
         assert_eq!(*asked.0.lock().unwrap(), 2);
 
         // the screen locking while the vault is read: the same refusal for
         // an answer from memory
-        locking.on_fetch(OnFetch::Lock);
+        on_fetch(OnFetch::Lock);
         assert!(agent.sign(sign(b"five")).await.is_err());
         assert_eq!(*asked.0.lock().unwrap(), 2);
         // and a confirmation given just before such a lock is not carried past
         // it: the next request asks again
         agent.sign(sign(b"six")).await.unwrap();
         assert_eq!(*asked.0.lock().unwrap(), 3);
-        locking.on_fetch(OnFetch::Nothing);
+        on_fetch(OnFetch::Nothing);
         agent.sign(sign(b"seven")).await.unwrap();
         assert_eq!(*asked.0.lock().unwrap(), 4);
 
         // a prompt dismissed leaves the vault as locked as it was found, and
         // ends what was approved before just the same: the request fails, and
         // the next one asks even once the vault is open again
-        locking.on_fetch(OnFetch::AskAndFail);
+        on_fetch(OnFetch::AskAndFail);
         let before = epoch.current();
         assert!(agent.sign(sign(b"eight")).await.is_err());
         assert_eq!(epoch.current(), before + 1);
-        locking.on_fetch(OnFetch::Nothing);
+        on_fetch(OnFetch::Nothing);
         agent.sign(sign(b"nine")).await.unwrap();
         assert_eq!(*asked.0.lock().unwrap(), 5);
     }
@@ -1554,40 +1595,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_vault_that_can_ask_for_a_password_signs_under_the_gate() {
-        // With the vault locked to the screen, the fetch itself may prompt —
-        // lpass asks for the master password through a helper of ours, from
-        // inside a subprocess the gate cannot see into. So the gate is taken
-        // before the fetch, and this pair must not overlap even though neither
-        // request confirms.
+    async fn a_vault_found_locked_is_asked_under_the_gate() {
+        // The quiet client reports the vault locked; only then does the fetch
+        // take the gate and reach for the client that asks. Two such requests
+        // at once must not overlap on screen, even though neither confirms —
+        // and both sign.
         let watch = Arc::new(ChannelWatch::default());
-        let client = Arc::new(
+        let vault = Arc::new(
             MockLpass::logged_in()
-                .prompting()
                 .with_field("1", "Public Key", ED25519_PW_PUB.as_bytes())
                 .with_field("1", "Private Key", ED25519_PW.as_bytes())
                 .with_field("1", "Passphrase", b""),
         );
+        let quiet: Arc<dyn LpassClient> = Arc::new(
+            MockLpass::logged_in()
+                .with_field("1", "Public Key", ED25519_PW_PUB.as_bytes())
+                .with_field("1", "Private Key", ED25519_PW.as_bytes())
+                .with_field("1", "Passphrase", b"")
+                .with_locked_field("1", "Private Key"),
+        );
         let config: Config = toml::from_str(PW_KEY).unwrap();
         let store = Served::new(
-            KeyStore::load(&*client, &config.keys, &config)
+            KeyStore::load(&*vault, &config.keys, &config)
                 .await
                 .unwrap(),
         );
-        let unlocker = unlocking(
-            &client,
+        let unlocker = Arc::new(Unlocker::new(
+            quiet.clone(),
             Arc::new(WatchingPrompt(
                 watch.clone(),
                 b"fixture-passphrase".to_vec(),
             )),
-        );
+        ));
         let agent = LpassAgent::new(
             store,
-            client,
+            quiet,
             Arc::new(NoConfirmer),
             unlocker,
             no_host_names(),
-        );
+        )
+        .with_asking(vault.clone());
 
         let mut first = agent.with_peer(None);
         let mut second = agent.with_peer(None);
@@ -1597,6 +1644,17 @@ mod tests {
         );
         assert!(a.is_ok() && b.is_ok());
         assert!(!watch.overlapped(), "two prompts shared one screen");
+        assert_eq!(
+            vault
+                .fetch_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, field)| field == "Private Key")
+                .count(),
+            2,
+            "both fetched through the client that asks"
+        );
     }
 
     #[tokio::test]
