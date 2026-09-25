@@ -102,8 +102,8 @@ pub enum Command {
     /// Remove the master password kept behind Touch ID
     ///
     /// The next time the vault needs opening you are asked instead. Run this
-    /// before switching `master_password` back to "prompt", so nothing is
-    /// left at rest that no setting reaches any more.
+    /// before switching `master_password` back to "prompt", so nothing stays
+    /// at rest that the config does not name.
     ForgetMasterPassword,
 }
 

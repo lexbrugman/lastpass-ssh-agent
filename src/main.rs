@@ -191,8 +191,8 @@ fn asking_client(config: &Config) -> Result<Arc<dyn LpassClient>> {
 ///
 /// Only one thing may talk to the user at a time, and that gate lives inside
 /// a running agent — it cannot reach across to this process. So beside one,
-/// this process asks nothing: a locked vault fails here, as every one-shot
-/// command did before there was anything to ask, and a signature unlocks it.
+/// this process asks nothing: a locked vault fails here, and a signature
+/// unlocks it.
 fn one_shot_source(config: &Config, socket_path: &Path) -> Result<lpass::MasterPasswordSource> {
     if agent_is_running(socket_path) {
         tracing::info!(
@@ -229,8 +229,7 @@ async fn forget_master_password(config_path: &Path) -> Result<()> {
     store.forget().await.map_err(Error::State)?;
     tracing::info!(
         store = store.name(),
-        "no master password is kept any more — the vault asks for it when it next needs \
-         opening"
+        "no master password is kept — the vault asks for it when it next needs opening"
     );
     Ok(())
 }
@@ -411,8 +410,8 @@ async fn start(config_path: &Path) -> Result<()> {
         ),
         refresh::REFRESH_INTERVAL,
     ));
-    // So a restart with the vault open picks up a key added since — off the
-    // critical path, where the scan used to sit.
+    // So a restart with the vault open picks up a key added since, off the
+    // critical path.
     refresher.at_startup();
     // Logged rather than printed as shell exports. `env` emits those, and they
     // are for a shell to evaluate — which nothing can do with the output of a

@@ -340,9 +340,9 @@ looks like every other one this agent shows — and holds the answer until the
 screen locks, the idle time passes or the agent stops. A dismissed prompt fails
 that signature and nothing else.
 
-`"off"` no longer exists: an agent that could not open the vault would fail
-every signature after a screen lock, which is the state this design removes.
-A config still naming it is refused at startup; delete the line.
+There is no way to switch this off: an agent that could not open the vault
+would fail every signature after a screen lock, and any other value for
+`master_password` is refused at startup.
 
 ### Keeping it behind Touch ID
 
@@ -394,8 +394,8 @@ To stop keeping it:
 lastpass-ssh-agent forget-master-password
 ```
 
-Run that before switching back to `"prompt"`, so nothing is left at rest that
-no setting reaches any more.
+Run that before switching back to `"prompt"`, so nothing stays at rest that
+the config does not name.
 
 ### How long the master password is held
 
@@ -608,8 +608,8 @@ unlocking — do not run `lpass` yourself — and every lock is one it sees.
   needs it, and stays open to this agent until the next screen lock or
   `vault_unlock_timeout_secs` of disuse — the lock bounds exposure, it does not
   make each signature cost a password. A shell where you ran `lpass` yourself
-  keeps the vault open machine-wide for the hour `lpass` gives it, as before;
-  this agent neither extends nor cuts that.
+  keeps the vault open machine-wide for the hour `lpass` gives it; this agent
+  neither extends nor cuts that.
 - Auto-discovery costs one `lpass` call per vault item, eight at a time:
   `lpass ls` reports names and ids but not the note type, so every item has to
   be asked. A few hundred items are quick; a few thousand are most of a minute

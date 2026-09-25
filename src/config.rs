@@ -591,8 +591,8 @@ id = "1"
             "case matters"
         );
         assert!(parse("master_password = true").is_err(), "not a bool");
-        // what the setting used to allow: refused rather than read as a
-        // vault that fails every signature, which nothing can be any more
+        // there is no way to switch this off: an unknown value is refused,
+        // never read as a vault that fails every signature
         assert!(parse("master_password = \"off\"").is_err());
     }
 
