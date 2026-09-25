@@ -186,7 +186,7 @@ pub fn unpad(padded: Zeroizing<Vec<u8>>) -> Result<Zeroizing<Vec<u8>>> {
 
 /// What a finished unwrap means to a `MasterPasswordStore`.
 ///
-/// The distinction this draws is the one `askpass::seed` depends on. Seeding
+/// The distinction this draws is the one `master::seed` depends on. Seeding
 /// reads the store first and refuses to touch it if that read fails, because
 /// overwriting a store that would not answer could destroy a password that
 /// works. So exactly one failure must read as *empty* instead:
@@ -310,7 +310,7 @@ fn take(bytes: &[u8], max: usize) -> Result<(&[u8], &[u8])> {
 
 /// Where the blob and ciphertext live, given the socket.
 ///
-/// Named after the socket for the same reason the askpass wrapper is: the
+/// Named after the socket for the same reason the identities file is: the
 /// socket path is the one thing the user chooses that every part of a running
 /// agent already agrees on, so nothing else has to be configured to keep them
 /// together.

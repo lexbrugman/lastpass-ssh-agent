@@ -99,19 +99,12 @@ pub enum Command {
     /// it only if it does — encrypted to a key held in the Secure Enclave.
     /// Needs `master_password = "touchid"`. macOS only.
     StoreMasterPassword,
-    /// Ask for the `LastPass` master password and print it (used by `lpass`)
+    /// Remove the master password kept behind Touch ID
     ///
-    /// Not a command to run by hand. A running agent points `lpass` at a small
-    /// wrapper that invokes this, so a vault whose key has expired can be
-    /// reopened through the same prompt the agent uses for everything else. It
-    /// needs `LASTPASS_SSH_AGENT_ASKPASS_CONFIG`, which that agent sets, and
-    /// refuses to run without it.
-    Askpass {
-        /// Prompt text from `lpass`. Accepted because `lpass` always passes
-        /// one, and ignored: the agent composes its own, escaped, wording.
-        #[arg(value_name = "PROMPT")]
-        _prompt: Option<String>,
-    },
+    /// The next time the vault needs opening you are asked instead. Run this
+    /// before switching `master_password` back to "prompt", so nothing is
+    /// left at rest that no setting reaches any more.
+    ForgetMasterPassword,
 }
 
 #[cfg(test)]

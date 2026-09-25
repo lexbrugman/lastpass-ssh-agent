@@ -1,6 +1,6 @@
 mod cli;
 
-pub use cli::{LpassCli, ASKPASS_FROM_STORE, ASKPASS_MARKER, ASKPASS_ONCE_MARKER, ASKPASS_SIGNAL};
+pub use cli::{LpassCli, MasterPasswordSource};
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,16 +16,23 @@ pub struct ItemSummary {
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoginStatus {
-    LoggedIn(String),
-    NotLoggedIn,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum LpassError {
     #[error("not logged in to LastPass — run `lpass login <email>` and retry")]
     NotLoggedIn,
+
+    /// The vault needs the master password and none was fed. What a call
+    /// that may not ask gets; one that may asks and tries again.
+    #[error("the vault is locked, and needs the master password to open")]
+    Locked,
+
+    #[error("LastPass did not accept the master password")]
+    WrongMasterPassword,
+
+    /// The password was needed and could not be obtained — a prompt dismissed,
+    /// timed out, or with nowhere to appear.
+    #[error("the vault is locked, and no master password was given: {0}")]
+    NoMasterPassword(String),
 
     #[error("LastPass item {0} not found (deleted, or not shared with this account?)")]
     ItemNotFound(String),
@@ -52,29 +59,18 @@ pub enum LpassError {
 #[async_trait::async_trait]
 pub trait LpassClient: Send + Sync {
     /// Whether a call to this client can put a prompt on the user's screen —
-    /// true once lpass has somewhere to ask for the master password.
+    /// true when it may ask for the master password on finding the vault
+    /// locked.
     ///
-    /// The signing path needs to know *before* it calls: a prompt appearing from
-    /// inside a fetch would otherwise sit outside the one-interaction-at-a-time
-    /// gate, and could share the screen with another request's dialog.
+    /// The signing path needs to know *before* it calls: the gate that keeps
+    /// one interaction on screen at a time is taken there, and a prompt raised
+    /// from inside a fetch would otherwise share the screen with another
+    /// request's dialog.
     ///
     /// Required rather than defaulted: an implementation that quietly inherited
     /// "never prompts" while in fact prompting would put a master-password
     /// dialog outside the gate, which is the one thing this exists to prevent.
     fn may_prompt(&self) -> bool;
-
-    /// Whether a call has made the master-password helper run since this
-    /// client was built.
-    ///
-    /// Proof that a password was actually consulted. Setup needs it: an `lpass`
-    /// call can succeed on a key that was already cached, which says nothing
-    /// about whether the candidate password is right.
-    /// Required rather than defaulted, like `may_prompt`: an implementation
-    /// inheriting "never asked" would make setup reject passwords that are in
-    /// fact correct, and the reason would be invisible.
-    fn master_password_came_from_store(&self) -> bool;
-
-    async fn status(&self) -> Result<LoginStatus, LpassError>;
 
     /// `lpass show --field=<field> <item_id>` — the value with trailing
     /// newlines removed. An existing-but-empty field yields an empty buffer.
@@ -159,54 +155,51 @@ pub async fn discover_ssh_key_items(
     Ok(found)
 }
 
-/// The `lpass` agent process, which is where the vault's derived key lives.
+/// End the `lpass` agent process a shell may have left holding the vault's
+/// derived key, so that the next call has to be given the master password.
 ///
-/// Ending it is the only way to make `lpass` forget that key: there is no
-/// "lock" subcommand, and `lpass logout` would discard the session as well,
-/// turning a master-password prompt into a full login with a second factor.
+/// Only `store-master-password` wants this: it is the one way to learn whether
+/// a candidate password opens the vault, because `lpass` reads that agent
+/// before it reads stdin. The running agent never does it — a vault the user
+/// opened themselves is theirs to leave open.
+///
+/// `true` once no such process is holding a key, whether one was ended or none
+/// was running.
 ///
 /// Identified by command line rather than by name: the agent rewrites its argv
 /// to `lpass [agent]`, and on macOS the rewritten title runs into the
-/// environment that followed it, so only the prefix is dependable. Matching a
-/// short-lived `lpass show` too would cost nothing — a signature in flight when
-/// the screen locks is one we are about to make ask for a password anyway.
-pub struct LpassAgentProcess;
-
-#[async_trait::async_trait]
-impl crate::vaultlock::VaultKey for LpassAgentProcess {
-    // Excluded from coverage, and deliberately: exercising the path that
-    // actually matches something would mean killing a process, and the only
-    // pattern worth testing is the real one — which on a developer's own
-    // machine is their live vault session. The rules around this call (when it
-    // fires, and how often) are `vaultlock`'s, and covered there.
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    async fn forget(&self) {
-        // `pkill` rather than walking the process table ourselves: finding a
-        // process by command line is /proc on Linux and sysctl on macOS, which
-        // is exactly the per-platform logic this design keeps out of the way
-        // for something the system already exposes as one command.
-        let killed = tokio::process::Command::new("pkill")
-            .arg("-f")
-            .arg(r"^lpass \[a")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .status()
-            .await;
-        // pkill's codes: 0 signalled something, 1 matched nothing, and 2 or 3
-        // are its own failures. Only 1 means "there was no key to drop" —
-        // folding the rest into it would report a vault as locked while it is
-        // still open, which is the one thing this must not get wrong.
-        match killed.as_ref().map(std::process::ExitStatus::code) {
-            Ok(Some(0)) => {
-                tracing::info!("the LastPass agent's cached key has been dropped");
-            }
-            Ok(Some(1)) => tracing::debug!("no LastPass agent was holding a key"),
-            other => tracing::warn!(
-                "could not drop the LastPass agent's cached key ({other:?}), so the vault \
-                 stays unlocked until it expires on its own"
-            ),
+/// environment that followed it, so only the prefix is dependable.
+///
+/// Excluded from coverage, and deliberately: exercising the path that actually
+/// matches something would mean killing a process, and the only pattern worth
+/// testing is the real one — which on a developer's own machine is their live
+/// vault session.
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub async fn drop_shell_unlock() -> bool {
+    // `pkill` rather than walking the process table ourselves: finding a
+    // process by command line is /proc on Linux and sysctl on macOS, which is
+    // exactly the per-platform logic this design keeps out of the way for
+    // something the system already exposes as one command.
+    let killed = tokio::process::Command::new("pkill")
+        .arg("-f")
+        .arg(r"^lpass \[a")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await;
+    // pkill's codes: 0 signalled something, 1 matched nothing, and 2 or 3 are
+    // its own failures. Only the first two mean no key is held now.
+    match killed.as_ref().map(std::process::ExitStatus::code) {
+        Ok(Some(0)) => {
+            tracing::info!("the shell's LastPass agent has been ended, so the vault is locked");
+            true
+        }
+        Ok(Some(1)) => true,
+        other => {
+            tracing::warn!("could not end the shell's LastPass agent ({other:?})");
+            false
         }
     }
 }
@@ -447,8 +440,8 @@ pub mod mock {
             self
         }
 
-        /// As a client with an askpass helper installed: fetches from it may
-        /// put a prompt on screen.
+        /// As a client that may ask for the master password: fetches from it
+        /// may put a prompt on screen.
         pub const fn prompting(mut self) -> Self {
             self.prompting = true;
             self
@@ -479,20 +472,8 @@ pub mod mock {
 
     #[async_trait::async_trait]
     impl LpassClient for MockLpass {
-        fn master_password_came_from_store(&self) -> bool {
-            self.prompting
-        }
-
         fn may_prompt(&self) -> bool {
             self.prompting
-        }
-
-        async fn status(&self) -> Result<LoginStatus, LpassError> {
-            Ok(if self.logged_in {
-                LoginStatus::LoggedIn("mock@example.com".into())
-            } else {
-                LoginStatus::NotLoggedIn
-            })
         }
 
         async fn show_field(

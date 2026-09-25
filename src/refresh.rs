@@ -2,8 +2,8 @@
 //!
 //! A scan costs a vault call per item, so it runs when a signature has just
 //! proved the vault reachable, at most once an hour, and through a client that
-//! cannot prompt: with the vault open it is silent, with the vault shut it fails
-//! fast and nothing changes. What it produces replaces both the served set and
+//! cannot prompt: fed only what the agent already holds, it is silent with the
+//! vault open, and with the vault shut it fails fast and nothing changes. What it produces replaces both the served set and
 //! the file, and only whole — `KeyStore::load_complete` says what "whole" means.
 
 use std::path::PathBuf;
@@ -21,8 +21,8 @@ pub struct Refresher {
     served: Served,
     remembered_at: PathBuf,
     config: Arc<Config>,
-    /// Built without a master-password helper, so nothing it does can put a
-    /// prompt on screen — a shut vault fails fast instead.
+    /// Fed only the master password the agent already holds, so nothing it
+    /// does can put a prompt on screen — a shut vault fails fast instead.
     client: Arc<dyn LpassClient>,
     interval: Duration,
     /// When the last attempt began. Attempts rather than successes: a vault

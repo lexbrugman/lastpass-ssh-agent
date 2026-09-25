@@ -214,11 +214,10 @@ impl LpassAgent {
         flags: u32,
         gate: &mut InteractionGate,
     ) -> Result<Signature, String> {
-        // A fetch can itself put a prompt on screen: with the vault locked to
-        // the screen, lpass asks for the master password through a helper of
-        // ours. That is an interaction like any other, and it arrives from
-        // inside a subprocess where the gate cannot reach it — so the gate is
-        // taken here, before the call, rather than after the fact.
+        // A fetch can itself put a prompt on screen: finding the vault locked,
+        // the client asks for the master password. That is an interaction like
+        // any other, and it happens inside the call where the gate cannot
+        // reach it — so the gate is taken here, before the call.
         if self.lpass.may_prompt() {
             gate.enter().await;
         }

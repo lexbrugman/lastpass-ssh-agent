@@ -1,20 +1,15 @@
-//! Forgetting the vault's cached key when the session locks.
+//! Forgetting the master password when the session locks.
 //!
-//! `lpass` keeps the key it derived from the master password in an agent
-//! process of its own, for an hour by default. That agent is what makes a
-//! signature cost no password — and it is also what makes the whole vault, not
-//! just the SSH keys, readable by anything running as this user until it
-//! expires. Walking away locks the screen; it does not lock the vault.
-//!
-//! So when the screen locks, the agent process is asked to go away. What
-//! survives is the *session*: `lpass` still knows who is logged in, so the way
-//! back is the master password rather than a fresh login with a second factor.
-//! `lpass logout` would take the session too, which is a much bigger hammer
-//! than this deserves.
+//! The agent holds the master password between signatures, which is what
+//! makes a signature cost no prompt — and what would leave the vault open to
+//! this process for as long as it ran. Walking away locks the screen; this is
+//! what makes it lock the vault too. What survives is the `LastPass` *session*,
+//! so the way back is the master password rather than a fresh login with a
+//! second factor.
 //!
 //! Everything here is portable. Learning that the screen locked is the one
 //! platform-specific part, and it lives behind `ScreenLock` as a value this
-//! module looks up.
+//! module looks up; what holding the password means is `crate::unlock`'s.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,23 +52,22 @@ pub trait ScreenLock: Send + Sync {
     async fn is_locked(&self) -> Option<bool>;
 }
 
-/// Somewhere holding a derived vault key that can be told to forget it.
+/// Something holding what opens the vault, which can be told to forget it.
 ///
 /// A trait so the watcher's rules are testable without a vault: the real
-/// implementation ends a process, and a test's counts calls.
+/// implementation is `crate::unlock::Unlock`, and a test's counts calls.
 #[async_trait::async_trait]
 pub trait VaultKey: Send + Sync {
-    /// Drop the cached key. Best effort — a vault that was already locked, or
-    /// an agent that had already expired, is a success with nothing to do.
+    /// Drop it. Already dropped is a success with nothing to do.
     async fn forget(&self);
 }
 
 /// Whether a sample means the key should be forgotten now.
 ///
 /// The *transition* into locked, not the state: sampling a locked screen every
-/// few seconds would otherwise re-kill an agent nobody restarted, and — worse —
-/// stop the user from re-authenticating at a prompt while still locked, which
-/// is exactly what unlocking through a screen saver does on some setups.
+/// few seconds would otherwise keep forgetting — and stop the user from
+/// re-authenticating at a prompt while still locked, which is exactly what
+/// unlocking through a screen saver does on some setups.
 const fn locking_now(previous: bool, current: bool) -> bool {
     current && !previous
 }
@@ -106,8 +100,8 @@ pub async fn watch(
         return;
     }
     tracing::info!(
-        "locking the vault with the screen — the LastPass agent's cached key is dropped on \
-         lock, and the master password is asked for when it is next needed"
+        "locking the vault with the screen — the master password is forgotten on lock, and \
+         asked for when it is next needed"
     );
     let Some(locked_at_startup) = screen.is_locked().await else {
         tracing::debug!("no way to read the screen lock state here; not watching");
@@ -116,19 +110,16 @@ pub async fn watch(
 
     // "Before we looked" counts as unlocked, so a screen that is already locked
     // when the agent starts is a lock like any other. Tempting to call it a
-    // baseline instead — but `start` logs in, discovers items and loads keys
-    // before this runs, and every one of those calls makes lpass cache the
-    // derived key. Waiting for a later unlock/relock would leave the vault open
-    // for the whole locked session, which is the window this exists to close.
+    // baseline instead — but a start that scans the vault may already have
+    // asked for the password before this runs. Waiting for a later
+    // unlock/relock would keep it for the whole locked session, which is the
+    // window this exists to close.
     let mut previous = false;
     let mut current = locked_at_startup;
     let mut unreadable_in_a_row = 0u32;
     loop {
         if locking_now(previous, current) {
-            tracing::info!(
-                "screen locked — dropping the LastPass agent's cached key, so the next \
-                 signature asks for the master password"
-            );
+            tracing::info!("screen locked — the next signature asks for the master password");
             key.forget().await;
         }
         previous = current;
@@ -146,8 +137,8 @@ pub async fn watch(
                 tracing::warn!(
                     "the screen lock state has been unreadable \
                      {unreadable_in_a_row} checks running, so the vault is no longer being \
-                     locked with the screen — it now stays open until it expires or the \
-                     agent is restarted"
+                     locked with the screen — the master password is now kept until the \
+                     idle time passes or the agent is restarted"
                 );
                 return;
             }
@@ -245,8 +236,8 @@ mod tests {
 
     #[tokio::test]
     async fn staying_locked_does_not_keep_forgetting() {
-        // Re-killing an agent nobody restarted is pointless, and would fight a
-        // master-password prompt answered while the screen is still locked.
+        // Forgetting again is pointless, and would fight a master-password
+        // prompt answered while the screen is still locked.
         assert_eq!(forgets_for(vec![false, true, true, true]).await, 1);
     }
 
@@ -262,9 +253,9 @@ mod tests {
 
     #[tokio::test]
     async fn starting_up_locked_drops_the_key_straight_away() {
-        // Startup itself caches the key — logging in, discovering items and
-        // loading them all go through lpass — so a screen that is already
-        // locked must be acted on rather than recorded as a baseline.
+        // A start that scans the vault may already hold the password, so a
+        // screen that is already locked must be acted on rather than recorded
+        // as a baseline.
         assert_eq!(forgets_for(vec![true, true]).await, 1);
         // and it is still a single drop across a locked stretch
         assert_eq!(forgets_for(vec![true, true, false, true]).await, 2);
@@ -272,8 +263,8 @@ mod tests {
 
     #[tokio::test]
     async fn switched_off_it_never_even_looks() {
-        // The default. Nothing samples, nothing is forgotten, and no task sits
-        // in a loop for a feature nobody asked for.
+        // Nothing samples, nothing is forgotten, and no task sits in a loop for
+        // a feature that was switched off.
         let key = Arc::new(CountingKey::default());
         let screen = Arc::new(Noted::default());
         watch(false, screen.clone(), key.clone(), Duration::from_millis(1)).await;

@@ -13,11 +13,26 @@ struct Setup {
     config: PathBuf,
 }
 
-fn fake_lpass(dir: &Path, body: &str) -> PathBuf {
-    let path = dir.join("lpass");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+/// Write an executable script the way `testutil::write_script` does: staged,
+/// then copied into place by a separate process, so no descriptor open for
+/// writing exists in this process for a concurrent spawn to inherit.
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let staged = dir.join(format!(".{name}.staging"));
+    let path = dir.join(name);
+    std::fs::write(&staged, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let status = Command::new("cp")
+        .arg("-p")
+        .arg(&staged)
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "could not copy {name} into place");
     path
+}
+
+fn fake_lpass(dir: &Path, body: &str) -> PathBuf {
+    write_script(dir, "lpass", body)
 }
 
 /// The standard healthy vault: item 1 is an SSH Key, item 3 is not.
@@ -25,7 +40,6 @@ fn healthy_vault_body(dir: &Path) -> String {
     std::fs::write(dir.join("pub"), ED25519_PUB).unwrap();
     format!(
         r#"case "$1" in
-  status) echo "Logged in as test@example.com.";;
   ls) printf 'Personal/ed [id: 1]\nPersonal/Visa [id: 3]\n';;
   show)
     case "$2" in
@@ -53,6 +67,35 @@ fn setup(lpass_body: &str, config_extra: &str) -> Setup {
     )
     .unwrap();
     Setup { dir, config }
+}
+
+/// What real lpass says on stderr when it has no key and nothing answers
+/// its prompt — whether the vault is locked or there is no login at all.
+const NO_KEY: &str = "echo 'lpass: Error: Could not find decryption key. Perhaps you need to login with `lpass login`.' >&2; exit 1";
+
+/// A vault that is locked until fed `secret` on stdin, and then healthy; any
+/// other password is refused in lpass's words.
+fn locked_vault_body() -> String {
+    format!(
+        r#"if ! IFS= read -r pw; then {NO_KEY}; fi
+[ "$pw" = secret ] || {{ echo 'Incorrect master password; please try again.' >&2; {NO_KEY}; }}
+{}"#,
+        healthy_vault_body_owned()
+    )
+}
+
+/// `setup`, with the master password asked for through a script answering
+/// `answer` — the one prompt transport a test can drive.
+fn asking_setup(lpass_body: &str, config_extra: &str, answer: &str) -> Setup {
+    let s = setup(lpass_body, config_extra);
+    let script = write_script(s.dir.path(), "askpass", answer);
+    let config = format!(
+        "{}confirm = \"askpass\"\naskpass = {}\n",
+        std::fs::read_to_string(&s.config).unwrap(),
+        toml::Value::String(script.display().to_string())
+    );
+    std::fs::write(&s.config, config).unwrap();
+    s
 }
 
 fn run(setup: &Setup, args: &[&str]) -> Output {
@@ -211,10 +254,60 @@ esac"#,
 
 #[test]
 fn search_fails_cleanly_when_logged_out() {
-    let s = setup("echo 'Not logged in.'; exit 1", "");
+    // lpass says the same thing for a locked vault and for no login, so the
+    // command asks for the master password first; only a vault that does not
+    // even try it has no login.
+    let s = asking_setup(NO_KEY, "", "echo anything");
     let output = run(&s, &["search"]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("not logged in"));
+    assert!(
+        stderr(&output).contains("not logged in"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_command_beside_a_running_agent_never_asks() {
+    // The agent's prompts and this one cannot take turns, so a locked vault
+    // fails here rather than putting a second prompt on the screen.
+    let s = asking_setup(&locked_vault_body(), "", "echo secret");
+    let _agent = std::os::unix::net::UnixListener::bind(s.dir.path().join("agent.sock")).unwrap();
+    let output = run(&s, &["list"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("the vault is locked"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("will not ask"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_locked_vault_is_asked_for_the_master_password() {
+    let s = asking_setup(&locked_vault_body(), "", "echo secret");
+    let output = run(&s, &["list"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("[id: 1]"));
+    assert!(
+        stderr(&output).contains("holding the master password"),
+        "{}",
+        stderr(&output)
+    );
+
+    // and a wrong answer is reported in lpass's own verdict
+    let s = asking_setup(&locked_vault_body(), "", "echo typo");
+    let output = run(&s, &["list"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("did not accept the master password"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -255,7 +348,7 @@ fn doctor_all_green() {
     let text = stdout(&output);
     assert!(text.contains("✓ config"));
     assert!(text.contains("auto-discovery"));
-    assert!(text.contains("✓ lpass login: test@example.com"));
+    assert!(text.contains("✓ lpass login: logged in"), "{text}");
     assert!(text.contains("✓ key"));
     assert!(text.contains("✓ socket path"));
     assert!(!text.contains('✗'));
@@ -263,21 +356,34 @@ fn doctor_all_green() {
 
 #[test]
 fn doctor_reports_the_master_password_source() {
-    // Silent when there is nothing configured, and a line once there is —
-    // otherwise the one setting that makes the agent ask for the master
-    // password would never appear in the checklist.
-    let quiet = setup(&healthy_vault_body_owned(), "");
-    assert!(!stdout(&run(&quiet, &["doctor"])).contains("master password"));
-
-    let s = setup(
-        &healthy_vault_body_owned(),
-        "master_password = \"prompt\"\n",
-    );
+    let s = setup(&healthy_vault_body_owned(), "");
     let output = run(&s, &["doctor"]);
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     assert!(text.contains("✓ master password"), "{text}");
-    assert!(text.contains("never kept"), "{text}");
+    assert!(text.contains("held only"), "{text}");
+}
+
+#[test]
+fn doctor_opens_a_locked_vault_the_way_the_agent_would() {
+    // The arrangement under test is the whole of it: found locked, the vault
+    // is asked for the master password through the configured prompt, and
+    // the key checks then run against it.
+    let s = asking_setup(&locked_vault_body(), "", "echo secret");
+    let output = run(&s, &["doctor"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let text = stdout(&output);
+    assert!(text.contains("✓ lpass login"), "{text}");
+    assert!(text.contains("✓ key"), "{text}");
+
+    let s = asking_setup(&locked_vault_body(), "", "echo typo");
+    let output = run(&s, &["doctor"]);
+    assert!(!output.status.success());
+    assert!(
+        stdout(&output).contains("✗ lpass login: LastPass did not accept"),
+        "{}",
+        stdout(&output)
+    );
 }
 
 #[test]
@@ -320,13 +426,17 @@ fn doctor_flags_binary_login_and_key_problems() {
     assert!(!output.status.success());
     assert!(stdout(&output).contains("✗ lpass binary"));
 
-    // not logged in
-    let s = setup("echo 'Not logged in.'; exit 1", "");
+    // not logged in: no key, and a password that was never even tried
+    let s = asking_setup(NO_KEY, "", "echo anything");
     let output = run(&s, &["doctor"]);
     assert!(!output.status.success());
-    assert!(stdout(&output).contains("✗ lpass login"));
+    assert!(
+        stdout(&output).contains("✗ lpass login: not logged in"),
+        "{}",
+        stdout(&output)
+    );
 
-    // status blows up entirely
+    // the vault blows up entirely
     let s = setup("echo boom >&2; exit 9", "");
     let output = run(&s, &["doctor"]);
     assert!(!output.status.success());
@@ -334,16 +444,13 @@ fn doctor_flags_binary_login_and_key_problems() {
 
     // pinned item whose Public Key field is empty / garbage / missing
     for (body, expect) in [
+        (r#"case "$1" in show) printf '';; esac"#, "empty Public Key"),
         (
-            r#"case "$1" in status) echo "Logged in as t.";; show) printf '';; esac"#,
-            "empty Public Key",
-        ),
-        (
-            r#"case "$1" in status) echo "Logged in as t.";; show) echo "not a key";; esac"#,
+            r#"case "$1" in show) echo "not a key";; esac"#,
             "does not parse",
         ),
         (
-            r#"case "$1" in status) echo "Logged in as t.";; show) echo 'Error: Could not find specified account(s).' >&2; exit 1;; esac"#,
+            r#"case "$1" in show) echo 'Error: Could not find specified account(s).' >&2; exit 1;; esac"#,
             "not found",
         ),
     ] {
@@ -355,7 +462,7 @@ fn doctor_flags_binary_login_and_key_problems() {
 
     // discovery finds nothing -> keys check fails
     let s = setup(
-        r#"case "$1" in status) echo "Logged in as t.";; ls) printf 'Personal/Visa [id: 3]\n';; show) echo "Credit Card";; esac"#,
+        r#"case "$1" in ls) printf 'Personal/Visa [id: 3]\n';; show) echo "Credit Card";; esac"#,
         "",
     );
     let output = run(&s, &["doctor"]);
@@ -423,6 +530,27 @@ fn doctor_with_broken_config_file() {
     let output = run(&s, &["doctor", "--test-confirm"]);
     assert!(!output.status.success());
     assert!(!stdout(&output).contains("confirmation"));
+
+    // an lpass found on PATH is still checked, with nothing to ask through
+    let output = Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
+        .arg("--config")
+        .arg(&s.config)
+        .arg("doctor")
+        .env("HOME", s.dir.path())
+        .env("PATH", s.dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stdout(&output).contains("✓ lpass binary"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("✓ lpass login"),
+        "{}",
+        stdout(&output)
+    );
 }
 
 #[test]
@@ -497,128 +625,6 @@ fn doctor_test_confirm_modes() {
     assert!(stdout(&output).contains("denied/timed out"));
 }
 
-/// The `LPASS_ASKPASS` helper: lpass runs this binary with the marker set in
-/// its environment, and reads the master password off stdout.
-///
-/// Driven through `confirm = "askpass"` so the answer comes from a script this
-/// test controls, rather than from a terminal or a dialog the suite has not got.
-fn askpass_setup(helper_body: &str) -> Setup {
-    let s = setup(&healthy_vault_body_owned(), "");
-    let helper = fake_lpass(s.dir.path(), helper_body);
-    let config = format!(
-        "confirm = \"askpass\"\nmaster_password = \"prompt\"\naskpass = {}\n",
-        toml::Value::String(helper.display().to_string())
-    );
-    std::fs::write(&s.config, config).unwrap();
-    s
-}
-
-#[test]
-fn askpass_helper_prints_the_master_password_on_stdout() {
-    let s = askpass_setup("printf 'the-master-password\\n'");
-    let output = Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
-        .args(["askpass", "a prompt from lpass"])
-        .env("HOME", s.dir.path())
-        .env("LASTPASS_SSH_AGENT_ASKPASS_CONFIG", &s.config)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-    // exactly the answer and one newline: lpass reads this verbatim
-    assert_eq!(stdout(&output), "the-master-password\n");
-    // and it says so on stderr, which is what the agent turns into a log line
-    assert!(
-        stderr(&output).contains("master password supplied"),
-        "the unlock must leave a trace: {}",
-        stderr(&output)
-    );
-}
-
-#[test]
-fn a_dismissed_master_password_prompt_fails_without_printing_anything() {
-    // Nothing on stdout, ever: lpass would take whatever is there as the
-    // password, and an empty answer is not one.
-    let s = askpass_setup("exit 1");
-    let output = Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
-        .args(["askpass", "a prompt from lpass"])
-        .env("HOME", s.dir.path())
-        .env("LASTPASS_SSH_AGENT_ASKPASS_CONFIG", &s.config)
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert_eq!(stdout(&output), "");
-    assert!(!stderr(&output).is_empty(), "it must say why");
-}
-
-#[test]
-fn askpass_run_by_hand_refuses_and_says_why() {
-    // The whole reason it is a named command rather than a mode the environment
-    // switches on: run without the arrangement it belongs to, it says so.
-    let s = setup(&healthy_vault_body_owned(), "");
-    let output = Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
-        .arg("askpass")
-        .env("HOME", s.dir.path())
-        .env_remove("LASTPASS_SSH_AGENT_ASKPASS_CONFIG")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert_eq!(stdout(&output), "", "never a password on stdout");
-    assert!(
-        stderr(&output).contains("not a command to run by hand"),
-        "{}",
-        stderr(&output)
-    );
-}
-
-#[test]
-fn askpass_is_listed_in_help() {
-    // It was invisible before: a mode selected by an environment variable can
-    // never appear here, which is what made it folklore.
-    let s = setup(&healthy_vault_body_owned(), "");
-    let output = run(&s, &["--help"]);
-    assert!(stdout(&output).contains("askpass"), "{}", stdout(&output));
-}
-
-#[test]
-fn start_writes_the_askpass_wrapper_lpass_will_run() {
-    // It has to exist before the first lpass call, so it is written even when
-    // that call is the one that fails.
-    use std::os::unix::fs::PermissionsExt as _;
-    let s = setup(
-        "echo 'Not logged in.'; exit 1",
-        "master_password = \"prompt\"\n",
-    );
-    let output = run(&s, &["start"]);
-    assert!(!output.status.success(), "the vault is logged out");
-
-    let wrapper = s.dir.path().join("agent.sock.askpass");
-    let script = std::fs::read_to_string(&wrapper).expect("the wrapper must be written");
-    assert!(script.starts_with("#!/bin/sh\n"), "{script}");
-    assert!(script.contains(" askpass \"$@\""), "{script}");
-    let mode = std::fs::metadata(&wrapper).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o700, "only this user may run it");
-
-    // and it really runs: what lpass execs is this file, with a prompt
-    let helper = Command::new(&wrapper)
-        .arg("a prompt from lpass")
-        .env("HOME", s.dir.path())
-        .env_remove("LASTPASS_SSH_AGENT_ASKPASS_CONFIG")
-        .output()
-        .unwrap();
-    assert!(!helper.status.success(), "no config named, so it refuses");
-    assert!(
-        stderr(&helper).contains("not a command to run by hand"),
-        "{}",
-        stderr(&helper)
-    );
-}
-
-#[test]
-fn start_writes_no_wrapper_when_it_was_not_asked_for() {
-    let s = setup("echo 'Not logged in.'; exit 1", "");
-    assert!(!run(&s, &["start"]).status.success());
-    assert!(!s.dir.path().join("agent.sock.askpass").exists());
-}
-
 #[test]
 fn storing_a_master_password_needs_the_touchid_source() {
     // Nothing to store without somewhere to put it, and saying so beats
@@ -634,23 +640,43 @@ fn storing_a_master_password_needs_the_touchid_source() {
 }
 
 #[test]
-fn store_master_password_is_listed_in_help() {
+fn both_master_password_commands_are_listed_in_help() {
     let s = setup(&healthy_vault_body_owned(), "");
-    assert!(stdout(&run(&s, &["--help"])).contains("store-master-password"));
+    let help = stdout(&run(&s, &["--help"]));
+    assert!(help.contains("store-master-password"), "{help}");
+    assert!(help.contains("forget-master-password"), "{help}");
+}
+
+#[test]
+fn forgetting_a_master_password_that_was_never_kept_is_fine() {
+    // Nothing stored here — and off macOS nowhere to store — is the state the
+    // command leaves behind, so it is a success either way.
+    let s = setup(&healthy_vault_body_owned(), "");
+    let output = run(&s, &["forget-master-password"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("no master password is kept"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
 fn start_refuses_when_logged_out() {
-    let s = setup("echo 'Not logged in.'; exit 1", "");
+    let s = asking_setup(NO_KEY, "", "echo anything");
     let output = run(&s, &["start"]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("not logged in"));
+    assert!(
+        stderr(&output).contains("not logged in"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
 fn start_refuses_with_no_ssh_keys_in_vault() {
     let s = setup(
-        r#"case "$1" in status) echo "Logged in as t.";; ls) printf 'Personal/Visa [id: 3]\n';; show) echo "Credit Card";; esac"#,
+        r#"case "$1" in ls) printf 'Personal/Visa [id: 3]\n';; show) echo "Credit Card";; esac"#,
         "",
     );
     let output = run(&s, &["start"]);

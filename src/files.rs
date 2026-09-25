@@ -14,10 +14,9 @@ use crate::error::Result;
 /// half-written file.
 ///
 /// Staged beside the destination and renamed over it. `rename` swaps the name
-/// in one step, so a reader — or an `exec`, for the wrapper — either sees the
-/// old file or the new one and never a partial write. Opening the destination
-/// with `O_TRUNC` instead would be visible to anything reading it at that
-/// moment, and for an executable it is the `ETXTBSY` race `AGENTS.md` describes.
+/// in one step, so a reader either sees the old file or the new one and never
+/// a partial write. Opening the destination with `O_TRUNC` instead would be
+/// visible to anything reading it at that moment.
 ///
 /// The staging name carries this process's id, so two agents doing this at once
 /// stage into files of their own instead of truncating each other's work or

@@ -337,9 +337,15 @@ impl KeyStore {
                 // identity set quietly missing the first. Discovery refuses the
                 // same thing for the same reason.
                 KeyInspection::Unusable {
-                    issue: KeyIssue::Fetch(crate::lpass::LpassError::NotLoggedIn),
+                    issue:
+                        KeyIssue::Fetch(
+                            shut @ (crate::lpass::LpassError::NotLoggedIn
+                            | crate::lpass::LpassError::Locked
+                            | crate::lpass::LpassError::WrongMasterPassword
+                            | crate::lpass::LpassError::NoMasterPassword(_)),
+                        ),
                     ..
-                } => return Err(crate::lpass::LpassError::NotLoggedIn.into()),
+                } => return Err(shut.into()),
                 KeyInspection::Unusable {
                     item_id,
                     name,

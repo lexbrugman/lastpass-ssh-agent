@@ -443,8 +443,8 @@ async fn a_second_start_with_pinned_keys_needs_no_vault_call() {
     drop(first);
     wait_for_socket(&socket, false, "the first agent never unlinked its socket");
 
-    // an lpass that answers nothing at all — `status` included, since a locked
-    // vault reports as logged out and that is exactly the start the file is for
+    // an lpass that answers nothing at all: a locked vault is exactly the start
+    // the file is for
     std::fs::write(dir.path().join("lpass"), "#!/bin/sh\nexit 1\n").unwrap();
     let second = spawn_agent(&config_path, &socket);
     wait_for_socket(&socket, true, "second start never bound the socket");
