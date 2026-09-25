@@ -49,6 +49,24 @@ impl LockEpoch {
     }
 }
 
+/// What a signing request had by way of approval when it went to the vault.
+pub enum Answer {
+    /// The key needs no confirmation.
+    NotNeeded,
+    /// Honoured from memory, in this epoch.
+    Remembered(u64),
+    /// The user said yes just now, in this epoch, to this question — or to
+    /// no question at all, when the requester could not be told from another.
+    Given {
+        question: Option<String>,
+        epoch: u64,
+    },
+}
+
+/// A remembered answer that no longer covers the request it was honoured for.
+#[derive(Debug)]
+pub struct Voided;
+
 pub struct Approvals {
     enabled: bool,
     epoch: Arc<LockEpoch>,
@@ -81,9 +99,36 @@ impl Approvals {
         self.epoch.unlocks()
     }
 
-    /// The vault has turned out to be locked: end everything remembered.
-    pub fn lock(&self) {
-        self.epoch.bump();
+    /// What a request's answer comes to once its vault work is done — the one
+    /// place that decides what an ask means to the approvals.
+    ///
+    /// `asked` says the request had to ask for the master password: the vault
+    /// was locked, by a lock this agent has not otherwise seen — a shell's
+    /// unlock expiring — and what was approved before it is void, whether or
+    /// not the ask was answered. So an answer honoured from memory no longer
+    /// covers the request, and an answer given just now belongs to the epoch
+    /// that begins here. `signed` says a signature was issued: an answer given
+    /// is filed only then.
+    pub fn settle(&self, answer: Answer, asked: bool, signed: bool) -> Result<(), Voided> {
+        if asked {
+            self.epoch.bump();
+        }
+        match answer {
+            Answer::NotNeeded => Ok(()),
+            Answer::Remembered(epoch) => {
+                if asked || epoch != self.epoch.current() {
+                    Err(Voided)
+                } else {
+                    Ok(())
+                }
+            }
+            Answer::Given { question, epoch } => {
+                if let (Some(question), true) = (question, signed) {
+                    self.remember_in(question, if asked { epoch + 1 } else { epoch });
+                }
+                Ok(())
+            }
+        }
     }
 
     /// The epoch this question was approved in, if that is the current one.
@@ -147,13 +192,72 @@ mod tests {
         assert_eq!(approvals.remembered.lock().unwrap().len(), 1);
         assert_eq!(approvals.remembered_in("other"), Some(1));
 
-        // asking for the master password is counted, and turned into a lock
-        // by whoever learns of it
+        // asking for the master password is counted, for the request that
+        // asked to settle with
         assert_eq!(approvals.unlocks(), 0);
         epoch.unlocked();
         assert_eq!(approvals.unlocks(), 1);
-        approvals.lock();
-        assert_eq!(approvals.epoch(), 2);
+    }
+
+    #[test]
+    fn settling_turns_an_ask_into_a_lock_and_files_an_answer_where_it_belongs() {
+        let epoch = Arc::new(LockEpoch::default());
+        let approvals = Approvals::new(true, epoch.clone());
+        let given = |epoch| Answer::Given {
+            question: Some("q".into()),
+            epoch,
+        };
+
+        // nothing to settle, nothing changes
+        approvals.settle(Answer::NotNeeded, false, true).unwrap();
+        assert_eq!(approvals.epoch(), 0);
+
+        // an answer given, signed, no ask: filed in its epoch
+        approvals.settle(given(0), false, true).unwrap();
+        assert_eq!(approvals.remembered_in("q"), Some(0));
+        // ... and honoured from memory while nothing locks
+        approvals
+            .settle(Answer::Remembered(0), false, true)
+            .unwrap();
+
+        // an ask is a lock: what was honoured no longer covers the request
+        assert!(approvals.settle(Answer::Remembered(0), true, true).is_err());
+        assert_eq!(approvals.epoch(), 1);
+        assert_eq!(approvals.remembered_in("q"), None);
+        // a lock that happened elsewhere voids it too
+        approvals.settle(given(1), false, true).unwrap();
+        epoch.bump();
+        assert!(approvals
+            .settle(Answer::Remembered(1), false, true)
+            .is_err());
+
+        // an answer given while the request's own fetch asked is carried into
+        // the epoch that begins with that ask
+        approvals.settle(given(2), true, true).unwrap();
+        assert_eq!(approvals.remembered_in("q"), Some(3));
+        // not signed, not filed; asked and not signed, still a lock
+        approvals.settle(given(3), false, false).unwrap();
+        assert_eq!(approvals.remembered_in("q"), Some(3));
+        approvals.settle(given(3), true, false).unwrap();
+        assert_eq!(approvals.epoch(), 4);
+        assert_eq!(approvals.remembered_in("q"), None);
+        // no question to file is nothing to file
+        approvals
+            .settle(
+                Answer::Given {
+                    question: None,
+                    epoch: 4,
+                },
+                false,
+                true,
+            )
+            .unwrap();
+        assert!(approvals
+            .remembered
+            .lock()
+            .unwrap()
+            .values()
+            .all(|answered_in| *answered_in != 4));
     }
 
     #[test]

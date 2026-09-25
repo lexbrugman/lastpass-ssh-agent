@@ -7,7 +7,7 @@ use ssh_agent_lib::proto::{Extension, Identity, Request, Response, SignRequest};
 use ssh_key::{PrivateKey, Signature};
 use zeroize::Zeroizing;
 
-use crate::approvals::Approvals;
+use crate::approvals::{Answer, Approvals};
 use crate::confirm::{ConfirmContext, Confirmer, Decision, PeerInfo, SessionBinding};
 use crate::interaction::InteractionGate;
 use crate::keystore::{KeyEntry, Served};
@@ -232,19 +232,9 @@ impl LpassAgent {
              serve what the vault holds");
     }
 
-    /// Everything that touches the private key, in one place.
-    ///
-    /// `unlocked` is set when the vault had to be asked for the master
-    /// password on the way, answered or not — `sign` reads it as a lock
-    /// having happened.
-    async fn fetch_and_sign(
-        &self,
-        entry: &KeyEntry,
-        data: &[u8],
-        flags: u32,
-        gate: &mut InteractionGate,
-        unlocked: &mut bool,
-    ) -> Result<Signature, String> {
+    /// The private key's bytes from the vault, and whether the vault had to
+    /// be asked for the master password on the way.
+    async fn fetch_private_key(&self, entry: &KeyEntry, gate: &mut InteractionGate) -> Fetch {
         // Through the client that cannot prompt first, and without the gate:
         // with the password held, or the vault open in a shell, this is the
         // whole fetch, and requests that never reach the user run side by
@@ -252,18 +242,31 @@ impl LpassAgent {
         // under the gate, because a master-password prompt is an interaction
         // like any other, and the gate is what keeps it off a screen another
         // request's dialog is on.
-        let fetched = match self.lpass.show_field(&entry.item_id, "Private Key").await {
+        match self.lpass.show_field(&entry.item_id, "Private Key").await {
             Err(crate::lpass::LpassError::Locked) => {
                 gate.enter().await;
                 // With the gate held, an ask counted here can only be this
                 // request's own.
                 let before = self.approvals.unlocks();
-                let fetched = self.asking.show_field(&entry.item_id, "Private Key").await;
-                *unlocked = self.approvals.unlocks() != before;
-                fetched
+                let key = self.asking.show_field(&entry.item_id, "Private Key").await;
+                Fetch {
+                    key,
+                    asked: self.approvals.unlocks() != before,
+                }
             }
-            quiet => quiet,
-        };
+            key => Fetch { key, asked: false },
+        }
+    }
+
+    /// Everything that touches the private key, in one place.
+    async fn sign_with(
+        &self,
+        entry: &KeyEntry,
+        fetched: Result<Zeroizing<Vec<u8>>, crate::lpass::LpassError>,
+        data: &[u8],
+        flags: u32,
+        gate: &mut InteractionGate,
+    ) -> Result<Signature, String> {
         let pem: Zeroizing<Vec<u8>> = match fetched {
             Ok(pem) => pem,
             Err(e) => {
@@ -316,6 +319,69 @@ impl LpassAgent {
         signing::sign_with_key(&key, data, flags).map_err(|e| e.to_string())
         // `key` (and the encrypted original) zeroize on drop here.
     }
+
+    /// The user's answer for this request: remembered, or asked for now.
+    ///
+    /// A denial ends the request here.
+    async fn approval_for(
+        &self,
+        entry: &KeyEntry,
+        gate: &mut InteractionGate,
+    ) -> Result<Answer, AgentError> {
+        // The host lookup first: it can wait on the filesystem, and nothing
+        // about it needs the user, so no other request should stand behind it.
+        let bindings = self.named_bindings().await;
+        let mut ctx = ConfirmContext::new(entry, self.peer, bindings);
+        let mut question = crate::confirm::approval_question(&ctx);
+        let remembered = |question: &Option<String>| {
+            question
+                .as_deref()
+                .and_then(|question| self.approvals.remembered_in(question))
+        };
+        // Asked again once the gate is held: a second request with the same
+        // question, arriving while the first was on screen, would otherwise
+        // put a second prompt up for an answer just given. The context is
+        // rebuilt there too, so what the prompt shows and what is remembered
+        // are one snapshot of the requester, taken now rather than before
+        // the wait. A request answered from memory takes no gate here, and
+        // the one wait it can still meet — the vault turning out locked
+        // under it — voids that answer when the request settles.
+        let mut answered = remembered(&question);
+        if answered.is_none() {
+            gate.enter().await;
+            ctx = ConfirmContext::new(entry, self.peer, ctx.bindings);
+            question = crate::confirm::approval_question(&ctx);
+            answered = remembered(&question);
+        }
+        if let Some(epoch) = answered {
+            tracing::info!(item = %entry.item_id, key = %entry.name,
+                "signature approved as before, for the same requester and hosts");
+            return Ok(Answer::Remembered(epoch));
+        }
+        match self.confirmer.confirm(&ctx).await {
+            Decision::Approve => Ok(Answer::Given {
+                question,
+                epoch: self.approvals.epoch(),
+            }),
+            Decision::Deny => {
+                // Not "denied by user": a prompt that could not be shown
+                // denies too, and claiming a refusal that never happened
+                // sends whoever reads this looking in the wrong place. The
+                // confirmer has just logged which it was.
+                tracing::info!(item = %entry.item_id, key = %entry.name,
+                    "signature denied");
+                Err(AgentError::Failure)
+            }
+        }
+    }
+}
+
+/// What fetching a private key came to.
+struct Fetch {
+    key: Result<Zeroizing<Vec<u8>>, crate::lpass::LpassError>,
+    /// Whether the vault had to be asked for the master password, answered
+    /// or not — a lock this agent has not otherwise seen.
+    asked: bool,
 }
 
 /// Removing a file the agent itself wrote cannot fail in practice, so the edge
@@ -391,95 +457,24 @@ impl Session for LpassAgent {
             return Err(AgentError::Failure);
         };
 
-        // The epoch a remembered approval was honoured in, when one was. The
-        // fetch below can find the vault locked — by a lock this agent never
-        // saw, a shell's unlock expiring — and a signature made past that is
-        // one the approval no longer covers: refused, not issued.
-        let mut approved_in = None;
-        // The question the user has just said yes to, and the epoch they said
-        // it in; filed once the signature is issued, so a fetch that is itself
-        // the first unlock can carry it into the epoch that begins there.
-        let mut to_remember = None;
-        // Only a client that can prompt can have unlocked the vault, and it
-        // does so holding the gate — so the gate is taken first, and every
-        // wait is over before the requester is looked at or the unlock counter
-        // read: a request that stood here while another's prompt was up sees
-        // the requester as it is now, and an unlock that other request did is
-        // not taken for one of its own.
-        // The host lookup first: it can wait on the filesystem, and nothing
-        // about it needs the user, so no other request should stand behind it.
-        let bindings = if entry.confirm {
-            self.named_bindings().await
+        let answer = if entry.confirm {
+            self.approval_for(entry, &mut gate).await?
         } else {
-            Vec::new()
+            Answer::NotNeeded
         };
-        if entry.confirm {
-            let mut ctx = ConfirmContext::new(entry, self.peer, bindings);
-            let mut question = crate::confirm::approval_question(&ctx);
-            let remembered = |question: &Option<String>| {
-                question
-                    .as_deref()
-                    .and_then(|question| self.approvals.remembered_in(question))
-            };
-            // Asked again once the gate is held: a second request with the same
-            // question, arriving while the first was on screen, would otherwise
-            // put a second prompt up for an answer just given. The context is
-            // rebuilt there too, so what the prompt shows and what is remembered
-            // are one snapshot of the requester, taken now rather than before
-            // the wait. A request answered from memory takes no gate here, and
-            // the one wait it can still meet — the vault turning out locked
-            // under it — voids that answer below.
-            let mut answered = remembered(&question);
-            if answered.is_none() {
-                gate.enter().await;
-                ctx = ConfirmContext::new(entry, self.peer, ctx.bindings);
-                question = crate::confirm::approval_question(&ctx);
-                answered = remembered(&question);
-            }
-            if let Some(epoch) = answered {
-                tracing::info!(item = %entry.item_id, key = %entry.name,
-                    "signature approved as before, for the same requester and hosts");
-                approved_in = Some(epoch);
-            } else {
-                match self.confirmer.confirm(&ctx).await {
-                    Decision::Approve => {
-                        to_remember = question.map(|question| (question, self.approvals.epoch()));
-                    }
-                    Decision::Deny => {
-                        // Not "denied by user": a prompt that could not be shown
-                        // denies too, and claiming a refusal that never happened
-                        // sends whoever reads this looking in the wrong place. The
-                        // confirmer has just logged which it was.
-                        tracing::info!(item = %entry.item_id, key = %entry.name,
-                            "signature denied");
-                        return Err(AgentError::Failure);
-                    }
-                }
-            }
-        }
 
-        let mut unlocked_now = false;
-        let result = self
-            .fetch_and_sign(
-                entry,
-                &request.data,
-                request.flags,
-                &mut gate,
-                &mut unlocked_now,
-            )
+        let fetch = self.fetch_private_key(entry, &mut gate).await;
+        let signed = self
+            .sign_with(entry, fetch.key, &request.data, request.flags, &mut gate)
             .await;
-        // Having had to ask for the master password means the vault was locked,
-        // by a lock nothing here saw: what was approved before it is void,
-        // whether or not the ask was answered — a prompt dismissed leaves the
-        // vault as locked as it found it.
-        if unlocked_now {
-            self.approvals.lock();
-        }
-        match result {
-            Ok(_)
-                if approved_in
-                    .is_some_and(|epoch| unlocked_now || epoch != self.approvals.epoch()) =>
-            {
+        let voided = self
+            .approvals
+            .settle(answer, fetch.asked, signed.is_ok())
+            .is_err();
+        match signed {
+            // A signature that failed says why; an answer voided under it is
+            // beside the point.
+            Ok(_) if voided => {
                 tracing::warn!(item = %entry.item_id, key = %entry.name,
                     "the vault locked during this request, so the remembered approval no \
                      longer covers it — retry, and confirm");
@@ -488,12 +483,6 @@ impl Session for LpassAgent {
             Ok(signature) => {
                 tracing::info!(item = %entry.item_id, key = %entry.name,
                     algorithm = %signature.algorithm(), "signature issued");
-                // This request's own approval belongs to the epoch that began
-                // with its unlock.
-                if let Some((question, epoch)) = to_remember {
-                    self.approvals
-                        .remember_in(question, if unlocked_now { epoch + 1 } else { epoch });
-                }
                 if let Some(refresher) = &self.refresher {
                     refresher.after_signature();
                 }
