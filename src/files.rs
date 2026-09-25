@@ -43,11 +43,14 @@ pub fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     staging.push(format!(".{}", std::process::id()));
     let staging = PathBuf::from(staging);
 
+    // Never through a symlink: the staging name is predictable, and one planted
+    // there would have the contents written wherever it points.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&staging)?;
     file.write_all(contents)?;
     // Closed before the rename: a descriptor still open for writing is exactly

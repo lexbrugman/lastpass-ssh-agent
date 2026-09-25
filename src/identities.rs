@@ -59,6 +59,20 @@ pub fn load(path: &Path) -> Result<Option<Remembered>> {
         String::from_utf8(bytes)
             .map_err(|e| e.to_string())
             .and_then(|text| toml::from_str::<Remembered>(&text).map_err(|e| e.to_string()))
+            // An id goes to lpass as an argument, so it is held to the same
+            // rule as one from the config; the file is the agent's own, and
+            // one that breaks the rule was not written by it.
+            .and_then(|remembered| {
+                if remembered
+                    .keys
+                    .iter()
+                    .all(|key| crate::lpass::is_item_id(&key.id))
+                {
+                    Ok(remembered)
+                } else {
+                    Err("an item id that is not one".to_string())
+                }
+            })
     };
     match decoded {
         Ok(remembered) => Ok(Some(remembered)),
@@ -122,6 +136,26 @@ fn cannot_encode(e: toml::ser::Error) -> Error {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_id_that_is_not_one_makes_the_file_unreadable() {
+        // An id goes to lpass as an argument, and the agent writes only
+        // digits, so a file saying otherwise is not one it wrote.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock.identities");
+        std::fs::write(
+            &path,
+            "[[keys]]\nid = \"--field=x\"\nname = \"n\"\npublic = \"p\"\n",
+        )
+        .unwrap();
+        assert!(load(&path).unwrap().is_none());
+        std::fs::write(
+            &path,
+            "[[keys]]\nid = \"42\"\nname = \"n\"\npublic = \"p\"\n",
+        )
+        .unwrap();
+        assert_eq!(load(&path).unwrap().unwrap().keys[0].id, "42");
+    }
 
     fn sample() -> Remembered {
         Remembered {

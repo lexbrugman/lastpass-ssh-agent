@@ -66,6 +66,11 @@ pub struct LpassAgent {
 /// without bound. OpenSSH's agent uses the same limit.
 const MAX_SESSION_BINDINGS: usize = 16;
 
+/// A session id is a key-exchange hash, at most 64 bytes; OpenSSH's agent
+/// allows twice that. Kept for the connection's life, so bounded, or a peer
+/// could fill memory one signed binding at a time.
+const MAX_SESSION_ID_BYTES: usize = 128;
+
 impl LpassAgent {
     pub fn new(
         store: Served,
@@ -166,10 +171,25 @@ impl LpassAgent {
             tracing::warn!("refusing a session binding whose host signature does not verify: {e}");
             return Response::Failure;
         }
-        if self.bindings.len() >= MAX_SESSION_BINDINGS {
+        if bind.session_id.len() > MAX_SESSION_ID_BYTES {
             tracing::warn!(
-                "refusing a session binding: this connection already has \
-                 {MAX_SESSION_BINDINGS}"
+                "refusing a session binding whose session id is longer than any key exchange \
+                 produces"
+            );
+            return Response::Failure;
+        }
+        // OpenSSH's own rules for what may follow a binding. A hop that is
+        // not forwarding the agent is the connection's destination, and
+        // nothing binds after it. A host key already bound is a replay:
+        // binding signatures cover the session id and nothing else, so one
+        // seen once can be sent again at will, and letting it change the
+        // list — its order, its last entry, its forwarding marks — would let
+        // a peer choose which session a signature is checked against. It is
+        // ignored, and what was bound first stands.
+        if self.bindings.last().is_some_and(|last| !last.is_forwarding) {
+            tracing::warn!(
+                "refusing a session binding: this connection is already bound to its \
+                 destination"
             );
             return Response::Failure;
         }
@@ -177,13 +197,19 @@ impl LpassAgent {
             .host_key
             .fingerprint(ssh_key::HashAlg::Sha256)
             .to_string();
-        // a repeated hop tells the user nothing new
         if self
             .bindings
             .iter()
             .any(|seen| seen.host_fingerprint == host_fingerprint)
         {
             return Response::Success;
+        }
+        if self.bindings.len() >= MAX_SESSION_BINDINGS {
+            tracing::warn!(
+                "refusing a session binding: this connection already has \
+                 {MAX_SESSION_BINDINGS}"
+            );
+            return Response::Failure;
         }
         tracing::debug!(host = %host_fingerprint, forwarding = bind.is_forwarding,
             "session bound");
@@ -192,6 +218,10 @@ impl LpassAgent {
             // Named when a signature is actually asked for; see `host_names`.
             host_name: None,
             is_forwarding: bind.is_forwarding,
+            session_id: bind.session_id,
+            host_key: ssh_key::PublicKey::from(bind.host_key)
+                .to_bytes()
+                .unwrap_or_else(unencodable),
         });
         Response::Success
     }
@@ -376,6 +406,20 @@ impl LpassAgent {
     }
 }
 
+/// A public key that parsed cannot fail to encode, so this is excluded from
+/// coverage rather than pretended testable; an empty encoding matches no
+/// request, which refuses the signature.
+/// (`unwrap_or_else` dictates the by-value signature.)
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "unwrap_or_else requires FnOnce(ssh_key::Error)"
+)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn unencodable(e: ssh_key::Error) -> Vec<u8> {
+    tracing::warn!("cannot encode the advertised public key: {e}");
+    Vec::new()
+}
+
 /// What fetching a private key came to.
 struct Fetch {
     key: Result<Zeroizing<Vec<u8>>, crate::lpass::LpassError>,
@@ -456,6 +500,33 @@ impl Session for LpassAgent {
             tracing::warn!("sign request for a key this agent does not hold");
             return Err(AgentError::Failure);
         };
+
+        // On a bound connection, what is signed has to be a userauth request
+        // for the session bound last — OpenSSH's own rule. A binding is a
+        // host's signature over a session id, replayable by anyone who has
+        // ever connected to that host, so without this a request for one host
+        // could wear another's binding and the prompt would name the wrong
+        // host; and data that is not a userauth request at all is not what
+        // `ssh` sends on a bound connection.
+        if let Some(bound) = self.bindings.last() {
+            let public_key = entry.public.to_bytes().unwrap_or_else(unencodable);
+            match signing::userauth_session_id(&request.data, &public_key, &bound.host_key) {
+                Some(session_id) if session_id == bound.session_id => {}
+                Some(_) => {
+                    tracing::warn!(item = %entry.item_id, key = %entry.name,
+                        host = %bound.host_fingerprint,
+                        "refusing to sign: the request is for a session other than the one \
+                         this connection is bound to");
+                    return Err(AgentError::Failure);
+                }
+                None => {
+                    tracing::warn!(item = %entry.item_id, key = %entry.name,
+                        "refusing to sign: a bound connection asked for something other than \
+                         a userauth request");
+                    return Err(AgentError::Failure);
+                }
+            }
+        }
 
         let answer = if entry.confirm {
             self.approval_for(entry, &mut gate).await?
@@ -594,6 +665,36 @@ mod tests {
     /// `LpassAgent::new` call sites.
     fn unlocking(client: &Arc<MockLpass>, prompt: Arc<dyn PassphrasePrompt>) -> Arc<Unlocker> {
         Arc::new(Unlocker::new(client.clone(), prompt))
+    }
+
+    /// What `ssh` asks the agent to sign on a bound connection: a userauth
+    /// request for `session_id` with `public`.
+    fn userauth(session_id: &[u8], public: &str) -> Vec<u8> {
+        userauth_to(session_id, public, None)
+    }
+
+    /// The same in the host-bound form, naming `host` as the server.
+    fn userauth_to(session_id: &[u8], public: &str, host: Option<&PrivateKey>) -> Vec<u8> {
+        let string = |value: &[u8]| {
+            let mut out = u32::try_from(value.len()).unwrap().to_be_bytes().to_vec();
+            out.extend_from_slice(value);
+            out
+        };
+        let key = ssh_key::PublicKey::from_openssh(public.trim()).unwrap();
+        let mut data = string(session_id);
+        data.push(50);
+        data.extend(string(b"user"));
+        data.extend(string(b"ssh-connection"));
+        data.extend(string(host.map_or(&b"publickey"[..], |_| {
+            b"publickey-hostbound-v00@openssh.com"
+        })));
+        data.push(1);
+        data.extend(string(key.algorithm().as_str().as_bytes()));
+        data.extend(string(&key.to_bytes().unwrap()));
+        if let Some(host) = host {
+            data.extend(string(&host.public_key().to_bytes().unwrap()));
+        }
+        data
     }
 
     fn sign_request(public: &str, data: &[u8], flags: u32) -> SignRequest {
@@ -1760,7 +1861,11 @@ mod tests {
             Response::Success
         ));
         agent
-            .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth(b"session-one", ED25519_PUB),
+                0,
+            )))
             .await
             .unwrap();
 
@@ -1795,7 +1900,11 @@ mod tests {
             .await
             .unwrap();
         agent
-            .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth(b"hop-two", ED25519_PUB),
+                0,
+            )))
             .await
             .unwrap();
 
@@ -1822,28 +1931,63 @@ mod tests {
         let mut agent = agent_recording(confirmer.clone()).await;
         let host = PrivateKey::from_openssh(ED25519).unwrap();
 
-        // the same hop repeated adds nothing
-        for _ in 0..3 {
+        // the same hop repeated adds nothing, and changes nothing: a replay
+        // with another session id leaves the one bound first
+        for session in [&b"same-host"[..], b"same-host", b"replayed-later"] {
             assert!(matches!(
                 agent
-                    .handle(session_bind(&host, b"same-host", false))
+                    .handle(session_bind(&host, session, true))
                     .await
                     .unwrap(),
                 Response::Success
             ));
         }
         assert_eq!(agent.bindings.len(), 1);
+        assert_eq!(agent.bindings[0].session_id, b"same-host");
 
-        // distinct hops accumulate only up to our own cap
+        // distinct forwarding hops accumulate only up to our own cap
         for hop in 0..MAX_SESSION_BINDINGS + 4 {
             let key =
                 PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
             let _ = agent
-                .handle(session_bind(&key, format!("hop{hop}").as_bytes(), false))
+                .handle(session_bind(&key, format!("hop{hop}").as_bytes(), true))
                 .await
                 .unwrap();
         }
         assert_eq!(agent.bindings.len(), MAX_SESSION_BINDINGS);
+    }
+
+    #[tokio::test]
+    async fn nothing_binds_after_the_destination() {
+        // A hop that is not forwarding the agent is where the connection
+        // ends; a binding after it could only be a peer rewriting the chain.
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone()).await;
+        let first = PrivateKey::from_openssh(ED25519).unwrap();
+        let destination =
+            PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        agent
+            .handle(session_bind(&first, b"hop-one", true))
+            .await
+            .unwrap();
+        agent
+            .handle(session_bind(&destination, b"the-end", false))
+            .await
+            .unwrap();
+        // neither a new host nor a replay of the first hop gets in
+        let another =
+            PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        for (key, session) in [(&another, &b"later"[..]), (&first, b"hop-one")] {
+            assert!(matches!(
+                agent
+                    .handle(session_bind(key, session, false))
+                    .await
+                    .unwrap(),
+                Response::Failure
+            ));
+        }
+        assert_eq!(agent.bindings.len(), 2);
+        assert_eq!(agent.bindings.last().unwrap().session_id, b"the-end");
     }
 
     #[tokio::test]
@@ -1897,6 +2041,82 @@ mod tests {
             agent.handle(malformed).await.unwrap(),
             Response::Failure
         ));
+    }
+
+    #[tokio::test]
+    async fn a_bound_connection_signs_only_userauth_requests_for_its_session() {
+        // A binding is replayable by anyone who has connected to that host, so
+        // the data must say which session it is for, and that must be the one
+        // bound last: anything else would put the wrong host on the prompt.
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone()).await;
+        let host = PrivateKey::from_openssh(ED25519).unwrap();
+        agent
+            .handle(session_bind(&host, b"bound", false))
+            .await
+            .unwrap();
+
+        // another session's userauth request, and data that is no userauth
+        // request at all: refused before any prompt
+        for data in [userauth(b"other", ED25519_PUB), b"just bytes".to_vec()] {
+            let response = agent
+                .handle(Request::SignRequest(sign_request(ED25519_PUB, &data, 0)))
+                .await
+                .unwrap();
+            assert!(matches!(response, Response::Failure));
+        }
+        assert!(confirmer.0.lock().unwrap().is_empty(), "nothing was asked");
+
+        // the bound session's own request is signed
+        let response = agent
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth(b"bound", ED25519_PUB),
+                0,
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::SignResponse(_)));
+
+        // the host-bound form names the server: the bound host is signed for,
+        // a host in the middle naming the one beyond it is not
+        let beyond = PrivateKey::from_openssh(ED25519_PW)
+            .unwrap()
+            .decrypt("fixture-passphrase")
+            .unwrap();
+        let response = agent
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth_to(b"bound", ED25519_PUB, Some(&host)),
+                0,
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::SignResponse(_)));
+        let response = agent
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth_to(b"bound", ED25519_PUB, Some(&beyond)),
+                0,
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Failure));
+
+        // a session id longer than any key exchange produces is refused
+        let response = agent
+            .handle(session_bind(&host, &[7u8; MAX_SESSION_ID_BYTES + 1], false))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Failure));
+
+        // an unbound connection is under no such rule
+        let mut plain = agent_recording(confirmer.clone()).await;
+        let response = plain
+            .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::SignResponse(_)));
     }
 
     #[tokio::test]

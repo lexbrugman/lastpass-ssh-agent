@@ -239,11 +239,13 @@ impl LpassCli {
                 stdout.pop();
             }
         }
-        let stderr: String = String::from_utf8_lossy(&stderr)
-            .trim()
-            .chars()
-            .take(300)
-            .collect();
+        // Untrusted text like a vault name — lpass quotes item names in some
+        // of its messages — and headed for the log, so escaped the same way.
+        let stderr: String =
+            crate::text::escape_for_display(String::from_utf8_lossy(&stderr).trim())
+                .chars()
+                .take(300)
+                .collect();
         Ok(CmdOutput {
             success: status.success(),
             code: status.code(),
@@ -375,7 +377,7 @@ fn parse_ls_line(line: &str) -> Option<ItemSummary> {
     let line = line.trim_end();
     let rest = line.strip_suffix(']')?;
     let (name, id) = rest.rsplit_once(" [id: ")?;
-    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+    if !super::is_item_id(id) {
         return None;
     }
     Some(ItemSummary {
@@ -712,6 +714,21 @@ done"#,
                 "{words}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn lpass_diagnostics_are_escaped_before_they_can_reach_a_log() {
+        // lpass repeats item names in some messages, and an item name is the
+        // vault's to choose: a control character in it must not redraw
+        // whatever terminal the log is on.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_lpass(
+            dir.path(),
+            "printf 'Error: no such item \\033[2J\\n' >&2; exit 1",
+        );
+        let err = LpassCli::new(bin).ls().await.unwrap_err().to_string();
+        assert!(!err.contains('\x1b'), "{err}");
+        assert!(err.contains("\\x1b[2J"), "{err}");
     }
 
     #[tokio::test]

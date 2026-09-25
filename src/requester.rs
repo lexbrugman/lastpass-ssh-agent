@@ -19,7 +19,17 @@ use crate::text::escape_for_display;
 #[derive(Debug, Clone)]
 pub struct Requester {
     pub process: String,
-    pub origin: Vec<String>,
+    pub origin: Vec<Ancestor>,
+}
+
+/// One process above the requester: named for the prompt, and by its whole
+/// path for what a remembered approval is keyed on — a name is what a person
+/// recognises, and a path is what two processes cannot share by choosing a
+/// file name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ancestor {
+    pub name: String,
+    pub path: String,
 }
 
 impl Requester {
@@ -109,7 +119,7 @@ const MAX_ORIGIN_DEPTH: usize = 8;
 
 /// The names of a process's ancestors, nearest first, up to the top of the
 /// user's own tree.
-fn origin_chain(pid: i32) -> Vec<String> {
+fn origin_chain(pid: i32) -> Vec<Ancestor> {
     origin_chain_from(pid, &parent_pid, &process_path)
 }
 
@@ -117,9 +127,9 @@ fn origin_chain(pid: i32) -> Vec<String> {
 /// on a tree of the test's own making.
 ///
 /// Stops before pid 1 — the tree's root names no application — and at the
-/// first ancestor that cannot be read. Consecutive repeats of one name, a shell
-/// that ran a shell, collapse into one, so the line reads as the steps that
-/// matter. Cycles need no guard: the kernel keeps this a tree, and the depth
+/// first ancestor that cannot be read. Consecutive repeats of one executable, a
+/// shell that ran a shell, collapse into one, so the line reads as the steps
+/// that matter. Cycles need no guard: the kernel keeps this a tree, and the depth
 /// bound holds regardless.
 ///
 /// The lookups are trait objects rather than generics so that there is one
@@ -129,8 +139,8 @@ fn origin_chain_from(
     pid: i32,
     parent: &dyn Fn(i32) -> Option<i32>,
     path: &dyn Fn(i32) -> Option<String>,
-) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
+) -> Vec<Ancestor> {
+    let mut ancestors: Vec<Ancestor> = Vec::new();
     let mut current = pid;
     // Bounds the ancestors walked, not the names kept: a chain of one name
     // repeated collapses to one entry, and must still end.
@@ -141,26 +151,30 @@ fn origin_chain_from(
         let Some(path) = path(next) else {
             break;
         };
-        let name = display_name(&path);
-        if names.last() != Some(&name) {
-            names.push(name);
+        let path = escape_for_display(&path);
+        if ancestors.last().is_none_or(|last| last.path != path) {
+            ancestors.push(Ancestor {
+                name: display_name(&path),
+                path,
+            });
         }
         current = next;
     }
-    names
+    ancestors
 }
 
 /// How an ancestor is named: the app bundle when it runs from one — the
 /// outermost, so a helper process inside an editor is named for the editor —
-/// and the executable's file name otherwise. Escaped, since whoever spawned
-/// the process chose it.
+/// and the executable's file name otherwise. `path` is escaped text already.
 fn display_name(path: &str) -> String {
     let bundle = path
         .split('/')
         .find_map(|part| part.strip_suffix(".app"))
         .filter(|stem| !stem.is_empty());
-    let name = bundle.or_else(|| path.rsplit('/').next()).unwrap_or(path);
-    escape_for_display(name)
+    bundle
+        .or_else(|| path.rsplit('/').next())
+        .unwrap_or(path)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -178,6 +192,7 @@ mod tests {
             !this.origin.is_empty(),
             "the test runner, at least, is above this process"
         );
+        assert!(this.origin[0].path.starts_with('/'), "{:?}", this.origin[0]);
         // pid 0 / absurd pids have no executable path, and pid 1's ancestry
         // is nobody's application
         assert!(process_path(0).is_none());
@@ -198,13 +213,24 @@ mod tests {
                 other => format!("/usr/bin/p{other}"),
             })
         };
+        let names = |chain: Vec<Ancestor>| -> Vec<String> {
+            chain.into_iter().map(|ancestor| ancestor.name).collect()
+        };
         assert_eq!(
-            origin_chain_from(10, &parent, &path),
+            names(origin_chain_from(10, &parent, &path)),
             ["zsh", "Terminal", "p6", "p5", "p4", "p3", "p2"]
+        );
+        // the path is kept beside the name, whole
+        assert_eq!(
+            origin_chain_from(10, &parent, &path)[1].path,
+            "/Applications/Terminal.app/Contents/MacOS/Terminal"
         );
         // an ancestor that cannot be read ends the walk there
         let unreadable = |pid: i32| (pid != 7).then(|| format!("/usr/bin/p{pid}"));
-        assert_eq!(origin_chain_from(10, &parent, &unreadable), ["p9", "p8"]);
+        assert_eq!(
+            names(origin_chain_from(10, &parent, &unreadable)),
+            ["p9", "p8"]
+        );
         // and a tree deeper than anyone reads is cut at the bound
         assert_eq!(
             origin_chain_from(100, &parent, &|pid| Some(format!("/p{pid}"))).len(),
@@ -218,7 +244,9 @@ mod tests {
             parent(pid)
         };
         assert_eq!(
-            origin_chain_from(100, &counted, &|_| Some("/bin/sh".to_string())),
+            names(origin_chain_from(100, &counted, &|_| Some(
+                "/bin/sh".to_string()
+            ))),
             ["sh"]
         );
         assert_eq!(walked.get(), MAX_ORIGIN_DEPTH);
@@ -236,8 +264,13 @@ mod tests {
         );
         // a bare ".app" component names nothing, so the file name stands
         assert_eq!(display_name("/x/.app/bin/tool"), "tool");
-        // untrusted: a name that tries to redraw the dialog is shown literally
-        assert_eq!(display_name("/tmp/evil\x1b[2J"), "evil\\x1b[2J");
         assert_eq!(display_name("noslash"), "noslash");
+        // untrusted: a path that tries to redraw the dialog is escaped on the
+        // way in, so name and path both show it literally
+        let evil = origin_chain_from(2, &|pid: i32| (pid == 2).then_some(3), &|_| {
+            Some("/tmp/evil\x1b[2J".to_string())
+        });
+        assert_eq!(evil[0].name, "evil\\x1b[2J");
+        assert_eq!(evil[0].path, "/tmp/evil\\x1b[2J");
     }
 }

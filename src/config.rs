@@ -228,7 +228,7 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         for key in &self.keys {
-            if key.id.is_empty() || !key.id.bytes().all(|b| b.is_ascii_digit()) {
+            if !crate::lpass::is_item_id(&key.id) {
                 return Err(Error::ConfigInvalid(format!(
                     "key id {:?} must be a numeric LastPass item id (use `lastpass-ssh-agent search` to find it)",
                     key.id
@@ -246,6 +246,17 @@ impl Config {
                 return Err(Error::ConfigInvalid(format!(
                     "socket path {} must be absolute — SSH clients resolve SSH_AUTH_SOCK from their own working directory",
                     socket.display()
+                )));
+            }
+        }
+        // Resolved from a working directory nothing chooses on purpose — a
+        // service's is `/` — and `doctor` and `start` could resolve them from
+        // different ones, so what one checks is not what the other runs.
+        for (name, path) in [("lpass_path", &self.lpass_path), ("askpass", &self.askpass)] {
+            if let Some(path) = path.as_deref().filter(|path| !path.is_absolute()) {
+                return Err(Error::ConfigInvalid(format!(
+                    "{name} {} must be absolute",
+                    path.display()
                 )));
             }
         }
@@ -400,6 +411,8 @@ mod tests {
             source: Box::new(e),
         })?;
         config.socket = config.socket.map(expand_tilde);
+        config.lpass_path = config.lpass_path.map(expand_tilde);
+        config.askpass = config.askpass.map(expand_tilde);
         config.validate()?;
         Ok(config)
     }
@@ -798,6 +811,16 @@ passphrase_fallback = "error"
     #[test]
     fn duplicate_ids_rejected() {
         assert!(parse("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"1\"").is_err());
+    }
+
+    #[test]
+    fn helper_paths_must_be_absolute() {
+        assert!(parse("lpass_path = \"lpass\"").is_err());
+        assert!(parse("lpass_path = \"bin/lpass\"").is_err());
+        assert!(parse("askpass = \"ssh-askpass\"").is_err());
+        assert!(parse("lpass_path = \"/opt/homebrew/bin/lpass\"").is_ok());
+        // ~ expands to an absolute path before validation
+        assert!(parse("lpass_path = \"~/bin/lpass\"").is_ok());
     }
 
     #[test]

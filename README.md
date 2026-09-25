@@ -33,7 +33,12 @@ What this agent **guarantees**:
   arrived over a connection you forwarded with `ssh -A` it says so and warns
   that it may have originated there rather than on your machine; without that,
   a relayed request looks identical to one you made yourself. Bindings whose
-  signature does not verify are refused and never displayed.
+  signature does not verify are refused and never displayed, and on a bound
+  connection only a user-authentication request for the session bound last is
+  signed — a binding is a host's signature over a session id and nothing else,
+  replayable by anyone who has connected to that host, so what is signed has
+  to say which session it is for. Nothing binds after the destination, and a
+  host key bound once is not bound again.
 - **Read-only agent.** `ssh-add` (add/remove/lock/unlock) is refused. The
   agent serves every usable SSH Key item the account can see, shared folders
   included — what you can use in the vault, you can use here, for the key
@@ -497,8 +502,10 @@ startup (see [Starting without the vault](#starting-without-the-vault)).
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
+  <!-- your own directory, not /tmp: a log in a shared directory can be
+       pre-created by another user, and the agent's names what you sign with -->
   <key>StandardErrorPath</key>
-  <string>/tmp/lastpass-ssh-agent.log</string>
+  <string>/Users/you/Library/Logs/lastpass-ssh-agent.log</string>
 </dict>
 </plist>
 ```
@@ -548,9 +555,11 @@ the master password, and approvals end there.) A
 per push, which is the arrangement 1Password's agent offers.
 
 Off by default, because the trade is real: while an approval stands, anything
-able to drive that application can sign with that key unasked. The prompt
-itself is unchanged, and a request that differs in any of the words it shows —
-another key, another host, another place it was started from — asks again.
+able to drive that application can sign with that key unasked — and what a
+request "was started from" is what the kernel reports about a process running
+as you, which a process running as you can arrange. The prompt itself is
+unchanged, and a request that differs in any of the words it shows — another
+key, another host, another place it was started from — asks again.
 
 One limit: a vault your shell keeps open is outside the agent's view. It sees
 that vault lock only when a request of its own has to ask for the master

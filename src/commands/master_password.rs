@@ -75,6 +75,19 @@ async fn seed(config: &Config, socket_path: &Path) -> Result<()> {
             "could not lock the vault, so the password cannot be checked — nothing was kept".into(),
         ));
     }
+    // Seen to be locked, not assumed: an agent process titled some other way
+    // survives the end above, and a vault still open would accept any
+    // candidate without reading it.
+    match super::client_from(config)?.ls().await {
+        Err(lpass::LpassError::Locked) => {}
+        Ok(_) => {
+            return Err(Error::State(
+                "the vault is still open, so the password cannot be checked — nothing was kept"
+                    .into(),
+            ))
+        }
+        Err(e) => return Err(e.into()),
+    }
     let secret = passphrase::from_config(config)?
         .prompt(&passphrase::PassphraseRequest::master_password())
         .await
@@ -90,8 +103,8 @@ async fn seed(config: &Config, socket_path: &Path) -> Result<()> {
 }
 
 /// Opening the vault means using it for something that needs the derived key
-/// and returns no secret: listing what is in it. With the shell's agent ended
-/// first, the only way that succeeds is by the candidate fed on stdin.
+/// and returns no secret: listing what is in it. With the vault seen to be
+/// locked first, the only way that succeeds is by the candidate fed on stdin.
 struct VaultOpens(Arc<dyn LpassClient>);
 
 #[async_trait::async_trait]

@@ -190,6 +190,14 @@ pub async fn drop_shell_unlock() -> bool {
     }
 }
 
+/// Whether `text` is an item id as lpass prints them: decimal digits, at
+/// least one. Also what keeps an id from reading as an option when it is
+/// passed to lpass as an argument, so every id from outside — the config,
+/// `lpass ls`, the identities file — is held to it.
+pub fn is_item_id(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Locate the lpass binary: explicit config path first, then PATH.
 pub fn resolve_binary(configured: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = configured {

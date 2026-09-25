@@ -43,6 +43,12 @@ pub struct SessionBinding {
     /// Untrusted text like any other: escaped before display.
     pub host_name: Option<String>,
     pub is_forwarding: bool,
+    /// The session the host signed for, which a signature on this connection
+    /// has to be for as well.
+    pub session_id: Vec<u8>,
+    /// The host's key as it travels on the wire, which a host-bound request
+    /// has to name.
+    pub host_key: Vec<u8>,
 }
 
 impl ConfirmContext {
@@ -137,7 +143,12 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
             // person reading this recognises, and what a request from
             // somewhere unexpected stands out by.
             if !requester.origin.is_empty() {
-                let _ = write!(line, "\nStarted from: {}", requester.origin.join(" → "));
+                let names: Vec<&str> = requester
+                    .origin
+                    .iter()
+                    .map(|ancestor| ancestor.name.as_str())
+                    .collect();
+                let _ = write!(line, "\nStarted from: {}", names.join(" → "));
             }
             line
         }
@@ -167,13 +178,16 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
                 hop
             })
             .collect();
-        let _ = write!(text, "\nSSH session: {}", chain.join(" → "));
+        // The warning ahead of the hops rather than after them: a chain is as
+        // long as a forwarded peer cares to make it, and a dialog clips at the
+        // bottom.
         if ctx.bindings.iter().any(|bind| bind.is_forwarding) {
             text.push_str(
-                "\n\nWARNING: the agent is forwarded to that host — this request may \
+                "\n\nWARNING: the agent is forwarded to a host below — this request may \
                  have originated there rather than on this machine.",
             );
         }
+        let _ = write!(text, "\nSSH session: {}", chain.join(" → "));
     }
     text
 }
@@ -230,7 +244,14 @@ pub fn approval_question(ctx: &ConfirmContext) -> Option<String> {
         escape_for_display(&ctx.key_name),
         requester.process.clone(),
         peer.uid.to_string(),
-        requester.origin.join(&SEP.to_string()),
+        // By path, not by the name the prompt shows: a name is a file name
+        // anything can take, a path at least has to be that file.
+        requester
+            .origin
+            .iter()
+            .map(|ancestor| ancestor.path.as_str())
+            .collect::<Vec<_>>()
+            .join(&SEP.to_string()),
         hosts.join(&SEP.to_string()),
     ] {
         question.push_str(&piece);
@@ -255,6 +276,7 @@ impl Confirmer for NoConfirmer {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::requester::Ancestor;
 
     use crate::testutil::fixtures::*;
 
@@ -298,6 +320,8 @@ mod tests {
             host_fingerprint: "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU".into(),
             host_name: host_name.map(str::to_string),
             is_forwarding: false,
+            session_id: Vec::new(),
+            host_key: Vec::new(),
         }]
     }
 
@@ -451,17 +475,28 @@ mod tests {
         assert!(question.contains("\n501\n"), "{question}");
         // two ancestries that would read alike joined on the arrow the prompt
         // uses are still two questions
+        let at = |path: &str| Ancestor {
+            name: path.rsplit('/').next().unwrap().to_string(),
+            path: path.to_string(),
+        };
         let mut split = ctx.clone();
         split.requester = Some(Requester {
             process: "ssh".into(),
-            origin: vec!["shell".into(), "Terminal".into()],
+            origin: vec![at("/bin/shell"), at("/bin/Terminal")],
         });
         let mut joined = ctx.clone();
         joined.requester = Some(Requester {
             process: "ssh".into(),
-            origin: vec!["shell → Terminal".into()],
+            origin: vec![at("/bin/shell → /bin/Terminal")],
         });
         assert_ne!(approval_question(&split), approval_question(&joined));
+        // and two ancestries that share names but not paths are two questions
+        let mut elsewhere = split.clone();
+        elsewhere.requester = Some(Requester {
+            process: "ssh".into(),
+            origin: vec![at("/tmp/x/shell"), at("/tmp/x/Terminal")],
+        });
+        assert_ne!(approval_question(&split), approval_question(&elsewhere));
 
         // the hosts tell two sessions apart, and forwarding is part of that
         ctx.bindings = vec![
@@ -469,11 +504,15 @@ mod tests {
                 host_fingerprint: "SHA256:aaa".into(),
                 host_name: Some("a".into()),
                 is_forwarding: true,
+                session_id: Vec::new(),
+                host_key: Vec::new(),
             },
             SessionBinding {
                 host_fingerprint: "SHA256:bbb".into(),
                 host_name: None,
                 is_forwarding: false,
+                session_id: Vec::new(),
+                host_key: Vec::new(),
             },
         ];
         let bound = approval_question(&ctx).unwrap();
