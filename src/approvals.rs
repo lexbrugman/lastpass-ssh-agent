@@ -2,11 +2,10 @@
 //!
 //! Opt-in. With it on, approving a signature for one key from one place — the
 //! same process started from the same chain, bound to the same hosts — answers
-//! the same question the next time, until the vault locks. That is the
-//! arrangement 1Password's agent offers, and the trade is the same: one prompt
-//! per key per application per unlock, instead of one per signature, in
-//! exchange for anything that can drive that application signing unasked for
-//! as long as the vault stays open.
+//! the same question the next time, until the vault locks. The trade: one
+//! prompt per key per application per unlock, instead of one per signature,
+//! in exchange for anything that can drive that application signing unasked
+//! for as long as the vault stays open.
 //!
 //! "Until the vault locks" is `LockEpoch`: a counter `crate::unlock` bumps
 //! whenever it forgets the master password, for whatever reason. An approval

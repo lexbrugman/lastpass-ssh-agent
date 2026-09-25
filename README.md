@@ -62,10 +62,10 @@ What it **cannot** guarantee:
   logging capped (its request dumps could contain a private key a client tried
   to add). Key material itself is not pinned: it lives milliseconds per
   signature.
-- **Your master password** is handled by this agent, the way 1Password's
-  agent handles its vault key: asked for when the vault is locked, held in
-  memory while it is unlocked, and forgotten when the screen locks, when it
-  has gone unused for `master_password_idle_secs`, and when the agent stops.
+- **Your master password** is handled by this agent: asked for when the
+  vault is locked, held in memory while it is unlocked, and forgotten when
+  the screen locks, when it has gone unused for `master_password_idle_secs`,
+  and when the agent stops.
   Each `lpass` call is fed it over a pipe and told not to start `lpass`'s own
   agent, so nothing this agent does leaves the vault open machine-wide — see
   [How the vault is opened](#how-the-vault-is-opened). It lives in a
@@ -300,8 +300,7 @@ use it to read the **whole vault**, not just the SSH keys. This agent never
 lets that happen on its account. Every `lpass` call it makes is told not to
 start that agent (`LPASS_AGENT_DISABLE`), is fed the master password over a
 pipe, derives the key, uses it and exits. Between calls the only thing kept is
-the password itself, in this process, the way 1Password's agent holds its vault
-key while unlocked.
+the password itself, in this process.
 
 Each call is first tried without a password, because a vault you unlocked
 yourself in a shell answers it: `lpass` still reads an agent that is already
@@ -552,7 +551,7 @@ it again for any reason, or the agent stops. (A vault your shell unlocked
 expires without telling the agent; the request that finds it locked asks for
 the master password, and approvals end there.) A
 `git push` from your editor then costs one prompt per unlock rather than one
-per push, which is the arrangement 1Password's agent offers.
+per push.
 
 Off by default, because the trade is real: while an approval stands, anything
 able to drive that application can sign with that key unasked — and what a

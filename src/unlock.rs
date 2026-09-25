@@ -7,9 +7,8 @@
 //! other process: between calls, the only thing kept is the password itself,
 //! here. (A vault you unlocked yourself in a shell is another matter — `lpass`
 //! still reads that agent, and this one uses it as it finds it and never
-//! locks it.) This is the model 1Password's agent uses, with the one
-//! difference the README states: the secret held is the password itself,
-//! because `lpass` accepts nothing else.
+//! locks it.) The secret held is the password itself, because `lpass` accepts
+//! nothing else.
 //!
 //! It is dropped when the screen locks, when it has gone unused for the
 //! configured idle time, when `lpass` reports it wrong, and when the agent

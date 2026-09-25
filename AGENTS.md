@@ -167,10 +167,9 @@ Private keys and passphrases follow the same discipline.
 - No key and no passphrase is cached. Every signature fetches the key,
   resolves the passphrase, decrypts, signs, and drops both; adding a cache for
   either is out of scope by design. The one secret held between signatures is
-  the master password, in `crate::unlock` and nowhere else, the way 1Password's
-  agent holds its vault key: because `lpass` accepts nothing but the password,
-  holding it is what keeps the vault from being left open machine-wide by an
-  `lpass` agent. It is dropped when the screen locks, when it has gone unused
+  the master password, in `crate::unlock` and nowhere else: because `lpass`
+  accepts nothing but the password, holding it is what keeps the vault from
+  being left open machine-wide by an `lpass` agent. It is dropped when the screen locks, when it has gone unused
   for the configured idle time, when `lpass` rejects it, and when the agent
   exits.
 - Strip exactly one trailing line ending from subprocess output, never more: a
