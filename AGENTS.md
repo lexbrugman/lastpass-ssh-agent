@@ -84,7 +84,7 @@ The code already works this way, and these are the patterns to copy:
   stopped at and the system's own error code, and nothing else; which stage
   means "ask again", which means "seed again" and which is a fault, along with
   the format the key blob is written in, are all decided in `enclave.rs` and
-  tested on Linux as well as macOS. `askpass/enclave.rs` is three foreign calls
+  tested on Linux as well as macOS. `master/enclave.rs` is three foreign calls
   and no judgement.
 
 If a `cfg` block contains a branch, a loop, or an error decision, it is
@@ -299,8 +299,9 @@ log`, which is built for it and which nobody has to read by accident.
 and the reason it fails is expensive to rediscover.
 
 - Worth it: why the master password is not a Keychain item (someone will try
-  it, and the answer is an entitlement that takes a day to find); why `install`
-  does not use `files::open_regular` (the two look interchangeable); why the
+  it, and the answer is an entitlement that takes a day to find); why
+  `LPASS_AGENT_DISABLE` is set only on a call fed a password (the man page
+  reads as if it would stop the unfed probe too); why the
   Swift language mode is pinned to 5 when the shim passes 6 (says when to
   raise it).
 - Not worth it: which error variant this used to be, which helper this was

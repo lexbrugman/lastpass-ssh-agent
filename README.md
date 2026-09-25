@@ -519,7 +519,7 @@ another agent.
 
 | mode | behavior |
 |---|---|
-| `osascript` (macOS default) | Native dialog: key name, fingerprint, requesting process (pid/uid via the socket's peer credentials), and the bound host. Deny is default + cancel; expiry = Deny; no GUI session = Deny. Vault-sourced strings are passed as AppleScript *arguments*, never spliced into code. |
+| `osascript` (macOS default) | Native dialog: key name, fingerprint, requesting process (pid/uid via the socket's peer credentials) and what it was started from, and the bound host. Deny is default + cancel; expiry = Deny; no GUI session = Deny. Vault-sourced strings are passed as AppleScript *arguments*, never spliced into code. |
 | `tty` (Linux default) | Prompt on the agent's own `/dev/tty`; type `yes` to approve. |
 | `askpass` | Runs the program in `askpass` with the prompt as its argument; exit 0 approves. `SSH_ASKPASS_PROMPT=confirm` is set, so OpenSSH-compatible helpers show a yes/no dialog rather than their password prompt — without it, clicking OK would approve whatever was typed. |
 | `off` | No confirmation (socket permissions are then your only guard, as with stock ssh-agent). |
@@ -590,7 +590,8 @@ unlocking — do not run `lpass` yourself — and every lock is one it sees.
 - Item lookups use the LastPass **item id**, not the name, so renames are
   safe and duplicate names are ambiguity-free. If the vault item's key is
   edited while the agent runs, the agent notices the public-key mismatch and
-  refuses to sign until restarted.
+  refuses to sign with it; the next refresh, or a restart, serves the new
+  key.
 - In auto-discovery mode, an SSH Key item added to the vault — or shared with
   you — is served after the next refresh (see [Starting without the
   vault](#starting-without-the-vault)). Pin `[[keys]]` if you want new vault
@@ -613,9 +614,11 @@ unlocking — do not run `lpass` yourself — and every lock is one it sees.
 - Auto-discovery costs one `lpass` call per vault item, eight at a time:
   `lpass ls` reports names and ids but not the note type, so every item has to
   be asked. A few hundred items are quick; a few thousand are most of a minute
-  at startup, before the socket exists. The agent logs how many it is about to
-  probe. **Pinning `[[keys]]` skips discovery entirely** and is worth it on a
-  large vault — `lastpass-ssh-agent search` prints the snippets.
+  on the first start, before the socket exists — later starts bind from what
+  that one wrote down and scan in the background. The agent logs how many it
+  is about to probe. **Pinning `[[keys]]` skips discovery entirely** and is
+  worth it on a large vault — `lastpass-ssh-agent search` prints the
+  snippets.
 - `tests/fixtures/` contains throwaway SSH keypairs used by the test suite
   only. They protect nothing and must never be authorized anywhere.
 
