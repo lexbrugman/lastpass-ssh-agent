@@ -21,9 +21,11 @@ What this agent **guarantees**:
   socket between starts — they are not secrets; see [Starting without the
   vault](#starting-without-the-vault).)
 - **User-visible signing.** By default every signature asks first — a native
-  dialog on macOS, a `/dev/tty` prompt on Linux — naming the key and the
-  requesting process, with *Deny* as the default and cancel button. Timeouts,
-  missing GUI sessions and helper failures all fail closed to Deny.
+  dialog on macOS, a `/dev/tty` prompt on Linux — naming the key, the
+  requesting process and what it was started from (its parent processes up to
+  the terminal or app, so a push from your editor reads as such), with *Deny*
+  as the default and cancel button. Timeouts, missing GUI sessions and helper
+  failures all fail closed to Deny.
 - **The host is named, and forwarding is visible.** The agent implements
   `session-bind@openssh.com`, so the prompt names the host each request is for
   — by hostname where `known_hosts` records one for that key, by fingerprint
