@@ -38,7 +38,7 @@ zeroize = { version = "1", features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-dirs = "6"
+dirs = "7"
 libc = "0.2"
 
 # Only the macOS Keychain store and the screen-lock probe need these, and they
