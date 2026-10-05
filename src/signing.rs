@@ -2,8 +2,10 @@ use rsa::pkcs1v15::SigningKey;
 use rsa::sha2::{Sha256, Sha512};
 use signature::{RandomizedSigner, SignatureEncoding, Signer};
 use ssh_agent_lib::proto::signature as sigflag;
+use ssh_agent_lib::ssh_encoding::{Decode as _, Reader as _};
 use ssh_key::private::KeypairData;
-use ssh_key::{Algorithm, EcdsaCurve, PrivateKey, Signature};
+use ssh_key::public::KeyData;
+use ssh_key::{Algorithm, Certificate, EcdsaCurve, PrivateKey, PublicKey, Signature};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SignError {
@@ -78,6 +80,91 @@ pub fn userauth_session_id<'a>(
     request.0.is_empty().then_some(session_id)
 }
 
+/// A `session-bind@openssh.com` request as OpenSSH lays it out: the host's
+/// key as it travelled in the key exchange, the session id, the host's
+/// signature over it, and whether the agent is forwarded onward from there.
+///
+/// The host key is kept as the bytes it arrived in. A host-bound userauth
+/// request carries the same bytes, so that is what `userauth_session_id`
+/// compares against — and when the host's key is a certificate, re-encoding
+/// it from the parsed key would drop the certificate and match nothing.
+pub struct SessionBindRequest<'a> {
+    pub host_key: &'a [u8],
+    pub session_id: &'a [u8],
+    pub signature: &'a [u8],
+    pub is_forwarding: bool,
+}
+
+/// Why a binding is refused, worded for the log.
+#[derive(Debug, thiserror::Error)]
+pub enum BindError {
+    #[error("the host key does not parse: {0}")]
+    HostKey(ssh_key::Error),
+
+    #[error("the host's signature does not parse: {0}")]
+    Signature(ssh_key::Error),
+
+    #[error("the host's signature does not verify: {0}")]
+    Unverified(signature::Error),
+}
+
+/// The fields of a `session-bind@openssh.com` request, when `data` is one —
+/// whole, with nothing after the forwarding flag.
+pub fn session_bind(data: &[u8]) -> Option<SessionBindRequest<'_>> {
+    let mut request = Wire(data);
+    let host_key = request.string()?;
+    let session_id = request.string()?;
+    let signature = request.string()?;
+    let is_forwarding = request.byte()? != 0;
+    request.0.is_empty().then_some(SessionBindRequest {
+        host_key,
+        session_id,
+        signature,
+        is_forwarding,
+    })
+}
+
+/// The key a binding's host proved itself with: the one it sent, or the one
+/// inside the certificate it sent.
+///
+/// A server set up with `HostCertificate` presents the certificate as its
+/// host key, and `ssh` binds whatever the server presented. The certificate
+/// is not checked against any authority here, the same as in OpenSSH's own
+/// agent: what a binding proves is that the far end holds the key it named,
+/// and the key inside the certificate is what signed the session id. It is
+/// also what `known_hosts` could record and what the prompt fingerprints.
+pub fn bound_host_key(bind: &SessionBindRequest<'_>) -> Result<KeyData, BindError> {
+    use signature::Verifier as _;
+
+    // The algorithm id is the first string in either encoding, and it is the
+    // id — not whether the rest happens to parse as one or the other — that
+    // says which the host sent.
+    let is_certificate = Wire(bind.host_key)
+        .string()
+        .is_some_and(|id| id.ends_with(b"-cert-v01@openssh.com"));
+    let host_key = if is_certificate {
+        Certificate::from_bytes(bind.host_key).map(|cert| cert.public_key().clone())
+    } else {
+        PublicKey::from_bytes(bind.host_key).map(|key| key.key_data().clone())
+    }
+    .map_err(BindError::HostKey)?;
+
+    let mut reader = bind.signature;
+    let signature = Signature::decode(&mut reader).map_err(BindError::Signature)?;
+    let signature = reader.finish(signature).map_err(trailing_signature_bytes)?;
+
+    host_key
+        .verify(bind.session_id, &signature)
+        .map_err(BindError::Unverified)?;
+    Ok(host_key)
+}
+
+/// Bytes after a signature mean the blob is not one signature, however well
+/// the front of it parsed.
+fn trailing_signature_bytes(e: ssh_agent_lib::ssh_encoding::Error) -> BindError {
+    BindError::Signature(e.into())
+}
+
 /// A cursor over SSH wire encoding: length-prefixed strings and single bytes.
 struct Wire<'a>(&'a [u8]);
 
@@ -90,8 +177,9 @@ impl<'a> Wire<'a> {
 
     fn string(&mut self) -> Option<&'a [u8]> {
         let len = usize::try_from(u32::from_be_bytes(self.0.get(..4)?.try_into().ok()?)).ok()?;
-        let value = self.0.get(4..4 + len)?;
-        self.0 = &self.0[4 + len..];
+        let end = 4usize.checked_add(len)?;
+        let value = self.0.get(4..end)?;
+        self.0 = &self.0[end..];
         Some(value)
     }
 }

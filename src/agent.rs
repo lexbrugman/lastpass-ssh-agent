@@ -71,6 +71,13 @@ const MAX_SESSION_BINDINGS: usize = 16;
 /// could fill memory one signed binding at a time.
 const MAX_SESSION_ID_BYTES: usize = 128;
 
+/// A host key is a few hundred bytes, and a certificate over one a few
+/// kilobytes even listing every name the host answers to; this allows far
+/// more. Kept for the connection's life as the session id is, and a
+/// certificate's text fields are the peer's to fill, so without a cap the
+/// binding limit would bound nothing.
+const MAX_HOST_KEY_BYTES: usize = 64 * 1024;
+
 impl LpassAgent {
     pub fn new(
         store: Served,
@@ -143,6 +150,13 @@ impl LpassAgent {
     /// unverifiable binding is refused rather than displayed. (Refusing does
     /// not lock the connection down: an attacker would simply send no
     /// binding at all, so there is nothing to gain by poisoning it.)
+    ///
+    /// Decoded by `signing::session_bind` rather than the library's type,
+    /// which reads the host key as a plain key: a host with a certificate
+    /// sends the certificate, and `ssh` treats a refused binding as nothing
+    /// worse than a debug line — so the connection would carry on unbound,
+    /// and a request relayed over it would show neither the hop nor the
+    /// forwarding warning.
     fn handle_extension(&mut self, extension: &Extension) -> Response {
         // A client may ask what we support before using anything. Answering
         // matters: one that negotiates this way would otherwise never send a
@@ -154,23 +168,15 @@ impl LpassAgent {
             })
             .map_or(Response::Failure, Response::ExtensionResponse);
         }
-        let bind = match extension.parse_message::<SessionBind>() {
-            Ok(Some(bind)) => bind,
-            // some other vendor extension: unsupported, as advertised
-            Ok(None) => {
-                tracing::debug!(extension = %extension.name, "refusing unsupported extension");
-                return Response::Failure;
-            }
-            Err(e) => {
-                tracing::warn!(extension = %extension.name,
-                    "refusing malformed session binding: {e}");
-                return Response::Failure;
-            }
-        };
-        if let Err(e) = bind.verify_signature() {
-            tracing::warn!("refusing a session binding whose host signature does not verify: {e}");
+        // some other vendor extension: unsupported, as advertised
+        if extension.name != SessionBind::NAME {
+            tracing::debug!(extension = %extension.name, "refusing unsupported extension");
             return Response::Failure;
         }
+        let Some(bind) = signing::session_bind(extension.details.as_ref()) else {
+            tracing::warn!("refusing a malformed session binding");
+            return Response::Failure;
+        };
         if bind.session_id.len() > MAX_SESSION_ID_BYTES {
             tracing::warn!(
                 "refusing a session binding whose session id is longer than any key exchange \
@@ -178,6 +184,19 @@ impl LpassAgent {
             );
             return Response::Failure;
         }
+        if bind.host_key.len() > MAX_HOST_KEY_BYTES {
+            tracing::warn!(
+                "refusing a session binding whose host key is larger than any host sends"
+            );
+            return Response::Failure;
+        }
+        let host_key = match signing::bound_host_key(&bind) {
+            Ok(host_key) => host_key,
+            Err(e) => {
+                tracing::warn!("refusing a session binding: {e}");
+                return Response::Failure;
+            }
+        };
         // OpenSSH's own rules for what may follow a binding. A hop that is
         // not forwarding the agent is the connection's destination, and
         // nothing binds after it. A host key already bound is a replay:
@@ -193,14 +212,14 @@ impl LpassAgent {
             );
             return Response::Failure;
         }
-        let host_fingerprint = bind
-            .host_key
-            .fingerprint(ssh_key::HashAlg::Sha256)
-            .to_string();
+        let host_fingerprint = host_key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+        // Compared as the bytes the host sent, not by fingerprint: two
+        // certificates over one key are two host keys, and a request bound
+        // to the second has to find the second recorded.
         if self
             .bindings
             .iter()
-            .any(|seen| seen.host_fingerprint == host_fingerprint)
+            .any(|seen| seen.host_key == bind.host_key)
         {
             return Response::Success;
         }
@@ -218,10 +237,8 @@ impl LpassAgent {
             // Named when a signature is actually asked for; see `host_names`.
             host_name: None,
             is_forwarding: bind.is_forwarding,
-            session_id: bind.session_id,
-            host_key: ssh_key::PublicKey::from(bind.host_key)
-                .to_bytes()
-                .unwrap_or_else(unencodable),
+            session_id: bind.session_id.to_vec(),
+            host_key: bind.host_key.to_vec(),
         });
         Response::Success
     }
@@ -1798,6 +1815,63 @@ mod tests {
         )
     }
 
+    /// A binding from a host whose key is a certificate, as a server with
+    /// `HostCertificate` sends it: the certificate travels as the host key
+    /// and the key inside it signs the session id.
+    fn certificate_bind(host: &PrivateKey, session_id: &[u8], is_forwarding: bool) -> Request {
+        use signature::Signer as _;
+        use ssh_agent_lib::ssh_encoding::Encode as _;
+        let ca = PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        let mut builder = ssh_key::certificate::Builder::new(
+            [0u8; 16],
+            host.public_key().key_data().clone(),
+            0,
+            u64::from(u32::MAX),
+        )
+        .unwrap();
+        builder
+            .cert_type(ssh_key::certificate::CertType::Host)
+            .unwrap()
+            .all_principals_valid()
+            .unwrap();
+        let certificate = builder.sign(&ca).unwrap().to_bytes().unwrap();
+        let mut payload = Vec::new();
+        certificate.encode(&mut payload).unwrap();
+        session_id.to_vec().encode(&mut payload).unwrap();
+        host.try_sign(session_id)
+            .unwrap()
+            .encode_prefixed(&mut payload)
+            .unwrap();
+        u8::from(is_forwarding).encode(&mut payload).unwrap();
+        Request::Extension(Extension {
+            name: SessionBind::NAME.into(),
+            details: payload.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_certificate_host_key_binds_like_a_plain_one() {
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone()).await;
+        let host = PrivateKey::from_openssh(ED25519).unwrap();
+        let response = agent
+            .handle(certificate_bind(&host, b"cert-session", true))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Success), "{response:?}");
+        assert_eq!(agent.bindings.len(), 1);
+        assert_eq!(agent.bindings[0].session_id, b"cert-session");
+        assert!(agent.bindings[0].is_forwarding);
+        // named by the key inside the certificate, which is what known_hosts
+        // could record and what the fingerprint of a plain host would be
+        assert_eq!(
+            agent.bindings[0].host_fingerprint,
+            host.public_key()
+                .fingerprint(ssh_key::HashAlg::Sha256)
+                .to_string()
+        );
+    }
+
     /// Captures the prompt a signing request would have shown.
     #[derive(Default)]
     struct RecordingConfirmer(std::sync::Mutex<Vec<String>>);
@@ -2026,21 +2100,82 @@ mod tests {
         assert!(!prompts[0].contains("WARNING"), "{}", prompts[0]);
     }
 
+    /// `string host_key, string session_id, string signature, byte flag`,
+    /// followed by whatever `trailing` is — nothing, for a well-formed one.
+    fn bind_payload(host_key: &[u8], signature: &[u8], trailing: &[u8]) -> Vec<u8> {
+        use ssh_agent_lib::ssh_encoding::Encode as _;
+        let mut payload = Vec::new();
+        for field in [host_key, b"session", signature] {
+            field.to_vec().encode(&mut payload).unwrap();
+        }
+        1u8.encode(&mut payload).unwrap();
+        payload.extend_from_slice(trailing);
+        payload
+    }
+
     #[tokio::test]
     async fn a_malformed_binding_is_refused() {
-        use ssh_agent_lib::proto::extension::MessageExtension as _;
+        use signature::Signer as _;
+        use ssh_agent_lib::ssh_encoding::Encode as _;
         let confirmer = Arc::new(RecordingConfirmer::default());
         let mut agent = agent_recording(confirmer).await;
+        let host = PrivateKey::from_openssh(ED25519).unwrap();
+        let key = host.public_key().to_bytes().unwrap();
+        let signature = Vec::<u8>::try_from(host.try_sign(b"session").unwrap()).unwrap();
+        let mut algorithm_only = Vec::new();
+        "ssh-ed25519".encode(&mut algorithm_only).unwrap();
+        let mut cert_without_body = Vec::new();
+        "ssh-ed25519-cert-v01@openssh.com"
+            .encode(&mut cert_without_body)
+            .unwrap();
 
-        // right extension name, payload that cannot decode
-        let malformed = Request::Extension(Extension {
-            name: SessionBind::NAME.into(),
-            details: vec![0xff, 0x00, 0x01].into(),
-        });
-        assert!(matches!(
-            agent.handle(malformed).await.unwrap(),
-            Response::Failure
-        ));
+        // right extension name, payload that does not decode — at each of
+        // the places it could fail to
+        let malformed: [(&str, Vec<u8>); 7] = [
+            ("truncated", vec![0xff, 0x00, 0x01]),
+            ("bytes after the flag", bind_payload(&key, &signature, b"!")),
+            ("empty host key", bind_payload(b"", &signature, b"")),
+            (
+                "plain key without its bytes",
+                bind_payload(&algorithm_only, &signature, b""),
+            ),
+            (
+                "certificate without its body",
+                bind_payload(&cert_without_body, &signature, b""),
+            ),
+            (
+                "signature that is not one",
+                bind_payload(&key, &[0xff], b""),
+            ),
+            (
+                "bytes after the signature",
+                bind_payload(&key, &[&signature[..], b"!"].concat(), b""),
+            ),
+        ];
+        for (case, details) in malformed {
+            let response = agent
+                .handle(Request::Extension(Extension {
+                    name: SessionBind::NAME.into(),
+                    details: details.into(),
+                }))
+                .await
+                .unwrap();
+            assert!(
+                matches!(response, Response::Failure),
+                "{case}: {response:?}"
+            );
+        }
+        assert!(agent.bindings.is_empty());
+
+        // and the well-formed version of the same bytes binds
+        let response = agent
+            .handle(Request::Extension(Extension {
+                name: SessionBind::NAME.into(),
+                details: bind_payload(&key, &signature, b"").into(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Success), "{response:?}");
     }
 
     #[tokio::test]
@@ -2106,6 +2241,16 @@ mod tests {
         // a session id longer than any key exchange produces is refused
         let response = agent
             .handle(session_bind(&host, &[7u8; MAX_SESSION_ID_BYTES + 1], false))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Failure));
+
+        // as is a host key larger than any host sends, before it is parsed
+        let response = agent
+            .handle(Request::Extension(Extension {
+                name: SessionBind::NAME.into(),
+                details: bind_payload(&vec![7u8; MAX_HOST_KEY_BYTES + 1], b"", b"").into(),
+            }))
             .await
             .unwrap();
         assert!(matches!(response, Response::Failure));

@@ -29,7 +29,9 @@ What this agent **guarantees**:
 - **The host is named, and forwarding is visible.** The agent implements
   `session-bind@openssh.com`, so the prompt names the host each request is for
   — by hostname where `known_hosts` records one for that key, by fingerprint
-  otherwise — and each hop proved possession of its host key. When the request
+  otherwise — and each hop proved possession of its host key. A host whose
+  key is a certificate is bound like any other and shown by the fingerprint
+  of the key inside it. When the request
   arrived over a connection you forwarded with `ssh -A` it says so and warns
   that it may have originated there rather than on your machine; without that,
   a relayed request looks identical to one you made yourself. Bindings whose
