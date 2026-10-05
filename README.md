@@ -94,18 +94,24 @@ Linux builds are musl-linked, so they do not depend on the host's glibc
 version.
 
 Without Homebrew, take the archive for your platform straight from the
-[latest release](https://github.com/lexbrugman/lastpass-ssh-agent/releases/latest).
-Each one ships beside a `.sha256`, so verify it before unpacking — and install
-`lastpass-cli` yourself, since nothing here does it for you:
+[latest release](https://github.com/lexbrugman/lastpass-ssh-agent/releases/latest)
+— and install `lastpass-cli` yourself, since nothing here does it for you:
 
 ```sh
 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, *-apple-darwin
 curl -fsSLO "https://github.com/lexbrugman/lastpass-ssh-agent/releases/latest/download/lastpass-ssh-agent-${target}.tar.xz"
-curl -fsSLO "https://github.com/lexbrugman/lastpass-ssh-agent/releases/latest/download/lastpass-ssh-agent-${target}.tar.xz.sha256"
-sha256sum -c "lastpass-ssh-agent-${target}.tar.xz.sha256"   # shasum -a 256 -c on macOS
+gh attestation verify "lastpass-ssh-agent-${target}.tar.xz" --repo lexbrugman/lastpass-ssh-agent
 tar -xJf "lastpass-ssh-agent-${target}.tar.xz"
 install -m 755 lastpass-ssh-agent /usr/local/bin/
 ```
+
+The `gh attestation verify` line is the check worth making. Every archive is
+attested by the workflow that built it, and verifying the attestation proves
+the file came out of this repository's release pipeline, from the commit it
+names, unmodified — something a checksum downloaded from beside the archive
+cannot, since whoever could replace the one could replace the other. (The
+`.sha256` beside each archive is there for the Homebrew formula and for
+spotting a corrupt download; it is not a defence against a substituted one.)
 
 > The tap is populated by the release pipeline. If `brew install` cannot find
 > the formula, the tap does not exist yet — build from source.
@@ -675,6 +681,16 @@ therefore leaves a discardable draft rather than a tag pointing at a release
 that was never finished, and because `resolve-release.yml` counts drafts too,
 the abandoned number is not handed out again.
 
+Before the draft is created, the publish job attests the archives with
+`actions/attest-build-provenance`: a signed statement, recorded by GitHub
+against each archive's digest, that this repository's workflow built it from
+this commit. That is what `gh attestation verify` checks at install time, and
+it is the one thing in the pipeline that a checksum cannot replace — the
+`.sha256` files are produced by the same job that produces the archives, so
+anything able to swap one can swap the other. The attestation is signed with
+a short-lived certificate issued to the workflow run itself (`id-token:
+write`), so there is no key to keep.
+
 `publish-homebrew-formula.yml` runs last, once the release is published: it
 generates the formula with `packaging/homebrew/generate-formula.sh` from the
 checksums attached to the release, and those URLs do not resolve while the
@@ -694,8 +710,9 @@ ssh-keygen -t ed25519 -N "" -C "lastpass-ssh-agent tap" -f tap-deploy-key
   policy to `master`
 
 This is the pipeline's only credential — everything else runs on the built-in
-`GITHUB_TOKEN`, and the tap needs a key of its own solely because it is a
-different repository, which that token cannot write to.
+`GITHUB_TOKEN` and the run's own OIDC identity, and the tap needs a key of its
+own solely because it is a different repository, which that token cannot write
+to.
 
 A deploy key rather than a personal access token because it is bound to that
 one repository, belongs to no user account, and does not expire. An

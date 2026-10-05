@@ -54,6 +54,9 @@ jobs:
     if: needs.release-version.outputs.version != ''
     permissions:
       contents: write
+      # for the provenance attestation; see publish-release.yml
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/publish-release.yml
     with:
       version: ${{ needs.release-version.outputs.version }}

@@ -268,6 +268,11 @@ Four invariants hold it together, and each is load-bearing:
   a run that dies partway leaves something discardable rather than a tag
   pointing at a release that was never finished. `resolve-release.yml` counts
   drafts for exactly this reason.
+- **The archives are attested before the draft exists.** The `.sha256` beside
+  each archive comes from the same job as the archive and proves nothing
+  about who built it; the attestation is what `gh attestation verify` checks,
+  and it needs `id-token: write` and `attestations: write` on the publish job
+  — granted in `ci.yml`, since a called workflow cannot raise what it is given.
 - **The formula is published last.** It points at the release's download URLs,
   which do not resolve until the release leaves draft.
 - **The archive's shape is a contract**, and one nothing notices breaking until
