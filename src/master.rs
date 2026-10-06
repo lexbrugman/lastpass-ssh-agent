@@ -461,9 +461,7 @@ mod tests {
     #[tokio::test]
     async fn a_platform_with_nowhere_to_keep_it_says_so() {
         assert!(NoStore.name().contains("no master password store"));
-        assert!(!default_store(Path::new("/tmp/agent.sock"))
-            .name()
-            .is_empty());
+        assert_ne!(default_store(Path::new("/tmp/agent.sock")).name(), "");
         let _: bool = store_available();
         assert!(NoStore.set(b"secret").await.is_err());
         assert!(

@@ -609,7 +609,7 @@ mod tests {
             vec![None]
         );
         // and asking nothing is not an error
-        assert!(resolver.names_for(Vec::new()).await.is_empty());
+        assert_eq!(resolver.names_for(Vec::new()).await, Vec::new());
     }
 
     #[test]

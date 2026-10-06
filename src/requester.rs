@@ -187,7 +187,7 @@ mod tests {
         let pid = std::process::id().cast_signed();
         assert!(process_path(pid).is_some());
         let this = Requester::of(pid).unwrap();
-        assert!(!this.process.is_empty());
+        assert_ne!(this.process, "");
         assert!(
             !this.origin.is_empty(),
             "the test runner, at least, is above this process"
@@ -197,7 +197,7 @@ mod tests {
         // is nobody's application
         assert!(process_path(0).is_none());
         assert!(Requester::of(0).is_none());
-        assert!(origin_chain(1).is_empty());
+        assert_eq!(origin_chain(1), Vec::new());
         let _ = parent_pid(0); // best effort either way
     }
 
