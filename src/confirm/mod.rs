@@ -8,7 +8,7 @@ pub use tty::TtyConfirmer;
 
 use crate::keystore::KeyEntry;
 use crate::requester::Requester;
-use crate::text::escape_for_display;
+use crate::text::{display_bounded, escape_for_display};
 
 /// What the user is being asked to approve. Everything here may be shown in
 /// a dialog; none of it is secret. `key_name` comes from the vault/config
@@ -153,9 +153,13 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
             line
         }
     };
+    // The name is cut to a bound and the rest only escaped: a fingerprint and
+    // an item id are already the size they are, and the requester's paths are
+    // the kernel's. The name is the vault's, and as long as whoever wrote it
+    // cared to make it.
     let mut text = format!(
         "SSH signature request\n\nKey: {}\nFingerprint: {}\nLastPass item: {}\nRequested by: {requester}",
-        escape_for_display(&ctx.key_name),
+        display_bounded(&ctx.key_name),
         escape_for_display(&ctx.fingerprint),
         escape_for_display(&ctx.item_id),
     );
@@ -171,7 +175,7 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
                 // host exactly and says nothing to the person reading it. The
                 // log keeps the fingerprint either way.
                 let mut hop =
-                    escape_for_display(bind.host_name.as_ref().unwrap_or(&bind.host_fingerprint));
+                    display_bounded(bind.host_name.as_ref().unwrap_or(&bind.host_fingerprint));
                 if bind.is_forwarding {
                     hop.push_str(" (forwarding the agent onward)");
                 }
