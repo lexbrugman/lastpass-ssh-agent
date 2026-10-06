@@ -99,14 +99,20 @@ pub async fn watch(
     if !enabled {
         return;
     }
+    // Announced only once a reading has succeeded: said first, a platform
+    // that then cannot answer would leave the log claiming a watch that is
+    // not running, with the password held until the idle time instead.
+    let Some(locked_at_startup) = screen.is_locked().await else {
+        tracing::warn!(
+            "cannot read whether the screen is locked here, so the vault is not locked with \
+             it — the master password is kept until `master_password_idle_secs` or exit"
+        );
+        return;
+    };
     tracing::info!(
         "locking the vault with the screen — the master password is forgotten on lock, and \
          asked for when it is next needed"
     );
-    let Some(locked_at_startup) = screen.is_locked().await else {
-        tracing::debug!("no way to read the screen lock state here; not watching");
-        return;
-    };
 
     // "Before we looked" counts as unlocked, so a screen that is already locked
     // when the agent starts is a lock like any other. Tempting to call it a
