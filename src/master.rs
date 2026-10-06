@@ -175,6 +175,12 @@ pub async fn resolve(
         .prompt(&PassphraseRequest::master_password())
         .await
         .map_err(|e| Error::ConfigInvalid(e.to_string()))?;
+    if typed.is_empty() {
+        // A stray Return at the dialog, not an answer. `lpass` would only
+        // reject it, and "rejected" sends someone off to check a password
+        // they never typed.
+        return Err(Error::ConfigInvalid("no master password entered".into()));
+    }
     Ok((typed, Source::Prompt))
 }
 
@@ -419,6 +425,18 @@ mod tests {
         assert!(resolve(MasterPassword::TouchId, &store, &prompt, false)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_is_an_error_not_a_password() {
+        let prompt = FakePrompt::answering(b"");
+        let err = resolve(MasterPassword::Prompt, &NoStore, &prompt, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no master password entered"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
