@@ -9,42 +9,59 @@ use zeroize::Zeroizing;
 
 const MAX_DISCOVERY_PROBES: usize = 8;
 
-/// Where `lpass login --plaintext-key` keeps the vault's key, given a way to
-/// read environment variables — `lpass`'s own rule for a data file
-/// (`config_path_for_type` and `get_xdg_dir` in lastpass-cli's `config.c`,
-/// unchanged across every release), so `doctor` looks exactly where `lpass`
-/// would: `$LPASS_HOME` when set; else `$XDG_DATA_HOME/lpass` when that is —
-/// `get_xdg_dir` returns the variable itself before it looks at anything
-/// else; else `~/.local/share/lpass`, but only when `XDG_RUNTIME_DIR` is set,
-/// which is how `lpass` decides a desktop follows the XDG layout at all; else
-/// `~/.lpass`. `None` when nothing names a directory. Read from the environment this process has: an `LPASS_HOME`
-/// that `lpass` only learns from its own `env` file is not seen here, and a
-/// key kept under it is not found.
+/// Where `lpass` keeps the data file `name`, given a way to read environment
+/// variables — `lpass`'s own rule (`config_path_for_type` and `get_xdg_dir`
+/// in lastpass-cli's `config.c`, unchanged across every release), so `doctor`
+/// looks exactly where `lpass` would: `$LPASS_HOME` when set; else
+/// `$XDG_DATA_HOME/lpass` when that is — `get_xdg_dir` returns the variable
+/// itself before it looks at anything else; else `~/.local/share/lpass`, but
+/// only when `XDG_RUNTIME_DIR` is set, which is how `lpass` decides a desktop
+/// follows the XDG layout at all; else `~/.lpass`. `None` when nothing names
+/// a directory.
+///
+/// Read from the environment this process has: an `LPASS_HOME` that `lpass`
+/// only learns from its own `env` file is not seen here, and a file kept under
+/// it is not found.
+fn data_file(var: &dyn Fn(&str) -> Option<std::ffi::OsString>, name: &str) -> Option<PathBuf> {
+    // A path variable set but empty counts as unset. `lpass` itself then
+    // tries to create `/<name>` or `/lpass`, cannot, and exits, so there is
+    // nothing of its to find — and an empty path joined would name a file in
+    // whatever directory `doctor` happens to run in. `XDG_RUNTIME_DIR` is not
+    // a path here but a flag, and `lpass` reads it as one: present is enough,
+    // empty or not.
+    let path_var = |name: &str| var(name).filter(|value| !value.is_empty());
+    if let Some(home) = path_var("LPASS_HOME") {
+        return Some(PathBuf::from(home).join(name));
+    }
+    if let Some(data) = path_var("XDG_DATA_HOME") {
+        return Some(PathBuf::from(data).join("lpass").join(name));
+    }
+    let home = PathBuf::from(path_var("HOME")?);
+    if var("XDG_RUNTIME_DIR").is_some() {
+        return Some(home.join(".local/share/lpass").join(name));
+    }
+    Some(home.join(".lpass").join(name))
+}
+
+/// Where `lpass login --plaintext-key` keeps the vault's key.
 ///
 /// A vault opened that way is open to every process running as you, with
 /// nothing to expire, and nothing this agent does — its screen-lock and idle
 /// forgetting above all — can close it, since `lpass` reads that file before
 /// it reads anything fed to it.
 pub fn plaintext_key_path(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
-    const FILE: &str = "plaintext_key";
-    // A path variable set but empty counts as unset. `lpass` itself then
-    // tries to create `/plaintext_key` or `/lpass`, cannot, and exits, so
-    // there is nothing of its to find — and an empty path joined would name a
-    // file in whatever directory `doctor` happens to run in. `XDG_RUNTIME_DIR`
-    // is not a path here but a flag, and `lpass` reads it as one: present is
-    // enough, empty or not.
-    let path_var = |name: &str| var(name).filter(|value| !value.is_empty());
-    if let Some(home) = path_var("LPASS_HOME") {
-        return Some(PathBuf::from(home).join(FILE));
-    }
-    if let Some(data) = path_var("XDG_DATA_HOME") {
-        return Some(PathBuf::from(data).join("lpass").join(FILE));
-    }
-    let home = PathBuf::from(path_var("HOME")?);
-    if var("XDG_RUNTIME_DIR").is_some() {
-        return Some(home.join(".local/share/lpass").join(FILE));
-    }
-    Some(home.join(".lpass").join(FILE))
+    data_file(var, "plaintext_key")
+}
+
+/// Where `lpass login` writes the session down, and `lpass logout` removes it.
+///
+/// Without the master password `lpass` cannot tell a locked vault from no
+/// login — it reports "not logged in" for both — so a call that may not feed
+/// the password tells them apart by whether this file is there. Looked for
+/// under `data_file`'s rule, so a path variable set but empty means the usual
+/// place here, where `lpass` itself would look nowhere usable.
+pub fn session_path(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    data_file(var, "session_uid")
 }
 
 /// One vault item as listed by `lpass ls` (names/ids only — no secrets).
@@ -266,6 +283,15 @@ mod discovery_tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| std::ffi::OsString::from(value))
         }
+    }
+
+    #[test]
+    fn the_session_is_looked_for_where_lpass_keeps_it() {
+        let vars: Vars = &[("LPASS_HOME", "/lp"), ("HOME", "/h")];
+        assert_eq!(
+            session_path(&env(vars)),
+            Some(PathBuf::from("/lp/session_uid"))
+        );
     }
 
     #[test]

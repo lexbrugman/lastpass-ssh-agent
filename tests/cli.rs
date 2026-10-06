@@ -90,11 +90,16 @@ fn asking_setup(lpass_body: &str, config_extra: &str, answer: &str) -> Setup {
 }
 
 fn run(setup: &Setup, args: &[&str]) -> Output {
+    run_env(setup, args, &[])
+}
+
+fn run_env(setup: &Setup, args: &[&str], env: &[(&str, &Path)]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
         .arg("--config")
         .arg(&setup.config)
         .args(args)
         .env("HOME", setup.dir.path()) // never touch the real home
+        .envs(env.iter().copied())
         .output()
         .unwrap()
 }
@@ -374,6 +379,44 @@ fn doctor_opens_a_locked_vault_the_way_the_agent_would() {
         stdout(&output).contains("✗ lpass login: LastPass did not accept"),
         "{}",
         stdout(&output)
+    );
+}
+
+#[test]
+fn doctor_beside_a_running_agent_passes_a_locked_vault() {
+    // The agent leaves the vault locked between signatures by design, and
+    // this command may not ask to open it, so locked is the healthy state
+    // here — reported as such, with the key checks left for an open vault.
+    // Unfed, lpass says the same whether or not there is a login, so the
+    // session lpass writes down is what tells the two apart.
+    let s = asking_setup(&locked_vault_body(), "", "echo secret");
+    let _agent = std::os::unix::net::UnixListener::bind(s.dir.path().join("agent.sock")).unwrap();
+    let lpass_home = s.dir.path().join("lpass-home");
+    std::fs::create_dir(&lpass_home).unwrap();
+    let env: &[(&str, &Path)] = &[("LPASS_HOME", &lpass_home)];
+
+    let output = run_env(&s, &["doctor"], env);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("✗ lpass login: not logged in"),
+        "{}",
+        stdout(&output)
+    );
+
+    std::fs::write(lpass_home.join("session_uid"), b"x").unwrap();
+    let output = run_env(&s, &["doctor"], env);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("✓ lpass login: logged in; the vault is locked"),
+        "{text}"
+    );
+    assert!(!text.contains("✓ key "), "{text}");
+    assert!(!text.contains('✗'), "{text}");
+    assert!(
+        stderr(&output).contains("will not ask"),
+        "{}",
+        stderr(&output)
     );
 }
 

@@ -37,8 +37,9 @@ impl Check {
 ///
 /// A check is skipped rather than failed when what it needs is already missing:
 /// there is no login to test without an lpass binary, and no keys to inspect
-/// without a login. The failure is already on the checklist, and repeating it
-/// under another label would suggest two problems where there is one.
+/// without an open vault. The failure is already on the checklist, and
+/// repeating it under another label would suggest two problems where there is
+/// one.
 pub async fn run(config_path: &Path, test_confirm: bool) -> Result<()> {
     // Printed as each check finishes rather than collected and printed at the
     // end: the vault checks can take seconds, and a checklist that appears all
@@ -60,12 +61,14 @@ pub async fn run(config_path: &Path, test_confirm: bool) -> Result<()> {
     let (check, client) = check_lpass_binary(config.as_ref())?;
     report(check);
 
-    let (login, logged_in) = check_login(client.as_ref()).await;
+    let var = |name: &str| std::env::var_os(name);
+    let (login, logged_in) =
+        check_login(client.as_ref(), lpass::session_path(&var).as_deref()).await;
     if let Some(check) = login {
         report(check);
     }
     report(check_plaintext_key(
-        lpass::plaintext_key_path(&|name| std::env::var_os(name)).as_deref(),
+        lpass::plaintext_key_path(&var).as_deref(),
     ));
 
     if let (Some(config), Some(client), true) = (&config, &client, logged_in) {
@@ -154,11 +157,16 @@ fn check_lpass_binary(config: Option<&Config>) -> Result<(Check, Option<Arc<dyn 
     Ok((check, Some(client)))
 }
 
-/// Whether the vault opens — with the master password, if it asks for one.
+/// Whether the vault opens — with the master password, if it asks for one and
+/// this command may answer. `session` is where `lpass` writes a login down,
+/// for when it may not.
 ///
 /// No check at all without a binary to ask with: that failure is already
 /// reported, and a second line about it would only repeat it.
-async fn check_login(client: Option<&Arc<dyn LpassClient>>) -> (Option<Check>, bool) {
+async fn check_login(
+    client: Option<&Arc<dyn LpassClient>>,
+    session: Option<&Path>,
+) -> (Option<Check>, bool) {
     let Some(client) = client else {
         return (None, false);
     };
@@ -170,15 +178,36 @@ async fn check_login(client: Option<&Arc<dyn LpassClient>>) -> (Option<Check>, b
             )),
             true,
         ),
-        Err(lpass::LpassError::NotLoggedIn) => (
-            Some(Check::failed(
-                "lpass login",
-                "not logged in — run `lpass login <email>`".into(),
-            )),
+        Err(lpass::LpassError::NotLoggedIn) => (Some(not_logged_in()), false),
+        // Only a call that may not ask for the master password gets `Locked`,
+        // and that is what every call beside a running agent is — the agent
+        // leaves nothing open on purpose, so beside one the vault is locked
+        // by design. Unfed, though, `lpass` says the same of no login at all,
+        // so the session file settles which this is. With one the login is
+        // fine; the key checks are what need the vault open, and they wait.
+        Err(lpass::LpassError::Locked) => (
+            Some(if session.is_some_and(Path::exists) {
+                Check::passed(
+                    "lpass login",
+                    "logged in; the vault is locked, and this command does not ask for the \
+                     master password — a signature through the agent opens it, so the key \
+                     checks are skipped here"
+                        .into(),
+                )
+            } else {
+                not_logged_in()
+            }),
             false,
         ),
         Err(e) => (Some(Check::failed("lpass login", e.to_string())), false),
     }
+}
+
+fn not_logged_in() -> Check {
+    Check::failed(
+        "lpass login",
+        "not logged in — run `lpass login <email>`".into(),
+    )
 }
 
 /// One line per key the agent would serve, or one for why there are none.
