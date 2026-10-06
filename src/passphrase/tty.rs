@@ -97,8 +97,15 @@ impl TerminalMode {
 
         let mut hidden = original;
         hidden.c_lflag &= !libc::ECHO;
-        // Canonical mode still applies, so the terminal assembles the line and
-        // hands it over on Enter; only the echoing of it is suppressed.
+        // The terminal assembles the line and hands it over on Enter, a typed
+        // carriage return arriving as the newline that ends it. Set rather
+        // than inherited: a terminal some program left in raw mode would
+        // otherwise hand over keystrokes one at a time, backspaces included.
+        hidden.c_lflag |= libc::ICANON;
+        hidden.c_iflag |= libc::ICRNL;
+        // IGNCR would discard the return before ICRNL could translate it,
+        // and Enter would then never end the line.
+        hidden.c_iflag &= !libc::IGNCR;
         apply(fd, &hidden)?;
         Ok(Self {
             fd,
@@ -335,6 +342,47 @@ mod tests {
         });
         let secret = prompt.prompt(&request()).await.unwrap();
         assert_eq!(&*secret, b"  leading and trailing  ");
+        drop(typist.await.unwrap());
+    }
+
+    fn termios_of(file: &File) -> libc::termios {
+        let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr fills the struct or fails.
+        assert_eq!(
+            unsafe { libc::tcgetattr(file.as_raw_fd(), mode.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: initialized by the successful call above.
+        unsafe { mode.assume_init() }
+    }
+
+    #[tokio::test]
+    async fn a_terminal_left_in_raw_mode_is_read_a_line_at_a_time_anyway() {
+        // Canonical mode and the CR-to-NL translation are set, not assumed,
+        // so a terminal a previous program left raw still yields the line —
+        // and is handed back raw, as it was found.
+        let (mut master, _keepalive, slave_path) = open_pty();
+        let slave = File::open(&slave_path).unwrap();
+        let mut mode = termios_of(&slave);
+        mode.c_lflag &= !libc::ICANON;
+        mode.c_iflag &= !libc::ICRNL;
+        mode.c_iflag |= libc::IGNCR;
+        // SAFETY: slave is a terminal and `mode` came from it.
+        assert_eq!(
+            unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &raw const mode) },
+            0
+        );
+        let prompt = TtyPrompt::with_tty(slave_path, UNHURRIED);
+        let typist = tokio::task::spawn_blocking(move || {
+            answer_prompt(&mut master, b"secret\r");
+            master
+        });
+        let secret = prompt.prompt(&request()).await.unwrap();
+        assert_eq!(&*secret, b"secret");
+        let after = termios_of(&slave);
+        assert_eq!(after.c_lflag & libc::ICANON, 0);
+        assert_eq!(after.c_iflag & libc::ICRNL, 0);
+        assert_ne!(after.c_iflag & libc::IGNCR, 0);
         drop(typist.await.unwrap());
     }
 
