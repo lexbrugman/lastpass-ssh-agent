@@ -602,7 +602,9 @@ unlocking — do not run `lpass` yourself — and every lock is one it sees.
   against a name you already have — and the binding supplies only the key.
   Hashing is per entry, so plain entries in the same file still resolve.
   (Upstream OpenSSH defaults this off; Debian and Ubuntu ship it on.)
-- **Certificates** are not served; plain keys only.
+- **User certificates** are not served; plain keys only. (A *host* whose key
+  is a certificate is bound and named like any other — see the security
+  model.)
 - Destination constraints (`ssh-add -h`) are not applicable: this agent
   refuses key addition, and its key set comes from the vault.
 - **RSA**: SHA-1 (`ssh-rsa`) signature requests are refused; every OpenSSH
@@ -740,8 +742,12 @@ version is tracked as precisely as its own format allows:
 
 - **Crates** keep caret ranges in `Cargo.toml`, and `Cargo.lock` is
   committed. Cargo's default range strategy resolves to `update-lockfile`,
-  so an in-range release arrives as a lock-file-only pull request and the
-  manifest stays permissive.
+  so an in-range release changes only the lock file and the manifest stays
+  permissive. Those arrive grouped into one pull request rather than one per
+  crate — they are accepted on the strength of the gate, not read one by one
+  — while a major keeps a pull request of its own, since those are read. A
+  crate still on `0.x` counts as a major at every minor, as cargo's caret
+  does, and is never grouped.
 - **The rest of the locked tree** — the transitive crates with no manifest
   entry of their own — is refreshed by `lockFileMaintenance`, weekly. Direct
   dependencies are a small fraction of what actually gets compiled, and
@@ -758,6 +764,7 @@ version is tracked as precisely as its own format allows:
   `rust` image tags), so the local gate and CI always run the same compiler, a
   new release's lints arrive as a reviewed change rather than as a red build,
   and the minimum version the crate claims is the one that is actually built.
+
 Two things are deliberately not tracked, because a version is the wrong
 thing to pin:
 
