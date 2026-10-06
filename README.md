@@ -316,6 +316,11 @@ running, and this agent uses it as it finds it and never locks it. Only a
 locked vault costs a prompt, and the answer is then held until one of the
 things below forgets it.
 
+One way of opening the vault is outside all of this: `lpass login
+--plaintext-key` writes the vault's key to disk, where it never expires and
+every process running as you can use it. Nothing below can close a vault
+opened that way, so `doctor` fails when it finds that file.
+
 ### Locking the vault with the screen
 
 ```toml

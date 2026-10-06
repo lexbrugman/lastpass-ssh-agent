@@ -64,6 +64,9 @@ pub async fn run(config_path: &Path, test_confirm: bool) -> Result<()> {
     if let Some(check) = login {
         report(check);
     }
+    report(check_plaintext_key(
+        lpass::plaintext_key_path(&|name| std::env::var_os(name)).as_deref(),
+    ));
 
     if let (Some(config), Some(client), true) = (&config, &client, logged_in) {
         for check in check_keys(client, config).await {
@@ -284,6 +287,27 @@ fn check_remembered(config: &Config) -> Vec<Check> {
     }
 }
 
+/// Whether `lpass login --plaintext-key` has left the vault's key on disk —
+/// the one way of opening the vault that nothing here can close again. Takes
+/// the path `lpass::plaintext_key_path` resolves, so the check itself runs
+/// against a directory a test can arrange.
+fn check_plaintext_key(path: Option<&Path>) -> Check {
+    const LABEL: &str = "lpass key at rest";
+    match path {
+        Some(path) if path.exists() => Check::failed(
+            LABEL,
+            format!(
+                "{} exists: `lpass login --plaintext-key` left the vault's key on disk, where \
+                 every process running as you can open the whole vault and the screen lock \
+                 and idle time here cannot close it — run `lpass logout`, then `lpass login` \
+                 without that option",
+                path.display()
+            ),
+        ),
+        _ => Check::passed(LABEL, "none".into()),
+    }
+}
+
 /// Whether a master password is already stored, which is a question about a
 /// file and never about a fingerprint — `doctor` must not cost one.
 ///
@@ -382,6 +406,18 @@ mod tests {
         std::fs::remove_file(dir.path().join("agent.sock.identities")).unwrap();
         std::fs::create_dir(dir.path().join("agent.sock.identities")).unwrap();
         assert!(!check_remembered(&config)[0].ok);
+    }
+
+    #[test]
+    fn a_plaintext_vault_key_on_disk_fails_the_checklist() {
+        assert!(check_plaintext_key(None).ok);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plaintext_key");
+        assert!(check_plaintext_key(Some(&path)).ok);
+        std::fs::write(&path, b"k").unwrap();
+        let check = check_plaintext_key(Some(&path));
+        assert!(!check.ok);
+        assert!(check.detail.contains("--plaintext-key"), "{}", check.detail);
     }
 
     #[test]

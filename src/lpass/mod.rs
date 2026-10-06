@@ -9,6 +9,44 @@ use zeroize::Zeroizing;
 
 const MAX_DISCOVERY_PROBES: usize = 8;
 
+/// Where `lpass login --plaintext-key` keeps the vault's key, given a way to
+/// read environment variables — `lpass`'s own rule for a data file
+/// (`config_path_for_type` and `get_xdg_dir` in lastpass-cli's `config.c`,
+/// unchanged across every release), so `doctor` looks exactly where `lpass`
+/// would: `$LPASS_HOME` when set; else `$XDG_DATA_HOME/lpass` when that is —
+/// `get_xdg_dir` returns the variable itself before it looks at anything
+/// else; else `~/.local/share/lpass`, but only when `XDG_RUNTIME_DIR` is set,
+/// which is how `lpass` decides a desktop follows the XDG layout at all; else
+/// `~/.lpass`. `None` when nothing names a directory. Read from the environment this process has: an `LPASS_HOME`
+/// that `lpass` only learns from its own `env` file is not seen here, and a
+/// key kept under it is not found.
+///
+/// A vault opened that way is open to every process running as you, with
+/// nothing to expire, and nothing this agent does — its screen-lock and idle
+/// forgetting above all — can close it, since `lpass` reads that file before
+/// it reads anything fed to it.
+pub fn plaintext_key_path(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    const FILE: &str = "plaintext_key";
+    // A path variable set but empty counts as unset. `lpass` itself then
+    // tries to create `/plaintext_key` or `/lpass`, cannot, and exits, so
+    // there is nothing of its to find — and an empty path joined would name a
+    // file in whatever directory `doctor` happens to run in. `XDG_RUNTIME_DIR`
+    // is not a path here but a flag, and `lpass` reads it as one: present is
+    // enough, empty or not.
+    let path_var = |name: &str| var(name).filter(|value| !value.is_empty());
+    if let Some(home) = path_var("LPASS_HOME") {
+        return Some(PathBuf::from(home).join(FILE));
+    }
+    if let Some(data) = path_var("XDG_DATA_HOME") {
+        return Some(PathBuf::from(data).join("lpass").join(FILE));
+    }
+    let home = PathBuf::from(path_var("HOME")?);
+    if var("XDG_RUNTIME_DIR").is_some() {
+        return Some(home.join(".local/share/lpass").join(FILE));
+    }
+    Some(home.join(".lpass").join(FILE))
+}
+
 /// One vault item as listed by `lpass ls` (names/ids only — no secrets).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemSummary {
@@ -219,6 +257,56 @@ fn is_executable(path: &Path) -> bool {
 mod discovery_tests {
     use super::mock::MockLpass;
     use super::*;
+
+    type Vars<'a> = &'a [(&'a str, &'a str)];
+
+    fn env(vars: Vars<'_>) -> impl Fn(&str) -> Option<std::ffi::OsString> + '_ {
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        }
+    }
+
+    #[test]
+    fn the_plaintext_key_is_looked_for_where_lpass_keeps_it() {
+        let cases: [(Vars, Option<&str>); 8] = [
+            (
+                &[("LPASS_HOME", "/lp"), ("HOME", "/h")],
+                Some("/lp/plaintext_key"),
+            ),
+            (&[("HOME", "/h")], Some("/h/.lpass/plaintext_key")),
+            (
+                &[("HOME", "/h"), ("XDG_RUNTIME_DIR", "/run/user/1")],
+                Some("/h/.local/share/lpass/plaintext_key"),
+            ),
+            // an explicit data home wins whether or not a runtime dir says
+            // the desktop is an XDG one, and needs no home directory
+            (
+                &[("HOME", "/h"), ("XDG_DATA_HOME", "/d")],
+                Some("/d/lpass/plaintext_key"),
+            ),
+            (&[("XDG_DATA_HOME", "/d")], Some("/d/lpass/plaintext_key")),
+            (&[("XDG_RUNTIME_DIR", "/run/user/1")], None),
+            // a path set but empty is unset, never a relative path — while the
+            // runtime dir is a flag, and present is enough
+            (
+                &[("LPASS_HOME", ""), ("XDG_DATA_HOME", ""), ("HOME", "/h")],
+                Some("/h/.lpass/plaintext_key"),
+            ),
+            (
+                &[("HOME", "/h"), ("XDG_RUNTIME_DIR", "")],
+                Some("/h/.local/share/lpass/plaintext_key"),
+            ),
+        ];
+        for (vars, expected) in cases {
+            assert_eq!(
+                plaintext_key_path(&env(vars)),
+                expected.map(PathBuf::from),
+                "{vars:?}"
+            );
+        }
+    }
     use std::sync::Arc;
 
     fn vault() -> Arc<MockLpass> {
