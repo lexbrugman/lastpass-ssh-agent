@@ -186,18 +186,20 @@ pub fn unpad(padded: Zeroizing<Vec<u8>>) -> Result<Zeroizing<Vec<u8>>> {
 
 /// What a finished unwrap means to a `MasterPasswordStore`.
 ///
-/// The distinction this draws is the one `master::seed` depends on. Seeding
-/// reads the store first and refuses to touch it if that read fails, because
-/// overwriting a store that would not answer could destroy a password that
-/// works. So exactly one failure must read as *empty* instead:
+/// `master::resolve` asks for the password either way — a store that will not
+/// answer never refuses a signature — so the distinction this draws is what
+/// the log tells the user to do about it. *Empty* is reported as nothing
+/// stored yet, with `store-master-password` named as the fix; an error is
+/// reported as a store that could not be read this time. So exactly one
+/// failure must read as empty:
 ///
-/// - `Reseed` — the key cannot be used again, by anyone, ever. There is
-///   nothing recoverable behind it, so seeding over it is safe, and it is the
-///   only way out. Reported as an error instead, it would make
-///   `store-master-password` refuse the very state it exists to repair.
+/// - `Reseed` — the key cannot be used again, by anyone, ever: the
+///   fingerprints it was bound to have changed. Nothing is recoverable behind
+///   it, and running `store-master-password` again is the only way out, so
+///   that is what has to be named.
 /// - everything else — a declined fingerprint above all — may well be sitting
-///   on a working secret. Calling that "nothing is stored" would invite the
-///   next seed to overwrite it because nobody happened to be at the machine.
+///   on a working secret. Calling that "nothing stored" would send someone to
+///   store it again when all it wanted was a fingerprint.
 pub fn unwrapped(
     result: std::result::Result<Zeroizing<Vec<u8>>, Outcome>,
 ) -> std::result::Result<Option<Zeroizing<Vec<u8>>>, String> {
