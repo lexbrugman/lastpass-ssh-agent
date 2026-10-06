@@ -56,7 +56,10 @@ What it **cannot** guarantee:
   memory — or who owns your user account — wins regardless.
 - What **is** done cheaply: no other process of yours may attach a debugger
   to the agent or read its memory (`PR_SET_DUMPABLE=0` on Linux,
-  `PT_DENY_ATTACH` on macOS — root excepted, as with ssh-agent), the held
+  `PT_DENY_ATTACH` on macOS — root excepted, as with ssh-agent; and this
+  process only: `lpass` runs as an ordinary child for the few hundred
+  milliseconds of each call, where on Linux Yama's `ptrace_scope` is what
+  stands between it and your other processes), the held
   master password is pinned in RAM and excluded from dumps (`mlock`, and
   `MADV_DONTDUMP` on Linux), core dumps disabled (`RLIMIT_CORE=0`),
   `umask 077`, socket directory forced to `0700`/owner-only with symlink
