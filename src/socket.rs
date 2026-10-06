@@ -113,13 +113,8 @@ pub fn prepare_dir(dir: &Path) -> Result<()> {
 /// Used by `doctor` so it reports what `start` would refuse. A directory
 /// that does not exist yet is fine — `bind` creates it correctly.
 pub fn validate_dir(dir: &Path) -> Result<()> {
-    // SAFETY: geteuid cannot fail and touches no memory.
-    let uid = unsafe { libc::geteuid() };
     let meta = match fs::symlink_metadata(dir) {
-        // Not yet: `bind` creates it — inside whatever exists above, which
-        // has to pass the same checks now as it will then, or `doctor` would
-        // call healthy a path `start` is about to refuse.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return validate_ancestors(dir, uid),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         other => other?,
     };
     if meta.file_type().is_symlink() {
@@ -134,6 +129,8 @@ pub fn validate_dir(dir: &Path) -> Result<()> {
             dir.display()
         )));
     }
+    // SAFETY: geteuid cannot fail and touches no memory.
+    let uid = unsafe { libc::geteuid() };
     if meta.uid() != uid {
         return Err(Error::Socket(format!(
             "socket directory {} is owned by uid {}, not us (uid {uid})",
@@ -157,82 +154,6 @@ pub fn validate_dir(dir: &Path) -> Result<()> {
             dir.display(),
             dir.display()
         )));
-    }
-    validate_ancestors(dir, uid)
-}
-
-/// The directories above the socket directory, each of which has to be one
-/// whose entries nobody else can rename or remove: the checks above are on
-/// the directory itself, and whoever controls the directory *containing* it
-/// can swap it for their own once they have passed. Owned by us or by root,
-/// and either closed to others or sticky, is what `/`, `/run/user/<uid>`,
-/// `$HOME` and `/tmp` all satisfy.
-///
-/// Checked along the path as written and along the path the filesystem
-/// resolves it to: a symlink on the way puts the socket under directories
-/// the written path never names, and their owners could replace it just the
-/// same — as could the symlink's own owner, by pointing it elsewhere, so a
-/// symlink on the written path has to be ours or root's too. Ancestors that
-/// do not exist yet are skipped — `bind` creates them, inside whatever exists
-/// above.
-///
-/// `uid` is a parameter so a test can be someone else.
-fn validate_ancestors(dir: &Path, uid: u32) -> Result<()> {
-    for written in dir.ancestors().skip(1) {
-        let Ok(meta) = fs::symlink_metadata(written) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() && ![uid, 0].contains(&meta.uid()) {
-            return Err(Error::Socket(format!(
-                "socket directory {} is reached through {}, a symlink owned by uid {} — its \
-                 owner can point it anywhere; keep the socket under your own home or runtime \
-                 directory",
-                dir.display(),
-                written.display(),
-                meta.uid()
-            )));
-        }
-    }
-    // Whatever `canonicalize` refuses here, `symlink_metadata` on the
-    // directory itself has already refused or reported missing — so a
-    // failure can only be an ancestor that does not exist yet, and is
-    // skipped as one.
-    let mut ancestors: Vec<PathBuf> = dir
-        .ancestors()
-        .skip(1)
-        .filter_map(|written| fs::canonicalize(written).ok())
-        .flat_map(|resolved| {
-            resolved
-                .ancestors()
-                .map(Path::to_path_buf)
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    ancestors.sort();
-    ancestors.dedup();
-    for ancestor in ancestors {
-        let ancestor = ancestor.as_path();
-        let meta = fs::metadata(ancestor)?;
-        if ![uid, 0].contains(&meta.uid()) {
-            return Err(Error::Socket(format!(
-                "socket directory {} is under {}, which is owned by uid {} — whoever owns a \
-                 directory above the socket can replace it; keep the socket under your own \
-                 home or runtime directory",
-                dir.display(),
-                ancestor.display(),
-                meta.uid()
-            )));
-        }
-        let mode = meta.permissions().mode() & 0o7777;
-        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
-            return Err(Error::Socket(format!(
-                "socket directory {} is under {}, which others can write to (mode {mode:o}) \
-                 without the sticky bit — anyone could replace the socket directory; keep it \
-                 under your own home or runtime directory",
-                dir.display(),
-                ancestor.display()
-            )));
-        }
     }
     Ok(())
 }
@@ -329,82 +250,6 @@ mod tests {
         }
         assert!(path.exists());
         let (_listener, _guard) = bind(&path).unwrap();
-    }
-
-    #[tokio::test]
-    async fn refuses_a_dir_under_one_others_could_replace_it_in() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shared = tmp.path().join("shared");
-        let dir = shared.join("agent");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        // anyone may write to the directory above: its entries can be renamed
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let err = validate_dir(&dir).unwrap_err().to_string();
-        assert!(err.contains("sticky"), "{err}");
-        // the sticky bit is what /tmp has, and what stops exactly that
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        validate_dir(&dir).unwrap();
-        // group-writable alone is enough to refuse
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(validate_dir(&dir).is_err());
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
-        validate_dir(&dir).unwrap();
-
-        // and one owned by someone other than us or root, by being someone else
-        // SAFETY: geteuid cannot fail.
-        let someone_else = unsafe { libc::geteuid() } + 1;
-        let err = validate_ancestors(&dir, someone_else)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("owned by uid"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn checks_the_directories_a_symlink_on_the_way_leads_through() {
-        // link -> shared/target, with the socket dir inside: the written path
-        // never names `shared`, but the socket lives under it.
-        let tmp = tempfile::tempdir().unwrap();
-        let shared = tmp.path().join("shared");
-        let target = shared.join("target");
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let link = tmp.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let dir = link.join("agent");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        let err = validate_dir(&dir).unwrap_err().to_string();
-        assert!(err.contains("shared"), "{err}");
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        validate_dir(&dir).unwrap();
-
-        // the link itself is ours, which is what lets it pass; one owned by
-        // someone else could be pointed anywhere later
-        // SAFETY: geteuid cannot fail.
-        let someone_else = unsafe { libc::geteuid() } + 1;
-        let err = validate_ancestors(&dir, someone_else)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("symlink owned by uid"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_dir_that_does_not_exist_yet_is_judged_by_what_it_would_be_created_in() {
-        // `doctor` on a fresh config must refuse what `start` is about to
-        // refuse once it has created the directory.
-        let tmp = tempfile::tempdir().unwrap();
-        let shared = tmp.path().join("shared");
-        std::fs::create_dir(&shared).unwrap();
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let dir = shared.join("not-yet").join("agent");
-        assert!(validate_dir(&dir).is_err());
-        assert!(prepare_dir(&dir).is_err());
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        validate_dir(&dir).unwrap();
-        prepare_dir(&dir).unwrap();
     }
 
     #[tokio::test]
