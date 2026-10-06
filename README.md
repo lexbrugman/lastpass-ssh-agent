@@ -40,7 +40,7 @@ What this agent **guarantees**:
   signed — a binding is a host's signature over a session id and nothing else,
   replayable by anyone who has connected to that host, so what is signed has
   to say which session it is for. Nothing binds after the destination, and a
-  host key bound once is not bound again.
+  binding seen before changes nothing.
 - **Read-only agent.** `ssh-add` (add/remove/lock/unlock) is refused. The
   agent serves every usable SSH Key item the account can see, shared folders
   included — what you can use in the vault, you can use here, for the key

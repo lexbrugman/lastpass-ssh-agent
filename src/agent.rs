@@ -199,12 +199,18 @@ impl LpassAgent {
         };
         // OpenSSH's own rules for what may follow a binding. A hop that is
         // not forwarding the agent is the connection's destination, and
-        // nothing binds after it. A host key already bound is a replay:
-        // binding signatures cover the session id and nothing else, so one
-        // seen once can be sent again at will, and letting it change the
-        // list — its order, its last entry, its forwarding marks — would let
-        // a peer choose which session a signature is checked against. It is
-        // ignored, and what was bound first stands.
+        // nothing binds after it. A binding seen before — the same host key
+        // for the same session — is a replay and changes nothing. The same
+        // session under another key is a peer rewriting the chain, and is
+        // refused. A key seen before with a new session is a new connection
+        // to a host already on the chain, and is appended like any other hop
+        // (OpenSSH's `process_ext_session_bind` does the same): one wildcard
+        // host certificate serves many hosts under one key, and `ssh -A a`
+        // then `ssh a` is a chain of two. Replaying a retained
+        // binding this way buys a peer nothing: what it moves the connection
+        // to is a signature good only for that session with that host, which
+        // the same peer could have by connecting to that host afresh — and
+        // the prompt names the host and warns of the forwarding either way.
         if self.bindings.last().is_some_and(|last| !last.is_forwarding) {
             tracing::warn!(
                 "refusing a session binding: this connection is already bound to its \
@@ -219,9 +225,19 @@ impl LpassAgent {
         if self
             .bindings
             .iter()
-            .any(|seen| seen.host_key == bind.host_key)
+            .any(|seen| seen.host_key == bind.host_key && seen.session_id == bind.session_id)
         {
             return Response::Success;
+        }
+        if self
+            .bindings
+            .iter()
+            .any(|seen| seen.session_id == bind.session_id)
+        {
+            tracing::warn!(
+                "refusing a session binding: this session is already bound to another host key"
+            );
+            return Response::Failure;
         }
         if self.bindings.len() >= MAX_SESSION_BINDINGS {
             tracing::warn!(
@@ -2005,9 +2021,9 @@ mod tests {
         let mut agent = agent_recording(confirmer.clone()).await;
         let host = PrivateKey::from_openssh(ED25519).unwrap();
 
-        // the same hop repeated adds nothing, and changes nothing: a replay
-        // with another session id leaves the one bound first
-        for session in [&b"same-host"[..], b"same-host", b"replayed-later"] {
+        // the same hop repeated adds nothing; the same host under a new
+        // session is a new connection to it, and is a hop of its own
+        for session in [&b"same-host"[..], b"same-host", b"same-host-again"] {
             assert!(matches!(
                 agent
                     .handle(session_bind(&host, session, true))
@@ -2016,8 +2032,20 @@ mod tests {
                 Response::Success
             ));
         }
-        assert_eq!(agent.bindings.len(), 1);
+        assert_eq!(agent.bindings.len(), 2);
         assert_eq!(agent.bindings[0].session_id, b"same-host");
+        assert_eq!(agent.bindings[1].session_id, b"same-host-again");
+
+        // a session already bound cannot be claimed by another host key
+        let other = PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        assert!(matches!(
+            agent
+                .handle(session_bind(&other, b"same-host", true))
+                .await
+                .unwrap(),
+            Response::Failure
+        ));
+        assert_eq!(agent.bindings.len(), 2);
 
         // distinct forwarding hops accumulate only up to our own cap
         for hop in 0..MAX_SESSION_BINDINGS + 4 {
