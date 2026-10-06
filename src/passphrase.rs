@@ -34,7 +34,7 @@ use zeroize::Zeroizing;
 use crate::config::PassphraseFallback;
 use crate::keystore::KeyEntry;
 use crate::lpass::LpassClient;
-use crate::text::escape_for_display;
+use crate::text::{display_bounded, escape_for_display};
 
 /// What the user is being asked to unlock. Display context only — no secret
 /// belongs in here. `key_name` comes from the vault and is escaped before any
@@ -90,7 +90,7 @@ impl PassphraseRequest {
         }
         format!(
             "Enter passphrase for SSH key\n\nKey: {}\nFingerprint: {}\nLastPass item: {}",
-            escape_for_display(&self.key_name),
+            display_bounded(&self.key_name),
             escape_for_display(&self.fingerprint),
             escape_for_display(&self.item_id),
         )
@@ -519,8 +519,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    const ED25519_PW: &str = include_str!("../tests/fixtures/ed25519_pw");
-    const ED25519_PW_PUB: &str = include_str!("../tests/fixtures/ed25519_pw.pub");
+    use crate::testutil::fixtures::*;
     const RIGHT: &[u8] = b"fixture-passphrase";
     const WRONG: &[u8] = b"not the passphrase";
 

@@ -7,11 +7,12 @@ use crate::error::{Error, Result};
 /// - `RLIMIT_CORE = 0`: a crash while a private key is in memory must not
 ///   write that memory to a core file.
 /// - `umask(077)`: every file/socket we create defaults to owner-only.
+/// - No debuggers: nothing else running as this user may attach to this
+///   process or read its memory. The master password lives here between
+///   signatures, and this is what keeps reading it from being one `ptrace`
+///   away for any process of the user's. Root is not kept out, and cannot be.
 ///
-/// Deliberately NOT done (documented in the README): `mlock/MADV_DONTDUMP`
-/// (key material lives milliseconds per signature and macOS swap is
-/// encrypted) and `PT_DENY_ATTACH` (an attacker who can attach a debugger can
-/// attach to `lpass` itself, which holds the whole vault).
+/// The held password is also pinned in RAM, per buffer, by `pin`.
 pub fn harden() -> Result<()> {
     let no_core = libc::rlimit {
         rlim_cur: 0,
@@ -19,23 +20,104 @@ pub fn harden() -> Result<()> {
     };
     // SAFETY: setrlimit reads a valid rlimit struct and touches no other memory.
     let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const no_core) };
-    harden_check(rc)?;
+    harden_check(rc, "setrlimit(RLIMIT_CORE, 0)")?;
+    harden_check(deny_debuggers(), "refusing debuggers")?;
     // SAFETY: umask is async-signal-safe and cannot fail.
     unsafe { libc::umask(0o077) };
     Ok(())
 }
 
 /// Lowering `RLIMIT_CORE` to 0/0 cannot fail (no EINVAL/EPERM case applies),
-/// so the error edge is untestable and excluded from coverage.
+/// and neither call in `deny_debuggers` can with these arguments, so the error
+/// edge is untestable and excluded from coverage.
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn harden_check(rc: libc::c_int) -> Result<()> {
+fn harden_check(rc: libc::c_int, what: &str) -> Result<()> {
     if rc == 0 {
         return Ok(());
     }
     Err(Error::Harden(format!(
-        "setrlimit(RLIMIT_CORE, 0): {}",
+        "{what}: {}",
         std::io::Error::last_os_error()
     )))
+}
+
+/// Not dumpable, which on Linux is also what closes `ptrace` and
+/// `/proc/<pid>/mem` to other processes of the same user.
+#[cfg(target_os = "linux")]
+fn deny_debuggers() -> libc::c_int {
+    // SAFETY: prctl with these arguments reads no memory.
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }
+}
+
+/// What ssh-agent does on macOS: no later attach, and a debugger already
+/// attached ends the process.
+#[cfg(target_os = "macos")]
+fn deny_debuggers() -> libc::c_int {
+    // SAFETY: PT_DENY_ATTACH takes no pointers and touches no memory.
+    unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) }
+}
+
+/// Nothing to do here, which is success.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn deny_debuggers() -> libc::c_int {
+    0
+}
+
+/// Keep `len` bytes at `ptr` in RAM and out of any dump: never paged to swap,
+/// never written by a crash. Page-granular, so whatever else shares those
+/// pages comes along, which costs nothing.
+///
+/// `ptr` and `len` rather than a slice, so a buffer can be unpinned after it
+/// has been wiped and its length zeroed.
+pub fn pin(ptr: *const u8, len: usize) -> std::io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let (start, span) = page_span(ptr as usize, len, page_size());
+    // SAFETY: the span is whole pages containing memory this process owns;
+    // mlock and madvise read nothing through the pointer.
+    os_check(unsafe { libc::mlock(start as *const libc::c_void, span) })?;
+    #[cfg(target_os = "linux")]
+    os_check(unsafe { libc::madvise(start as *mut libc::c_void, span, libc::MADV_DONTDUMP) })?;
+    Ok(())
+}
+
+/// Undo `pin`. Best effort: a page that stays locked costs nothing but the
+/// page.
+pub fn unpin(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (start, span) = page_span(ptr as usize, len, page_size());
+    // SAFETY: as in `pin`.
+    let _ = unsafe { libc::munlock(start as *const libc::c_void, span) };
+    #[cfg(target_os = "linux")]
+    let _ = unsafe { libc::madvise(start as *mut libc::c_void, span, libc::MADV_DODUMP) };
+}
+
+/// The whole pages covering `len` bytes at `addr`: where they start, and how
+/// long the run is.
+const fn page_span(addr: usize, len: usize, page: usize) -> (usize, usize) {
+    let start = addr - addr % page;
+    let end = (addr + len).div_ceil(page) * page;
+    (start, end - start)
+}
+
+fn page_size() -> usize {
+    // SAFETY: sysconf reads no memory.
+    usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096)
+}
+
+/// A failing return from a call that, with the arguments `pin` gives it, fails
+/// only under a memory-lock limit exhausted by something else — excluded from
+/// coverage, since a test cannot arrange that.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn os_check(rc: libc::c_int) -> std::io::Result<()> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Default directory for the agent socket. Must be private to the user;
@@ -167,6 +249,11 @@ mod tests {
         assert_eq!(limit.rlim_cur, 0);
         assert_eq!(limit.rlim_max, 0);
 
+        // and nothing of ours may be attached to
+        #[cfg(target_os = "linux")]
+        // SAFETY: prctl with this option reads no memory.
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+
         // SAFETY: umask is process-global; read it by setting and restoring.
         let current = unsafe { libc::umask(0o077) };
         assert_eq!(current, 0o077);
@@ -204,5 +291,20 @@ mod tests {
         let path = default_socket_path().unwrap();
         assert!(path.ends_with("agent.sock"));
         assert!(path.starts_with(dir));
+    }
+
+    #[test]
+    fn a_pinned_buffer_covers_whole_pages_and_comes_back_unpinned() {
+        assert_eq!(page_span(4096, 10, 4096), (4096, 4096));
+        assert_eq!(page_span(4100, 10, 4096), (4096, 4096));
+        assert_eq!(page_span(4100, 4093, 4096), (4096, 8192));
+        assert_eq!(page_span(0, 1, 4096), (0, 4096));
+
+        let secret = [7u8; 100];
+        pin(secret.as_ptr(), secret.len()).unwrap();
+        unpin(secret.as_ptr(), secret.len());
+        // nothing to pin is nothing to do
+        pin(secret.as_ptr(), 0).unwrap();
+        unpin(secret.as_ptr(), 0);
     }
 }

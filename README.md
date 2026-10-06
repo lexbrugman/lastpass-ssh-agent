@@ -17,22 +17,34 @@ What this agent **guarantees**:
   over a pipe, parsed in memory, used for one signature, and zeroized. It is
   never written to disk, never passed through a shell, argv, or environment.
 - **No caching.** There is deliberately no private-key cache. Each signature
-  is a fresh fetch (public keys and item metadata are cached for the agent's
-  lifetime — they are not secrets).
+  is a fresh fetch. (Public keys and item metadata are written down beside the
+  socket between starts — they are not secrets; see [Starting without the
+  vault](#starting-without-the-vault).)
 - **User-visible signing.** By default every signature asks first — a native
-  dialog on macOS, a `/dev/tty` prompt on Linux — naming the key and the
-  requesting process, with *Deny* as the default and cancel button. Timeouts,
-  missing GUI sessions and helper failures all fail closed to Deny.
+  dialog on macOS, a `/dev/tty` prompt on Linux — naming the key, the
+  requesting process and what it was started from (its parent processes up to
+  the terminal or app, so a push from your editor reads as such), with *Deny*
+  as the default and cancel button. Timeouts, missing GUI sessions and helper
+  failures all fail closed to Deny.
 - **The host is named, and forwarding is visible.** The agent implements
   `session-bind@openssh.com`, so the prompt names the host each request is for
   — by hostname where `known_hosts` records one for that key, by fingerprint
-  otherwise — and each hop proved possession of its host key. When the request
+  otherwise — and each hop proved possession of its host key. A host whose
+  key is a certificate is bound like any other and shown by the fingerprint
+  of the key inside it. When the request
   arrived over a connection you forwarded with `ssh -A` it says so and warns
   that it may have originated there rather than on your machine; without that,
   a relayed request looks identical to one you made yourself. Bindings whose
-  signature does not verify are refused and never displayed.
+  signature does not verify are refused and never displayed, and on a bound
+  connection only a user-authentication request for the session bound last is
+  signed — a binding is a host's signature over a session id and nothing else,
+  replayable by anyone who has connected to that host, so what is signed has
+  to say which session it is for. Nothing binds after the destination, and a
+  binding seen before changes nothing.
 - **Read-only agent.** `ssh-add` (add/remove/lock/unlock) is refused. The
-  agent serves the vault's SSH Key items discovered at startup — or, with
+  agent serves every usable SSH Key item the account can see, shared folders
+  included — what you can use in the vault, you can use here, for the key
+  types listed under [Notes & limitations](#notes--limitations) — or, with
   `[[keys]]` pinned in the config, exactly those and nothing else.
 
 What it **cannot** guarantee:
@@ -42,30 +54,35 @@ What it **cannot** guarantee:
   During a signature, plaintext key material exists briefly in `lpass`, the
   pipe, and this agent's memory. An attacker who can read this process's
   memory — or who owns your user account — wins regardless.
-- Deliberately **not** done, because it would be theater given the above:
-  `mlock`/`MADV_DONTDUMP` (key material lives milliseconds and macOS swap is
-  encrypted by default) and `PT_DENY_ATTACH` (a local debugger-capable
-  attacker can attach to `lpass` itself, which holds the whole vault).
-- What **is** done cheaply: core dumps disabled (`RLIMIT_CORE=0`),
+- What **is** done cheaply: no other process of yours may attach a debugger
+  to the agent or read its memory (`PR_SET_DUMPABLE=0` on Linux,
+  `PT_DENY_ATTACH` on macOS — root excepted, as with ssh-agent; and this
+  process only: `lpass` runs as an ordinary child for the few hundred
+  milliseconds of each call, where on Linux Yama's `ptrace_scope` is what
+  stands between it and your other processes), the held
+  master password is pinned in RAM and excluded from dumps (`mlock`, and
+  `MADV_DONTDUMP` on Linux), core dumps disabled (`RLIMIT_CORE=0`),
   `umask 077`, socket directory forced to `0700`/owner-only with symlink
   refusal, socket `0600`, lpass environment allowlisted, `ssh_agent_lib` debug
   logging capped (its request dumps could contain a private key a client tried
-  to add).
-- **Your master password**, specifically, and how far you take this is a
-  setting. By default (`master_password = "off"`) the agent never sees it:
-  lpass's own pinentry is disabled, so a vault that has forgotten its key fails
-  the signature and you run `lpass login` yourself.
-  [`"prompt"`](#being-asked-for-the-master-password) lets the agent ask and pass
-  it to `lpass` over a pipe, in a zeroizing buffer, never logged, never written
-  and never placed in argv or the environment.
-  [`"touchid"`](#keeping-it-behind-touch-id) goes further and is the only one
-  of the three that keeps the master password at rest: it is written to disk,
-  encrypted to a key that never leaves the Secure Enclave of the Mac it was
-  created on, and that macOS will not use without your fingerprint. Copies of
-  the file are inert anywhere else. That is a deliberate trade of a stored
-  secret for a hardware-enforced gate, and worth reading that section before
-  turning it on. (Key *passphrases* are a separate setting with a store of
-  their own — see
+  to add). Key material itself is not pinned: it lives milliseconds per
+  signature.
+- **Your master password** is handled by this agent: asked for when the
+  vault is locked, held in memory while it is unlocked, and forgotten when
+  the screen locks, when it has gone unused for `master_password_idle_secs`,
+  and when the agent stops.
+  Each `lpass` call is fed it over a pipe and told not to start `lpass`'s own
+  agent, so nothing this agent does leaves the vault open machine-wide — see
+  [How the vault is opened](#how-the-vault-is-opened). It lives in a
+  zeroizing buffer, is never logged, never written, and never placed in argv
+  or the environment.
+  [`"touchid"`](#keeping-it-behind-touch-id) is the one setting that keeps it
+  at rest: it is written to disk, encrypted to a key that never leaves the
+  Secure Enclave of the Mac it was created on, and that macOS will not use
+  without your fingerprint. Copies of the file are inert anywhere else. That
+  is a deliberate trade of a stored secret for a hardware-enforced gate, and
+  worth reading that section before turning it on. (Key *passphrases* are a
+  separate setting with a store of their own — see
   [`passphrase_fallback`](#keeping-the-passphrase-out-of-the-vault).)
 
 ## Install
@@ -80,18 +97,24 @@ Linux builds are musl-linked, so they do not depend on the host's glibc
 version.
 
 Without Homebrew, take the archive for your platform straight from the
-[latest release](https://github.com/lexbrugman/lastpass-ssh-agent/releases/latest).
-Each one ships beside a `.sha256`, so verify it before unpacking — and install
-`lastpass-cli` yourself, since nothing here does it for you:
+[latest release](https://github.com/lexbrugman/lastpass-ssh-agent/releases/latest)
+— and install `lastpass-cli` yourself, since nothing here does it for you:
 
 ```sh
 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, *-apple-darwin
 curl -fsSLO "https://github.com/lexbrugman/lastpass-ssh-agent/releases/latest/download/lastpass-ssh-agent-${target}.tar.xz"
-curl -fsSLO "https://github.com/lexbrugman/lastpass-ssh-agent/releases/latest/download/lastpass-ssh-agent-${target}.tar.xz.sha256"
-sha256sum -c "lastpass-ssh-agent-${target}.tar.xz.sha256"   # shasum -a 256 -c on macOS
+gh attestation verify "lastpass-ssh-agent-${target}.tar.xz" --repo lexbrugman/lastpass-ssh-agent
 tar -xJf "lastpass-ssh-agent-${target}.tar.xz"
 install -m 755 lastpass-ssh-agent /usr/local/bin/
 ```
+
+The `gh attestation verify` line is the check worth making. Every archive is
+attested by the workflow that built it, and verifying the attestation proves
+the file came out of this repository's release pipeline, from the commit it
+names, unmodified — something a checksum downloaded from beside the archive
+cannot, since whoever could replace the one could replace the other. (The
+`.sha256` beside each archive is there for the Homebrew formula and for
+spotting a corrupt download; it is not a defence against a substituted one.)
 
 > The tap is populated by the release pipeline. If `brew install` cannot find
 > the formula, the tap does not exist yet — build from source.
@@ -100,7 +123,7 @@ Or build it yourself:
 
 ```sh
 brew install lastpass-cli
-cargo build --release        # needs rustup; rust-version >= 1.87
+cargo build --release        # needs rustup; the release Cargo.toml names as rust-version
 cp target/release/lastpass-ssh-agent /usr/local/bin/  # or anywhere on PATH
 ```
 
@@ -195,18 +218,23 @@ vault scan) or tuning behavior:
 # "error" refuses to sign.
 # passphrase_fallback = "prompt"
 
-# How long the vault stays unlocked once lpass has derived its key. Unset
-# leaves lpass to its own default of an hour; 0 means never expire.
-# vault_unlock_timeout_secs = 300
+# How long the agent keeps the master password once it has asked for it,
+# counted from the last signature that used it. Unset is an hour; 0 keeps
+# it until the screen locks or the agent stops.
+# master_password_idle_secs = 3600
 
-# Where the master password comes from when lpass has forgotten its key.
-# "off" (default) fails the signature; "prompt" asks you, any platform;
-# "touchid" (macOS) releases it on Touch ID, falling back to asking.
-# master_password = "off"
+# Where the master password comes from when the vault is locked. "prompt"
+# (default) asks you, any platform; "touchid" (macOS) releases it on Touch
+# ID, falling back to asking.
+# master_password = "prompt"
 
-# Shut the vault when the screen locks, not just the display. macOS and
-# Linux (through logind's LockedHint).
-# lock_on_screen_lock = false
+# Forget the master password when the screen locks, not just the display.
+# On by default; macOS and Linux (through logind's LockedHint).
+# lock_on_screen_lock = true
+
+# Once you approve a signature, approve the same key for the same requester
+# and hosts without asking, until the vault locks. Off by default.
+# remember_approvals = false
 
 # Pin items (disables auto-discovery); `search` prints these snippets.
 [[keys]]
@@ -275,48 +303,66 @@ vault:
   passphrase, decrypts, signs, and wipes both. These are passphrase stores, not
   key stores.
 
+### How the vault is opened
+
+`lpass` derives a key from your master password and, left to itself, parks it
+in an agent process of its own for an hour — where anything running as you can
+use it to read the **whole vault**, not just the SSH keys. This agent never
+lets that happen on its account. Every `lpass` call it makes is told not to
+start that agent (`LPASS_AGENT_DISABLE`), is fed the master password over a
+pipe, derives the key, uses it and exits. Between calls the only thing kept is
+the password itself, in this process.
+
+Each call is first tried without a password, because a vault you unlocked
+yourself in a shell answers it: `lpass` still reads an agent that is already
+running, and this agent uses it as it finds it and never locks it. Only a
+locked vault costs a prompt, and the answer is then held until one of the
+things below forgets it.
+
+One way of opening the vault is outside all of this: `lpass login
+--plaintext-key` writes the vault's key to disk, where it never expires and
+every process running as you can use it. Nothing below can close a vault
+opened that way, so `doctor` fails when it finds that file.
+
 ### Locking the vault with the screen
 
-`lpass` keeps the key it derived from your master password in an agent process
-of its own — for an hour by default. That is what makes each signature cost no
-password, and it is also what leaves the **whole vault** readable by anything
-running as you until it expires. Locking the screen does not touch it.
-
 ```toml
-lock_on_screen_lock = true
+lock_on_screen_lock = true       # the default
 ```
 
-With this on, the agent watches the screen and drops that cached key the moment
-it locks. The LastPass *session* survives, so the way back is your master
-password, not a fresh login with a second factor — and you are not asked for it
-on unlock, only when a signature actually needs the vault again.
+The agent watches the screen and forgets the master password the moment it
+locks, so walking away shuts the vault and not just the display. The LastPass
+*session* survives, so the way back is your master password, not a fresh login
+with a second factor — and you are not asked for it on unlock, only when a
+signature actually needs the vault again.
 
 Reading the screen's lock state is the one part of this a platform has to
 provide, and two do: macOS through its window server, Linux through logind's
-`LockedHint`. Elsewhere the setting is refused at startup rather than ignored.
+`LockedHint`. Elsewhere the setting is refused at startup rather than ignored,
+and the default is off.
 
 The Linux side is only as good as the desktop's reporting: GNOME and KDE both
 set `LockedHint` when they lock, but a session that never sets it looks
 permanently unlocked and nothing here can tell that apart from a screen nobody
 has locked. There is also nothing to read without logind — a container, or a
 plain `ssh` login — and the agent then logs that it is not watching instead of
-pretending to.
-
-On its own, though, a lock costs you a failed `ssh` afterwards — which is what
-the setting below is for, and why the two are usually turned on together.
+pretending to; the idle time below still applies.
 
 ### Being asked for the master password
 
 ```toml
-master_password = "prompt"     # or "touchid" on macOS
+master_password = "prompt"     # the default; or "touchid" on macOS
 ```
 
-`lpass` forgets its cached key on its own hourly timeout as readily as it does
-when a screen lock takes it away, and by default either one fails the next
-signature with *not logged in* until you re-authenticate by hand. With this on,
-the agent asks instead — **it prompts you for the master password itself**,
-which it does not do otherwise; see the security model above for how that is
-handled.
+When a signature finds the vault locked, the agent asks you for the master
+password itself — through whatever `confirm` already selects, so the prompt
+looks like every other one this agent shows — and holds the answer until the
+screen locks, the idle time passes or the agent stops. A dismissed prompt fails
+that signature and nothing else.
+
+There is no way to switch this off: an agent that could not open the vault
+would fail every signature after a screen lock, and any other value for
+`master_password` is refused at startup.
 
 ### Keeping it behind Touch ID
 
@@ -328,10 +374,13 @@ master_password = "touchid"      # macOS only
 lastpass-ssh-agent store-master-password
 ```
 
-The setup command locks the vault, asks once, checks that what you typed
-actually opens it, and keeps it only if it does — so a typo never becomes a
-stored credential, and setting it up proves the whole arrangement works rather
-than only that a password was typed.
+The setup command asks once, checks that what you typed actually opens the
+vault, and keeps it only if it does — so a typo never becomes a stored
+credential, and setting it up proves the whole arrangement works rather than
+only that a password was typed. To make that check possible it first ends the
+`lpass` agent your shell may have left running, since a vault that is already
+open would answer without the password ever being read; that is the one time
+this agent locks a vault it did not open.
 
 After that a locked vault costs a fingerprint instead of typing your master
 password. The password is encrypted to a key generated inside your Mac's
@@ -349,7 +398,9 @@ than appearing unexplained, so one you were not expecting is one you can refuse.
 
 The key is bound to the fingerprints enrolled when you set it up. Adding or
 removing one invalidates it by design, and the agent says so and falls back to
-asking until you run `store-master-password` again.
+asking until you run `store-master-password` again. A stored password that
+`lpass` rejects — you changed it, say — is likewise not asked for again until
+then.
 
 Two things it does not change. The confirmation dialog still runs, separately
 and unchanged, naming the key, fingerprint, requester and host — Touch ID
@@ -357,44 +408,26 @@ authorises opening the vault, never a signature. And until you have run
 `store-master-password`, or on a Mac with no Secure Enclave, or whenever the
 fingerprint is declined, it behaves exactly like `"prompt"`.
 
-Deliberately a separate setting from `lock_on_screen_lock`, and deliberately not
-macOS-only: nothing about being asked for a password is platform-specific, and
-the hourly expiry happens everywhere. The prompt looks like every other one this
-agent shows, since it uses whatever `confirm` already selects.
-
-Mechanically, `lpass` runs a password helper as a bare executable path with the
-prompt as its only argument — no shell, no room for a subcommand. So the agent
-writes a two-line wrapper into its own socket directory and points `lpass` at
-that; the wrapper runs `lastpass-ssh-agent askpass`, an ordinary subcommand you
-can see in `--help` and in `ps`. It is rewritten on every start, so an upgrade
-that moves the binary corrects itself. Run by hand it refuses, because the
-config it prompts from is named by an environment variable the agent sets.
-
-### How long the vault stays unlocked
-
-`lpass` keeps the key it derives for an hour by default. To shorten that:
-
-```toml
-vault_unlock_timeout_secs = 300
-```
-
-Two things are worth knowing. `0` means *never expire*, which is lpass's own
-encoding — it disables the timer rather than setting it to nothing. And the
-value only governs an `lpass` agent that **this** agent starts: whichever
-process runs `lpass` first fixes the timeout for that agent's lifetime, so a
-shell that has already used `lpass` keeps whatever it set.
-
-That is why `lastpass-ssh-agent env` prints it too:
+To stop keeping it:
 
 ```sh
-$ lastpass-ssh-agent env
-SSH_AUTH_SOCK='/Users/you/…/agent.sock'; export SSH_AUTH_SOCK;
-LPASS_AGENT_TIMEOUT='300'; export LPASS_AGENT_TIMEOUT;
+lastpass-ssh-agent forget-master-password
 ```
 
-If your shell profile already runs `eval "$(lastpass-ssh-agent env)"`, both
-your shells and the agent take the number from this one file — rather than you
-keeping it in `.zshrc` as well and the two drifting apart.
+Run that before switching back to `"prompt"`, so nothing stays at rest that
+the config does not name.
+
+### How long the master password is held
+
+```toml
+master_password_idle_secs = 3600     # the default; 0 means until lock or exit
+```
+
+Counted from the last signature that used it, not from when it was typed, so a
+busy hour never asks and a quiet one does. `0` keeps it until the screen locks
+or the agent stops — a deliberate footgun rather than one to forbid. Shorter
+values make each idle stretch cost a prompt; there is no reason to match it to
+anything `lpass` does, because nothing `lpass` does here outlives a call.
 
 ## Run
 
@@ -414,10 +447,31 @@ ssh github.com      # pops the confirmation dialog, then signs
 
 If you log out of LastPass while the agent runs, signatures fail with a
 clear log message; `lpass login` in any terminal and retry — the agent does
-not need a restart. (With
-[`master_password`](#being-asked-for-the-master-password) set, a vault
-that has only forgotten its key prompts you instead of failing; a real logout
-still needs `lpass login`.)
+not need a restart. A vault that is merely locked
+[prompts you](#being-asked-for-the-master-password) instead of failing.
+
+### Starting without the vault
+
+The agent writes the identities it serves — item ids, names and public keys,
+nothing secret — to `agent.sock.identities` beside the socket. The next start
+reads that instead of the vault, so it binds at once whether the vault is open
+or not, and the vault is opened only when a signature needs it. So only the
+very first start reads the vault, and every start after it asks for nothing:
+nothing but signing touches the vault. A first start that finds the vault
+locked asks for the master password like a signature would; one that cannot
+ask — no prompt it can show, or no login — fails and says so. Under a service
+manager that would be a restart loop, so run `list` once with the vault open
+before enabling the service: it writes the same file.
+
+After a signature succeeds the agent refreshes its set and the file in the
+background, at most once an hour — so a key added to the vault appears on the
+first signature that falls outside that hour, without a restart. A start does
+the same if the vault is open at the time. A new key cannot announce itself, so
+if nothing is signing with an existing key and the vault is locked: unlock it,
+run `list`, which rewrites the file, and restart. A running agent keeps its own
+set until its next refresh. A signature that finds the vault contradicting the file — a key
+rotated inside its item, or the item gone — discards it, and the next start reads
+the vault again. `doctor` reports what is written down.
 
 ### Start automatically
 
@@ -432,7 +486,10 @@ Do **not** use `sudo brew services`: as a system daemon the agent has no GUI
 session, so every confirmation prompt fails closed and nothing is ever
 signed. On Linux a background service also has no terminal, so the default
 `tty` confirmation cannot work — set `confirm = "askpass"` with a helper such
-as `/usr/bin/ssh-askpass` before starting it.
+as `/usr/bin/ssh-askpass` before starting it. And before the first start as
+a service, run `lastpass-ssh-agent list` once with the vault open: that
+writes the identities down, so the service never has to read the vault at
+startup (see [Starting without the vault](#starting-without-the-vault)).
 
 <details>
 <summary>Managing launchd yourself instead</summary>
@@ -460,8 +517,10 @@ as `/usr/bin/ssh-askpass` before starting it.
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
+  <!-- your own directory, not /tmp: a log in a shared directory can be
+       pre-created by another user, and the agent's names what you sign with -->
   <key>StandardErrorPath</key>
-  <string>/tmp/lastpass-ssh-agent.log</string>
+  <string>/Users/you/Library/Logs/lastpass-ssh-agent.log</string>
 </dict>
 </plist>
 ```
@@ -489,10 +548,39 @@ another agent.
 
 | mode | behavior |
 |---|---|
-| `osascript` (macOS default) | Native dialog: key name, fingerprint, requesting process (pid/uid via the socket's peer credentials), and the bound host. Deny is default + cancel; expiry = Deny; no GUI session = Deny. Vault-sourced strings are passed as AppleScript *arguments*, never spliced into code. |
+| `osascript` (macOS default) | Native dialog: key name, fingerprint, requesting process (pid/uid via the socket's peer credentials) and what it was started from, and the bound host. Deny is default + cancel; expiry = Deny; no GUI session = Deny. Vault-sourced strings are passed as AppleScript *arguments*, never spliced into code. |
 | `tty` (Linux default) | Prompt on the agent's own `/dev/tty`; type `yes` to approve. |
 | `askpass` | Runs the program in `askpass` with the prompt as its argument; exit 0 approves. `SSH_ASKPASS_PROMPT=confirm` is set, so OpenSSH-compatible helpers show a yes/no dialog rather than their password prompt — without it, clicking OK would approve whatever was typed. |
 | `off` | No confirmation (socket permissions are then your only guard, as with stock ssh-agent). |
+
+### Remembering approvals
+
+```toml
+remember_approvals = true
+```
+
+With this on, approving a signature answers the same question the next time
+it is asked — the same key, for the same process started from the same chain,
+bound to the same hosts — until the vault locks: the screen locks, the master
+password goes unused for `master_password_idle_secs`, the agent has to ask for
+it again for any reason, or the agent stops. (A vault your shell unlocked
+expires without telling the agent; the request that finds it locked asks for
+the master password, and approvals end there.) A
+`git push` from your editor then costs one prompt per unlock rather than one
+per push.
+
+Off by default, because the trade is real: while an approval stands, anything
+able to drive that application can sign with that key unasked — and what a
+request "was started from" is what the kernel reports about a process running
+as you, which a process running as you can arrange. The prompt itself is
+unchanged, and a request that differs in any of the words it shows — another
+key, another host, another place it was started from — asks again.
+
+One limit: a vault your shell keeps open is outside the agent's view. It sees
+that vault lock only when a request of its own has to ask for the master
+password, so a shell that locks and reopens the vault between two requests
+does not end approvals given before it. If that matters, let the agent do the
+unlocking — do not run `lpass` yourself — and every lock is one it sees.
 
 ## Notes & limitations
 
@@ -503,9 +591,8 @@ another agent.
   field empty is what buys the separation; see [Keeping the passphrase out of
   the vault](#keeping-the-passphrase-out-of-the-vault).
 - **Secret prompts share `confirm_timeout_secs`** (30s by default) — the key
-  passphrase and, with a `master_password` source, the master password. Generous
-  for pressing a button, tight for typing a long secret; raise it if entry keeps
-  timing out.
+  passphrase and the master password. Generous for pressing a button, tight for
+  typing a long secret; raise it if entry keeps timing out.
 - **Suspending a `tty` passphrase prompt leaves the terminal with echo off.**
   Ctrl-Z skips the cleanup a timeout or cancellation runs, so the shell comes
   back not showing what you type and anything half-typed stays queued for it.
@@ -534,21 +621,35 @@ another agent.
 - Item lookups use the LastPass **item id**, not the name, so renames are
   safe and duplicate names are ambiguity-free. If the vault item's key is
   edited while the agent runs, the agent notices the public-key mismatch and
-  refuses to sign until restarted.
-- In auto-discovery mode, an SSH Key item added to the vault is served after
-  the next agent restart (discovery runs once at startup). Pin `[[keys]]` if
-  you want new vault items to require an explicit opt-in instead.
-- With `lock_on_screen_lock`, the vault reopens on the first signature that
-  needs it and stays open until the next lock or `vault_unlock_timeout_secs` —
-  the lock bounds exposure, it does not make each signature cost a password.
-  With `master_password = "off"`, that first signature fails rather than
-  prompting.
+  refuses to sign with it; the next refresh, or a restart, serves the new
+  key.
+- In auto-discovery mode, an SSH Key item added to the vault — or shared with
+  you — is served after the next refresh (see [Starting without the
+  vault](#starting-without-the-vault)). Pin `[[keys]]` if you want new vault
+  items to require an explicit opt-in instead.
+- **More than six keys can fail against a server.** `ssh` offers every
+  identity the agent has, in turn, and `sshd` refuses after `MaxAuthTries`
+  failed attempts — six by default — with *Too many authentication
+  failures*. So a host whose key is offered seventh or later is refused,
+  while one whose key comes up earlier works, and which is which depends on
+  the order the agent lists them in. Pin a few in `[[keys]]`, or tell `ssh`
+  which key a host takes with `IdentitiesOnly yes` and an `IdentityFile`
+  pointing at its public key in `ssh_config`. `doctor` says so when the set
+  is that large.
+- The vault is asked for the master password by the first signature that
+  needs it, and stays open to this agent until the next screen lock or
+  `master_password_idle_secs` of disuse — the lock bounds exposure, it does not
+  make each signature cost a password. A shell where you ran `lpass` yourself
+  keeps the vault open machine-wide for the hour `lpass` gives it; this agent
+  neither extends nor cuts that.
 - Auto-discovery costs one `lpass` call per vault item, eight at a time:
   `lpass ls` reports names and ids but not the note type, so every item has to
   be asked. A few hundred items are quick; a few thousand are most of a minute
-  at startup, before the socket exists. The agent logs how many it is about to
-  probe. **Pinning `[[keys]]` skips discovery entirely** and is worth it on a
-  large vault — `lastpass-ssh-agent search` prints the snippets.
+  on the first start, before the socket exists — later starts bind from what
+  that one wrote down and scan in the background. The agent logs how many it
+  is about to probe. **Pinning `[[keys]]` skips discovery entirely** and is
+  worth it on a large vault — `lastpass-ssh-agent search` prints the
+  snippets.
 - `tests/fixtures/` contains throwaway SSH keypairs used by the test suite
   only. They protect nothing and must never be authorized anywhere.
 
@@ -588,6 +689,16 @@ therefore leaves a discardable draft rather than a tag pointing at a release
 that was never finished, and because `resolve-release.yml` counts drafts too,
 the abandoned number is not handed out again.
 
+Before the draft is created, the publish job attests the archives with
+`actions/attest-build-provenance`: a signed statement, recorded by GitHub
+against each archive's digest, that this repository's workflow built it from
+this commit. That is what `gh attestation verify` checks at install time, and
+it is the one thing in the pipeline that a checksum cannot replace — the
+`.sha256` files are produced by the same job that produces the archives, so
+anything able to swap one can swap the other. The attestation is signed with
+a short-lived certificate issued to the workflow run itself (`id-token:
+write`), so there is no key to keep.
+
 `publish-homebrew-formula.yml` runs last, once the release is published: it
 generates the formula with `packaging/homebrew/generate-formula.sh` from the
 checksums attached to the release, and those URLs do not resolve while the
@@ -607,8 +718,9 @@ ssh-keygen -t ed25519 -N "" -C "lastpass-ssh-agent tap" -f tap-deploy-key
   policy to `master`
 
 This is the pipeline's only credential — everything else runs on the built-in
-`GITHUB_TOKEN`, and the tap needs a key of its own solely because it is a
-different repository, which that token cannot write to.
+`GITHUB_TOKEN` and the run's own OIDC identity, and the tap needs a key of its
+own solely because it is a different repository, which that token cannot write
+to.
 
 A deploy key rather than a personal access token because it is bound to that
 one repository, belongs to no user account, and does not expire. An
@@ -639,12 +751,19 @@ version is tracked as precisely as its own format allows:
   all; a floating major tag stays silent until the next major. Digests are
   deliberately not pinned (`"pinDigests": false`) — an exact tag is specific
   enough to track and stays readable.
+- **The stable toolchain is one version in three places**: `rust:<version>-slim`
+  in the Dockerfile, `dtolnay/rust-toolchain@<version>` in the workflows, and
+  `rust-version` in `Cargo.toml`. Renovate moves all three in a single pull
+  request (a regex manager in `renovate.json` reads the latter two against the
+  `rust` image tags), so the local gate and CI always run the same compiler, a
+  new release's lints arrive as a reviewed change rather than as a red build,
+  and the minimum version the crate claims is the one that is actually built.
 Two things are deliberately not tracked, because a version is the wrong
 thing to pin:
 
-- **`dtolnay/rust-toolchain@stable` and `@nightly`** are branch references,
-  not versions. The point is to compile against whatever those resolve to
-  today, which is also what the dev container does.
+- **`dtolnay/rust-toolchain@nightly`** is a branch reference, not a version.
+  It only runs the coverage build, and the point is to instrument with
+  whatever nightly is today.
 - **The `tool:` inputs to `taiki-e/install-action`** name `cargo-audit` and
   `cargo-llvm-cov` without versions, matching how the dev container fetches
   them. Pinning one side only would let CI and the container drift apart.

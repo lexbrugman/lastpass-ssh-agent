@@ -84,7 +84,7 @@ The code already works this way, and these are the patterns to copy:
   stopped at and the system's own error code, and nothing else; which stage
   means "ask again", which means "seed again" and which is a fault, along with
   the format the key blob is written in, are all decided in `enclave.rs` and
-  tested on Linux as well as macOS. `askpass/enclave.rs` is three foreign calls
+  tested on Linux as well as macOS. `master/enclave.rs` is three foreign calls
   and no judgement.
 
 If a `cfg` block contains a branch, a loop, or an error decision, it is
@@ -164,9 +164,14 @@ Private keys and passphrases follow the same discipline.
 - A secret never appears in a log, a tracing field, argv, an environment
   variable, a temporary file, or an error message. Fingerprints, item ids and
   key names are safe context; prefer them.
-- Nothing is cached. Every signature fetches the key, resolves the passphrase,
-  decrypts, signs, and drops both. There is no decrypted-key cache and no
-  passphrase cache, and adding either is out of scope by design.
+- No key and no passphrase is cached. Every signature fetches the key,
+  resolves the passphrase, decrypts, signs, and drops both; adding a cache for
+  either is out of scope by design. The one secret held between signatures is
+  the master password, in `crate::unlock` and nowhere else: because `lpass`
+  accepts nothing but the password, holding it is what keeps the vault from
+  being left open machine-wide by an `lpass` agent. It is dropped when the screen locks, when it has gone unused
+  for the configured idle time, when `lpass` rejects it, and when the agent
+  exits.
 - Strip exactly one trailing line ending from subprocess output, never more: a
   secret may legitimately end in whitespace.
 
@@ -263,6 +268,11 @@ Four invariants hold it together, and each is load-bearing:
   a run that dies partway leaves something discardable rather than a tag
   pointing at a release that was never finished. `resolve-release.yml` counts
   drafts for exactly this reason.
+- **The archives are attested before the draft exists.** The `.sha256` beside
+  each archive comes from the same job as the archive and proves nothing
+  about who built it; the attestation is what `gh attestation verify` checks,
+  and it needs `id-token: write` and `attestations: write` on the publish job
+  — granted in `ci.yml`, since a called workflow cannot raise what it is given.
 - **The formula is published last.** It points at the release's download URLs,
   which do not resolve until the release leaves draft.
 - **The archive's shape is a contract**, and one nothing notices breaking until
@@ -293,8 +303,9 @@ log`, which is built for it and which nobody has to read by accident.
 and the reason it fails is expensive to rediscover.
 
 - Worth it: why the master password is not a Keychain item (someone will try
-  it, and the answer is an entitlement that takes a day to find); why `install`
-  does not use `files::open_regular` (the two look interchangeable); why the
+  it, and the answer is an entitlement that takes a day to find); why
+  `LPASS_AGENT_DISABLE` is set only on a call fed a password (the man page
+  reads as if it would stop the unfed probe too); why the
   Swift language mode is pinned to 5 when the shim passes 6 (says when to
   raise it).
 - Not worth it: which error variant this used to be, which helper this was

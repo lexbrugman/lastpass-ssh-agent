@@ -7,9 +7,10 @@ use ssh_agent_lib::proto::{Extension, Identity, Request, Response, SignRequest};
 use ssh_key::{PrivateKey, Signature};
 use zeroize::Zeroizing;
 
+use crate::approvals::{Answer, Approvals};
 use crate::confirm::{ConfirmContext, Confirmer, Decision, PeerInfo, SessionBinding};
 use crate::interaction::InteractionGate;
-use crate::keystore::{KeyEntry, KeyStore};
+use crate::keystore::{KeyEntry, Served};
 use crate::lpass::LpassClient;
 use crate::passphrase::Unlocker;
 use crate::signing;
@@ -20,9 +21,18 @@ use crate::signing;
 /// Cloned once per client connection; shared state lives behind `Arc`s.
 #[derive(Clone)]
 pub struct LpassAgent {
-    store: Arc<KeyStore>,
+    store: Served,
+    /// Fed only the master password already held, so a fetch through it can
+    /// never put a prompt on screen — and never needs the interaction gate.
     lpass: Arc<dyn LpassClient>,
+    /// The same vault, asking for the master password when it finds the vault
+    /// locked. Reached only after `lpass` has reported exactly that, and only
+    /// under the gate, since asking is an interaction like any other.
+    asking: Arc<dyn LpassClient>,
     confirmer: Arc<dyn Confirmer>,
+    /// What has been approved since the vault last locked, when remembering
+    /// is on.
+    approvals: Arc<Approvals>,
     /// Decrypts the fetched key, resolving a passphrase the vault does not
     /// hold. Reached only for an encrypted key.
     unlocker: Arc<Unlocker>,
@@ -42,6 +52,12 @@ pub struct LpassAgent {
     /// Hosts this connection has bound itself to, oldest hop first. Per
     /// connection: a fresh session starts with none.
     bindings: Vec<SessionBinding>,
+    /// The file the served identities may have been read from, so a signature
+    /// that finds the vault contradicting it can discard it.
+    remembered: Option<std::path::PathBuf>,
+    /// Told after every signature that succeeds, since that is the moment the
+    /// vault is known to be reachable.
+    refresher: Option<Arc<crate::refresh::Refresher>>,
 }
 
 /// A forwarded connection is driven by whoever holds the far end, and they
@@ -50,9 +66,21 @@ pub struct LpassAgent {
 /// without bound. OpenSSH's agent uses the same limit.
 const MAX_SESSION_BINDINGS: usize = 16;
 
+/// A session id is a key-exchange hash, at most 64 bytes; OpenSSH's agent
+/// allows twice that. Kept for the connection's life, so bounded, or a peer
+/// could fill memory one signed binding at a time.
+const MAX_SESSION_ID_BYTES: usize = 128;
+
+/// A host key is a few hundred bytes, and a certificate over one a few
+/// kilobytes even listing every name the host answers to; this allows far
+/// more. Kept for the connection's life as the session id is, and a
+/// certificate's text fields are the peer's to fill, so without a cap the
+/// binding limit would bound nothing.
+const MAX_HOST_KEY_BYTES: usize = 64 * 1024;
+
 impl LpassAgent {
     pub fn new(
-        store: Arc<KeyStore>,
+        store: Served,
         lpass: Arc<dyn LpassClient>,
         confirmer: Arc<dyn Confirmer>,
         unlocker: Arc<Unlocker>,
@@ -60,14 +88,50 @@ impl LpassAgent {
     ) -> Self {
         Self {
             store,
+            asking: lpass.clone(),
             lpass,
             confirmer,
+            approvals: Arc::new(Approvals::off()),
             unlocker,
             host_names,
             interaction: Arc::new(tokio::sync::Mutex::new(())),
             peer: None,
             bindings: Vec::new(),
+            remembered: None,
+            refresher: None,
         }
+    }
+
+    /// The client to reach for when the vault turns out locked; see `asking`.
+    #[must_use]
+    pub fn with_asking(mut self, asking: Arc<dyn LpassClient>) -> Self {
+        self.asking = asking;
+        self
+    }
+
+    /// Remember approvals until the vault locks; see `approvals`.
+    #[must_use]
+    pub fn with_approvals(mut self, approvals: Arc<Approvals>) -> Self {
+        self.approvals = approvals;
+        self
+    }
+
+    /// Keep the served set current between starts; see `refresh`.
+    #[must_use]
+    pub fn with_refresher(mut self, refresher: Arc<crate::refresh::Refresher>) -> Self {
+        self.refresher = Some(refresher);
+        self
+    }
+
+    /// Name the file an earlier start wrote the identities to.
+    ///
+    /// Not whether this start was served from it: a start that scanned wrote
+    /// the same file, and a rotation after that would strand the next start on
+    /// it just the same.
+    #[must_use]
+    pub fn with_remembered_file(mut self, path: std::path::PathBuf) -> Self {
+        self.remembered = Some(path);
+        self
     }
 
     pub fn with_peer(&self, peer: Option<PeerInfo>) -> Self {
@@ -86,6 +150,13 @@ impl LpassAgent {
     /// unverifiable binding is refused rather than displayed. (Refusing does
     /// not lock the connection down: an attacker would simply send no
     /// binding at all, so there is nothing to gain by poisoning it.)
+    ///
+    /// Decoded by `signing::session_bind` rather than the library's type,
+    /// which reads the host key as a plain key: a host with a certificate
+    /// sends the certificate, and `ssh` treats a refused binding as nothing
+    /// worse than a debug line — so the connection would carry on unbound,
+    /// and a request relayed over it would show neither the hop nor the
+    /// forwarding warning.
     fn handle_extension(&mut self, extension: &Extension) -> Response {
         // A client may ask what we support before using anything. Answering
         // matters: one that negotiates this way would otherwise never send a
@@ -97,21 +168,75 @@ impl LpassAgent {
             })
             .map_or(Response::Failure, Response::ExtensionResponse);
         }
-        let bind = match extension.parse_message::<SessionBind>() {
-            Ok(Some(bind)) => bind,
-            // some other vendor extension: unsupported, as advertised
-            Ok(None) => {
-                tracing::debug!(extension = %extension.name, "refusing unsupported extension");
-                return Response::Failure;
-            }
+        // some other vendor extension: unsupported, as advertised
+        if extension.name != SessionBind::NAME {
+            tracing::debug!(extension = %extension.name, "refusing unsupported extension");
+            return Response::Failure;
+        }
+        let Some(bind) = signing::session_bind(extension.details.as_ref()) else {
+            tracing::warn!("refusing a malformed session binding");
+            return Response::Failure;
+        };
+        if bind.session_id.len() > MAX_SESSION_ID_BYTES {
+            tracing::warn!(
+                "refusing a session binding whose session id is longer than any key exchange \
+                 produces"
+            );
+            return Response::Failure;
+        }
+        if bind.host_key.len() > MAX_HOST_KEY_BYTES {
+            tracing::warn!(
+                "refusing a session binding whose host key is larger than any host sends"
+            );
+            return Response::Failure;
+        }
+        let host_key = match signing::bound_host_key(&bind) {
+            Ok(host_key) => host_key,
             Err(e) => {
-                tracing::warn!(extension = %extension.name,
-                    "refusing malformed session binding: {e}");
+                tracing::warn!("refusing a session binding: {e}");
                 return Response::Failure;
             }
         };
-        if let Err(e) = bind.verify_signature() {
-            tracing::warn!("refusing a session binding whose host signature does not verify: {e}");
+        // OpenSSH's own rules for what may follow a binding. A hop that is
+        // not forwarding the agent is the connection's destination, and
+        // nothing binds after it. A binding seen before — the same host key
+        // for the same session — is a replay and changes nothing. The same
+        // session under another key is a peer rewriting the chain, and is
+        // refused. A key seen before with a new session is a new connection
+        // to a host already on the chain, and is appended like any other hop
+        // (OpenSSH's `process_ext_session_bind` does the same): one wildcard
+        // host certificate serves many hosts under one key, and `ssh -A a`
+        // then `ssh a` is a chain of two. Replaying a retained
+        // binding this way buys a peer nothing: what it moves the connection
+        // to is a signature good only for that session with that host, which
+        // the same peer could have by connecting to that host afresh — and
+        // the prompt names the host and warns of the forwarding either way.
+        if self.bindings.last().is_some_and(|last| !last.is_forwarding) {
+            tracing::warn!(
+                "refusing a session binding: this connection is already bound to its \
+                 destination"
+            );
+            return Response::Failure;
+        }
+        let host_fingerprint = host_key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+        // Compared as the bytes the host sent, not by fingerprint: two
+        // certificates over one key are two host keys, and a request bound
+        // to the second has to find the second recorded.
+        if self
+            .bindings
+            .iter()
+            .any(|seen| seen.host_key == bind.host_key && seen.session_id == bind.session_id)
+        {
+            return Response::Success;
+        }
+        if self
+            .bindings
+            .iter()
+            .any(|seen| seen.session_id == bind.session_id)
+        {
+            tracing::warn!(
+                "refusing a session binding: this session is already bound to another host key"
+            );
             return Response::Failure;
         }
         if self.bindings.len() >= MAX_SESSION_BINDINGS {
@@ -121,18 +246,6 @@ impl LpassAgent {
             );
             return Response::Failure;
         }
-        let host_fingerprint = bind
-            .host_key
-            .fingerprint(ssh_key::HashAlg::Sha256)
-            .to_string();
-        // a repeated hop tells the user nothing new
-        if self
-            .bindings
-            .iter()
-            .any(|seen| seen.host_fingerprint == host_fingerprint)
-        {
-            return Response::Success;
-        }
         tracing::debug!(host = %host_fingerprint, forwarding = bind.is_forwarding,
             "session bound");
         self.bindings.push(SessionBinding {
@@ -140,6 +253,8 @@ impl LpassAgent {
             // Named when a signature is actually asked for; see `host_names`.
             host_name: None,
             is_forwarding: bind.is_forwarding,
+            session_id: bind.session_id.to_vec(),
+            host_key: bind.host_key.to_vec(),
         });
         Response::Success
     }
@@ -164,27 +279,73 @@ impl LpassAgent {
         bindings
     }
 
+    /// The vault has just contradicted what this agent advertises for one item,
+    /// so a file that would advertise it again at the next start is discarded.
+    ///
+    /// Only the vault's own verdicts reach here — a different key, or no key —
+    /// never its unavailability: a locked vault or a timeout says nothing about
+    /// the file, which would then be right and thrown away for nothing.
+    fn discard_remembered(&self, item_id: &str, why: &str) {
+        let Some(path) = &self.remembered else {
+            return;
+        };
+        crate::identities::remove(path).unwrap_or_else(could_not_discard);
+        tracing::warn!(item = %item_id, path = %path.display(),
+            "{why}, so the remembered identities were discarded — restart the agent to \
+             serve what the vault holds");
+    }
+
+    /// The private key's bytes from the vault, and whether the vault had to
+    /// be asked for the master password on the way.
+    async fn fetch_private_key(&self, entry: &KeyEntry, gate: &mut InteractionGate) -> Fetch {
+        // Through the client that cannot prompt first, and without the gate:
+        // with the password held, or the vault open in a shell, this is the
+        // whole fetch, and requests that never reach the user run side by
+        // side. Only a vault found locked reaches for the client that asks —
+        // under the gate, because a master-password prompt is an interaction
+        // like any other, and the gate is what keeps it off a screen another
+        // request's dialog is on.
+        match self.lpass.show_field(&entry.item_id, "Private Key").await {
+            Err(crate::lpass::LpassError::Locked) => {
+                gate.enter().await;
+                // With the gate held, an ask counted here can only be this
+                // request's own.
+                let before = self.approvals.unlocks();
+                let key = self.asking.show_field(&entry.item_id, "Private Key").await;
+                Fetch {
+                    key,
+                    asked: self.approvals.unlocks() != before,
+                }
+            }
+            key => Fetch { key, asked: false },
+        }
+    }
+
     /// Everything that touches the private key, in one place.
-    async fn fetch_and_sign(
+    async fn sign_with(
         &self,
         entry: &KeyEntry,
+        fetched: Result<Zeroizing<Vec<u8>>, crate::lpass::LpassError>,
         data: &[u8],
         flags: u32,
         gate: &mut InteractionGate,
     ) -> Result<Signature, String> {
-        // A fetch can itself put a prompt on screen: with the vault locked to
-        // the screen, lpass asks for the master password through a helper of
-        // ours. That is an interaction like any other, and it arrives from
-        // inside a subprocess where the gate cannot reach it — so the gate is
-        // taken here, before the call, rather than after the fact.
-        if self.lpass.may_prompt() {
-            gate.enter().await;
-        }
-        let pem: Zeroizing<Vec<u8>> = self
-            .lpass
-            .show_field(&entry.item_id, "Private Key")
-            .await
-            .map_err(|e| format!("fetching private key: {e}"))?;
+        let pem: Zeroizing<Vec<u8>> = match fetched {
+            Ok(pem) => pem,
+            Err(e) => {
+                // Absence is the vault's verdict on the key, where a locked vault
+                // or a timeout is only the vault being unavailable and says
+                // nothing about it.
+                if matches!(
+                    e,
+                    crate::lpass::LpassError::ItemNotFound(_)
+                        | crate::lpass::LpassError::FieldNotFound { .. }
+                ) {
+                    self.discard_remembered(&entry.item_id, "the vault no longer holds this key");
+                }
+                return Err(format!("fetching private key: {e}"));
+            }
+        };
         if pem.is_empty() {
             return Err("item has an empty Private Key field".into());
         }
@@ -202,6 +363,10 @@ impl LpassAgent {
         // saving that passphrase over the one belonging to the key still being
         // advertised.
         if key.public_key().key_data() != entry.public.key_data() {
+            self.discard_remembered(
+                &entry.item_id,
+                "the vault's key no longer matches the advertised one",
+            );
             return Err("private key does not match the advertised public key — vault item changed since startup?".into());
         }
 
@@ -217,6 +382,94 @@ impl LpassAgent {
         signing::sign_with_key(&key, data, flags).map_err(|e| e.to_string())
         // `key` (and the encrypted original) zeroize on drop here.
     }
+
+    /// The user's answer for this request: remembered, or asked for now.
+    ///
+    /// A denial ends the request here.
+    async fn approval_for(
+        &self,
+        entry: &KeyEntry,
+        gate: &mut InteractionGate,
+    ) -> Result<Answer, AgentError> {
+        // The host lookup first: it can wait on the filesystem, and nothing
+        // about it needs the user, so no other request should stand behind it.
+        let bindings = self.named_bindings().await;
+        let mut ctx = ConfirmContext::new(entry, self.peer, bindings);
+        let mut question = crate::confirm::approval_question(&ctx);
+        let remembered = |question: &Option<String>| {
+            question
+                .as_deref()
+                .and_then(|question| self.approvals.remembered_in(question))
+        };
+        // Asked again once the gate is held: a second request with the same
+        // question, arriving while the first was on screen, would otherwise
+        // put a second prompt up for an answer just given. The context is
+        // rebuilt there too, so what the prompt shows and what is remembered
+        // are one snapshot of the requester, taken now rather than before
+        // the wait. A request answered from memory takes no gate here, and
+        // the one wait it can still meet — the vault turning out locked
+        // under it — voids that answer when the request settles.
+        let mut answered = remembered(&question);
+        if answered.is_none() {
+            gate.enter().await;
+            ctx = ConfirmContext::new(entry, self.peer, ctx.bindings);
+            question = crate::confirm::approval_question(&ctx);
+            answered = remembered(&question);
+        }
+        if let Some(epoch) = answered {
+            tracing::info!(item = %entry.item_id, key = %entry.name,
+                "signature approved as before, for the same requester and hosts");
+            return Ok(Answer::Remembered(epoch));
+        }
+        match self.confirmer.confirm(&ctx).await {
+            Decision::Approve => Ok(Answer::Given {
+                question,
+                epoch: self.approvals.epoch(),
+            }),
+            Decision::Deny => {
+                // Not "denied by user": a prompt that could not be shown
+                // denies too, and claiming a refusal that never happened
+                // sends whoever reads this looking in the wrong place. The
+                // confirmer has just logged which it was.
+                tracing::info!(item = %entry.item_id, key = %entry.name,
+                    "signature denied");
+                Err(AgentError::Failure)
+            }
+        }
+    }
+}
+
+/// A public key that parsed cannot fail to encode, so this is excluded from
+/// coverage rather than pretended testable; an empty encoding matches no
+/// request, which refuses the signature.
+/// (`unwrap_or_else` dictates the by-value signature.)
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "unwrap_or_else requires FnOnce(ssh_key::Error)"
+)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn unencodable(e: ssh_key::Error) -> Vec<u8> {
+    tracing::warn!("cannot encode the advertised public key: {e}");
+    Vec::new()
+}
+
+/// What fetching a private key came to.
+struct Fetch {
+    key: Result<Zeroizing<Vec<u8>>, crate::lpass::LpassError>,
+    /// Whether the vault had to be asked for the master password, answered
+    /// or not — a lock this agent has not otherwise seen.
+    asked: bool,
+}
+
+/// Removing a file the agent itself wrote cannot fail in practice, so the edge
+/// is excluded from coverage rather than pretended testable.
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "by value is what unwrap_or_else hands a function"
+)]
+fn could_not_discard(e: crate::error::Error) {
+    tracing::warn!("could not discard the remembered identities: {e}");
 }
 
 #[ssh_agent_lib::async_trait]
@@ -251,6 +504,7 @@ impl Session for LpassAgent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
         Ok(self
             .store
+            .current()
             .entries()
             .map(|entry| Identity {
                 credential: entry.public.key_data().clone().into(),
@@ -271,36 +525,71 @@ impl Session for LpassAgent {
         // `InteractionGate`.
         let mut gate = InteractionGate::new(self.interaction.clone());
 
+        // One snapshot for the whole request: a refresh landing mid-signature
+        // must not change which key this is about.
+        let store = self.store.current();
         let key_data = request.credential.key_data();
-        let Some(entry) = self.store.lookup(key_data) else {
+        let Some(entry) = store.lookup(key_data) else {
             tracing::warn!("sign request for a key this agent does not hold");
             return Err(AgentError::Failure);
         };
 
-        if entry.confirm {
-            let ctx = ConfirmContext::new(entry, self.peer, self.named_bindings().await);
-            gate.enter().await;
-            match self.confirmer.confirm(&ctx).await {
-                Decision::Approve => {}
-                Decision::Deny => {
-                    // Not "denied by user": a prompt that could not be shown
-                    // denies too, and claiming a refusal that never happened
-                    // sends whoever reads this looking in the wrong place. The
-                    // confirmer has just logged which it was.
-                    tracing::info!(item = %entry.item_id, key = %entry.name,
-                        "signature denied");
+        // On a bound connection, what is signed has to be a userauth request
+        // for the session bound last — OpenSSH's own rule. A binding is a
+        // host's signature over a session id, replayable by anyone who has
+        // ever connected to that host, so without this a request for one host
+        // could wear another's binding and the prompt would name the wrong
+        // host; and data that is not a userauth request at all is not what
+        // `ssh` sends on a bound connection.
+        if let Some(bound) = self.bindings.last() {
+            let public_key = entry.public.to_bytes().unwrap_or_else(unencodable);
+            match signing::userauth_session_id(&request.data, &public_key, &bound.host_key) {
+                Some(session_id) if session_id == bound.session_id => {}
+                Some(_) => {
+                    tracing::warn!(item = %entry.item_id, key = %entry.name,
+                        host = %bound.host_fingerprint,
+                        "refusing to sign: the request is for a session other than the one \
+                         this connection is bound to");
+                    return Err(AgentError::Failure);
+                }
+                None => {
+                    tracing::warn!(item = %entry.item_id, key = %entry.name,
+                        "refusing to sign: a bound connection asked for something other than \
+                         a userauth request");
                     return Err(AgentError::Failure);
                 }
             }
         }
 
-        match self
-            .fetch_and_sign(entry, &request.data, request.flags, &mut gate)
-            .await
-        {
+        let answer = if entry.confirm {
+            self.approval_for(entry, &mut gate).await?
+        } else {
+            Answer::NotNeeded
+        };
+
+        let fetch = self.fetch_private_key(entry, &mut gate).await;
+        let signed = self
+            .sign_with(entry, fetch.key, &request.data, request.flags, &mut gate)
+            .await;
+        let voided = self
+            .approvals
+            .settle(answer, fetch.asked, signed.is_ok())
+            .is_err();
+        match signed {
+            // A signature that failed says why; an answer voided under it is
+            // beside the point.
+            Ok(_) if voided => {
+                tracing::warn!(item = %entry.item_id, key = %entry.name,
+                    "the vault locked during this request, so the remembered approval no \
+                     longer covers it — retry, and confirm");
+                Err(AgentError::Failure)
+            }
             Ok(signature) => {
                 tracing::info!(item = %entry.item_id, key = %entry.name,
                     algorithm = %signature.algorithm(), "signature issued");
+                if let Some(refresher) = &self.refresher {
+                    refresher.after_signature();
+                }
                 Ok(signature)
             }
             Err(reason) => {
@@ -319,6 +608,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::confirm::NoConfirmer;
+    use crate::keystore::KeyStore;
     use crate::lpass::mock::MockLpass;
     use crate::passphrase::{NoPrompt, PassphrasePrompt, PassphraseRequest, PromptError};
     use signature::Verifier;
@@ -355,13 +645,7 @@ mod tests {
         }
     }
 
-    const ED25519: &str = include_str!("../tests/fixtures/ed25519");
-    const ED25519_PUB: &str = include_str!("../tests/fixtures/ed25519.pub");
-    const ED25519_PW: &str = include_str!("../tests/fixtures/ed25519_pw");
-    const ED25519_PW_PUB: &str = include_str!("../tests/fixtures/ed25519_pw.pub");
-    const RSA_PUB: &str = include_str!("../tests/fixtures/rsa.pub");
-    const ECDSA: &str = include_str!("../tests/fixtures/ecdsa");
-    const ECDSA_PUB: &str = include_str!("../tests/fixtures/ecdsa.pub");
+    use crate::testutil::fixtures::*;
 
     fn init_tracing() {
         let _ = tracing_subscriber::fmt()
@@ -380,22 +664,26 @@ mod tests {
         keys_toml: &str,
         prompt: Arc<dyn PassphrasePrompt>,
     ) -> LpassAgent {
+        agent_over(Arc::new(client), keys_toml, Arc::new(NoConfirmer), prompt).await
+    }
+
+    /// An agent serving the keys `config` names, loaded from and signing
+    /// through `vault`, confirming and asking for passphrases as given.
+    async fn agent_over(
+        vault: Arc<dyn LpassClient>,
+        config: &str,
+        confirmer: Arc<dyn Confirmer>,
+        prompt: Arc<dyn PassphrasePrompt>,
+    ) -> LpassAgent {
         init_tracing();
-        let config: Config = toml::from_str(keys_toml).unwrap();
-        let client = Arc::new(client);
-        let store = Arc::new(
-            KeyStore::load(&*client, &config.keys, &config)
+        let config: Config = toml::from_str(config).unwrap();
+        let store = Served::new(
+            KeyStore::load(vault.as_ref(), &config.keys, &config)
                 .await
                 .unwrap(),
         );
-        let unlocker = Arc::new(Unlocker::new(client.clone(), prompt));
-        LpassAgent::new(
-            store,
-            client,
-            Arc::new(NoConfirmer),
-            unlocker,
-            no_host_names(),
-        )
+        let unlocker = Arc::new(Unlocker::new(vault.clone(), prompt));
+        LpassAgent::new(store, vault, confirmer, unlocker, no_host_names())
     }
 
     /// No `known_hosts` at all. Every binding then shows its fingerprint, so
@@ -410,6 +698,36 @@ mod tests {
     /// `LpassAgent::new` call sites.
     fn unlocking(client: &Arc<MockLpass>, prompt: Arc<dyn PassphrasePrompt>) -> Arc<Unlocker> {
         Arc::new(Unlocker::new(client.clone(), prompt))
+    }
+
+    /// What `ssh` asks the agent to sign on a bound connection: a userauth
+    /// request for `session_id` with `public`.
+    fn userauth(session_id: &[u8], public: &str) -> Vec<u8> {
+        userauth_to(session_id, public, None)
+    }
+
+    /// The same in the host-bound form, naming `host` as the server.
+    fn userauth_to(session_id: &[u8], public: &str, host: Option<&PrivateKey>) -> Vec<u8> {
+        let string = |value: &[u8]| {
+            let mut out = u32::try_from(value.len()).unwrap().to_be_bytes().to_vec();
+            out.extend_from_slice(value);
+            out
+        };
+        let key = ssh_key::PublicKey::from_openssh(public.trim()).unwrap();
+        let mut data = string(session_id);
+        data.push(50);
+        data.extend(string(b"user"));
+        data.extend(string(b"ssh-connection"));
+        data.extend(string(host.map_or(&b"publickey"[..], |_| {
+            b"publickey-hostbound-v00@openssh.com"
+        })));
+        data.push(1);
+        data.extend(string(key.algorithm().as_str().as_bytes()));
+        data.extend(string(&key.to_bytes().unwrap()));
+        if let Some(host) = host {
+            data.extend(string(&host.public_key().to_bytes().unwrap()));
+        }
+        data
     }
 
     fn sign_request(public: &str, data: &[u8], flags: u32) -> SignRequest {
@@ -429,11 +747,292 @@ mod tests {
         }
     }
 
+    /// Approves, and counts how often it was asked.
+    #[derive(Default)]
+    struct CountingConfirmer(std::sync::Mutex<usize>);
+    #[async_trait::async_trait]
+    impl Confirmer for CountingConfirmer {
+        async fn confirm(&self, _ctx: &ConfirmContext) -> Decision {
+            *self.0.lock().unwrap() += 1;
+            Decision::Approve
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remembered_approval_answers_the_same_question_until_the_vault_locks() {
+        let asked = Arc::new(CountingConfirmer::default());
+        let epoch = Arc::new(crate::approvals::LockEpoch::default());
+        let mut agent = agent_over(
+            Arc::new(MockLpass::logged_in().with_ed25519("1")),
+            "[[keys]]\nid = \"1\"",
+            asked.clone(),
+            Arc::new(NoPrompt),
+        )
+        .await
+        .with_approvals(Arc::new(Approvals::new(true, epoch.clone())))
+        .with_peer(Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        }));
+
+        agent
+            .sign(sign_request(ED25519_PUB, b"one", 0))
+            .await
+            .unwrap();
+        agent
+            .sign(sign_request(ED25519_PUB, b"two", 0))
+            .await
+            .unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 1, "the second was remembered");
+
+        epoch.bump();
+        agent
+            .sign(sign_request(ED25519_PUB, b"three", 0))
+            .await
+            .unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 2, "asked again after a lock");
+
+        // a requester that cannot be identified is asked every time, on
+        let mut anonymous = agent.with_peer(None);
+        anonymous
+            .sign(sign_request(ED25519_PUB, b"four", 0))
+            .await
+            .unwrap();
+        anonymous
+            .sign(sign_request(ED25519_PUB, b"five", 0))
+            .await
+            .unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 4);
+
+        // and off — the default — every signature asks
+        let mut plain = agent.with_peer(agent.peer);
+        plain.approvals = Arc::new(Approvals::off());
+        plain
+            .sign(sign_request(ED25519_PUB, b"six", 0))
+            .await
+            .unwrap();
+        plain
+            .sign(sign_request(ED25519_PUB, b"seven", 0))
+            .await
+            .unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 6);
+    }
+
+    /// What a private-key fetch does to the lock epoch, on top of answering.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum OnFetch {
+        Nothing,
+        /// The vault turns out locked and the master password is asked for.
+        Ask,
+        /// The screen locks while the vault is being read.
+        Lock,
+        /// The vault turns out locked, and the prompt for the master password
+        /// is dismissed.
+        AskAndFail,
+    }
+
+    /// Which of the agent's two clients a `LockingOnFetch` stands in for.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        /// Fed only what is held: a locked vault is reported, never asked.
+        Quiet,
+        /// Asks when the vault is locked.
+        Asking,
+    }
+
+    /// A vault whose private-key fetch does what the shared `OnFetch` says,
+    /// as seen by one of the agent's two clients.
+    struct LockingOnFetch {
+        vault: Arc<MockLpass>,
+        epoch: Arc<crate::approvals::LockEpoch>,
+        mode: Arc<std::sync::Mutex<OnFetch>>,
+        role: Role,
+    }
+    #[async_trait::async_trait]
+    impl LpassClient for LockingOnFetch {
+        async fn show_field(
+            &self,
+            item_id: &str,
+            field: &str,
+        ) -> Result<Zeroizing<Vec<u8>>, crate::lpass::LpassError> {
+            if field == "Private Key" {
+                let what = *self.mode.lock().unwrap();
+                match (what, self.role) {
+                    (OnFetch::Nothing, _) | (OnFetch::Lock, Role::Asking) => {}
+                    (OnFetch::Lock, Role::Quiet) => self.epoch.bump(),
+                    (OnFetch::Ask | OnFetch::AskAndFail, Role::Quiet) => {
+                        return Err(crate::lpass::LpassError::Locked);
+                    }
+                    (OnFetch::Ask, Role::Asking) => self.epoch.unlocked(),
+                    (OnFetch::AskAndFail, Role::Asking) => {
+                        self.epoch.unlocked();
+                        return Err(crate::lpass::LpassError::NoMasterPassword(
+                            "dismissed".into(),
+                        ));
+                    }
+                }
+            }
+            self.vault.show_field(item_id, field).await
+        }
+        async fn ls(&self) -> Result<Vec<crate::lpass::ItemSummary>, crate::lpass::LpassError> {
+            self.vault.ls().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lock_discovered_during_the_fetch_voids_the_remembered_approval() {
+        init_tracing();
+        let vault = Arc::new(MockLpass::logged_in().with_ed25519("1"));
+        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
+        let store = Served::new(
+            KeyStore::load(&*vault, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let epoch = Arc::new(crate::approvals::LockEpoch::default());
+        let mode = Arc::new(std::sync::Mutex::new(OnFetch::Ask));
+        let on_fetch = |what: OnFetch| *mode.lock().unwrap() = what;
+        let client_as = |role: Role| -> Arc<dyn LpassClient> {
+            Arc::new(LockingOnFetch {
+                vault: vault.clone(),
+                epoch: epoch.clone(),
+                mode: mode.clone(),
+                role,
+            })
+        };
+        let quiet = client_as(Role::Quiet);
+        let asked = Arc::new(CountingConfirmer::default());
+        let mut agent = LpassAgent::new(
+            store,
+            quiet.clone(),
+            asked.clone(),
+            Arc::new(Unlocker::new(quiet, Arc::new(NoPrompt))),
+            no_host_names(),
+        )
+        .with_asking(client_as(Role::Asking))
+        .with_approvals(Arc::new(Approvals::new(true, epoch.clone())))
+        .with_peer(Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        }));
+        let sign = |data: &'static [u8]| sign_request(ED25519_PUB, data, 0);
+
+        // asked, approved, and the fetch is what first opens the vault — the
+        // approval is filed in the epoch that begins there, so the next
+        // request has it
+        agent.sign(sign(b"one")).await.unwrap();
+        assert_eq!(epoch.current(), 1, "the ask was turned into a lock");
+        on_fetch(OnFetch::Nothing);
+        agent.sign(sign(b"two")).await.unwrap();
+        assert_eq!(
+            *asked.0.lock().unwrap(),
+            1,
+            "remembered across the first unlock"
+        );
+
+        // answered from memory, then the vault turns out locked under it:
+        // refused, not signed
+        on_fetch(OnFetch::Ask);
+        assert!(agent.sign(sign(b"three")).await.is_err());
+        assert_eq!(
+            *asked.0.lock().unwrap(),
+            1,
+            "never asked, so not silently confirmed"
+        );
+        // the retry is in the new epoch: asked, and signed
+        on_fetch(OnFetch::Nothing);
+        agent.sign(sign(b"four")).await.unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 2);
+
+        // the screen locking while the vault is read: the same refusal for
+        // an answer from memory
+        on_fetch(OnFetch::Lock);
+        assert!(agent.sign(sign(b"five")).await.is_err());
+        assert_eq!(*asked.0.lock().unwrap(), 2);
+        // and a confirmation given just before such a lock is not carried past
+        // it: the next request asks again
+        agent.sign(sign(b"six")).await.unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 3);
+        on_fetch(OnFetch::Nothing);
+        agent.sign(sign(b"seven")).await.unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 4);
+
+        // a prompt dismissed leaves the vault as locked as it was found, and
+        // ends what was approved before just the same: the request fails, and
+        // the next one asks even once the vault is open again
+        on_fetch(OnFetch::AskAndFail);
+        let before = epoch.current();
+        assert!(agent.sign(sign(b"eight")).await.is_err());
+        assert_eq!(epoch.current(), before + 1);
+        on_fetch(OnFetch::Nothing);
+        agent.sign(sign(b"nine")).await.unwrap();
+        assert_eq!(*asked.0.lock().unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_request_waiting_at_the_gate_takes_an_approval_given_meanwhile() {
+        // Two identical requests at once: the first is on screen, the second
+        // waits at the gate — and must not put a second prompt up for an answer
+        // the first has just been given.
+        init_tracing();
+        let client = Arc::new(MockLpass::logged_in().with_ed25519("1"));
+        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
+        let store = Served::new(
+            KeyStore::load(&*client, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let asked = Arc::new(CountingConfirmer::default());
+        let approvals = Arc::new(Approvals::new(
+            true,
+            Arc::new(crate::approvals::LockEpoch::default()),
+        ));
+        let peer = Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        });
+        let first = LpassAgent::new(
+            store.clone(),
+            client.clone(),
+            asked.clone(),
+            unlocking(&client, Arc::new(NoPrompt)),
+            no_host_names(),
+        )
+        .with_approvals(approvals.clone())
+        .with_peer(peer);
+        let mut second = first.with_peer(peer);
+
+        // the first request holds the gate, as it would while its prompt is up
+        let on_screen = first.interaction.clone().lock_owned().await;
+        let waiting = tokio::spawn(async move {
+            second
+                .sign(sign_request(ED25519_PUB, b"two", 0))
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(*asked.0.lock().unwrap(), 0, "waiting at the gate");
+
+        // the first is approved and finishes
+        let served = store.current();
+        let entry = served.entries().next().unwrap();
+        let question =
+            crate::confirm::approval_question(&ConfirmContext::new(entry, peer, Vec::new()))
+                .unwrap();
+        approvals.remember_in(question, approvals.epoch());
+        drop(on_screen);
+
+        waiting.await.unwrap();
+        assert_eq!(
+            *asked.0.lock().unwrap(),
+            0,
+            "answered by the first's approval"
+        );
+    }
+
     #[tokio::test]
     async fn identities_and_ed25519_signature() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519("1");
         let mut agent = agent_with(
             client,
             "confirm = \"off\"\n[[keys]]\nid = \"1\"\nname = \"test\"",
@@ -457,9 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_peer_carries_state_and_peer() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519("1");
         let agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         let mut session = agent.with_peer(Some(PeerInfo {
             pid: Some(1234),
@@ -474,9 +1071,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_private_key_field_fails() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", b"");
+        let client =
+            MockLpass::logged_in()
+                .with_ed25519_public("1")
+                .with_field("1", "Private Key", b"");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -487,7 +1085,7 @@ mod tests {
     #[tokio::test]
     async fn identity_comments_neutralize_vault_controlled_names() {
         // `ssh-add -l` prints these comments straight to a terminal
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(
             client,
             "confirm = \"off\"\n[[keys]]\nid = \"1\"\nname = \"spoof\\u001b[2Ksafe\"",
@@ -500,7 +1098,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_key_fails() {
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         assert!(agent
             .sign(sign_request(RSA_PUB, b"payload", sigflag::RSA_SHA2_256))
@@ -510,24 +1108,14 @@ mod tests {
 
     #[tokio::test]
     async fn denied_confirmation_blocks_and_never_touches_private_key() {
-        init_tracing();
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
-        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
-        let client = Arc::new(client);
-        let store = Arc::new(
-            KeyStore::load(&*client, &config.keys, &config)
-                .await
-                .unwrap(),
-        );
-        let mut agent = LpassAgent::new(
-            store,
+        let client = Arc::new(MockLpass::logged_in().with_ed25519("1"));
+        let mut agent = agent_over(
             client.clone(),
+            "[[keys]]\nid = \"1\"",
             Arc::new(DenyAll),
-            unlocking(&client, Arc::new(NoPrompt)),
-            no_host_names(),
-        );
+            Arc::new(NoPrompt),
+        )
+        .await;
 
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -547,9 +1135,9 @@ mod tests {
     #[tokio::test]
     async fn logged_out_mid_session_fails_but_agent_survives() {
         // Store loaded while logged in; then simulate logout by swapping the client.
-        let loaded = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let loaded = MockLpass::logged_in().with_ed25519_public("1");
         let config: Config = toml::from_str("confirm = \"off\"\n[[keys]]\nid = \"1\"").unwrap();
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&loaded, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -583,7 +1171,7 @@ mod tests {
         // advertised.
         let prompt = TypedPassphrase::new(b"fixture-passphrase");
         let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
+            .with_ed25519_public("1")
             // encrypted, and a different key from the advertised one
             .with_field("1", "Private Key", ED25519_PW.as_bytes());
         let mut agent = agent_prompting(
@@ -599,6 +1187,161 @@ mod tests {
         assert!(
             !prompt.was_asked(),
             "a key we will not sign with must not be unlocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_item_the_vault_no_longer_has_discards_the_remembered_identities() {
+        // Deleted, or unshared: the private key fetch fails before any key is
+        // compared, so this has to be caught on its own — or every start would
+        // go on advertising an identity that cannot sign. A locked vault must
+        // not count: the file is right about the key, the vault was merely
+        // unavailable.
+        let dir = tempfile::tempdir().unwrap();
+        let remembered = dir.path().join("agent.sock.identities");
+
+        // still advertised, but the item is gone from the vault
+        let loaded = MockLpass::logged_in().with_ed25519_public("1");
+        let config: Config = toml::from_str("confirm = \"off\"\n[[keys]]\nid = \"1\"").unwrap();
+        let store = Served::new(
+            KeyStore::load(&loaded, &config.keys, &config)
+                .await
+                .unwrap(),
+        );
+        let agent = |vault: MockLpass| {
+            let vault = Arc::new(vault);
+            LpassAgent::new(
+                store.clone(),
+                vault.clone(),
+                Arc::new(NoConfirmer),
+                unlocking(&vault, Arc::new(NoPrompt)),
+                no_host_names(),
+            )
+            .with_remembered_file(remembered.clone())
+        };
+
+        std::fs::write(&remembered, "[[keys]]\n").unwrap();
+        let mut locked = agent(MockLpass::default());
+        assert!(locked
+            .sign(sign_request(ED25519_PUB, b"payload", 0))
+            .await
+            .is_err());
+        assert!(
+            remembered.exists(),
+            "a locked vault is not a verdict on the key"
+        );
+
+        let mut deleted = agent(MockLpass::logged_in());
+        assert!(deleted
+            .sign(sign_request(ED25519_PUB, b"payload", 0))
+            .await
+            .is_err());
+        assert!(
+            !remembered.exists(),
+            "the next start must learn the item is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signature_that_succeeds_tells_the_refresher() {
+        // The moment the vault is known reachable is the moment to bring the
+        // remembered identities up to date — in the background.
+        let dir = tempfile::tempdir().unwrap();
+        let config: Arc<Config> = Arc::new(toml::from_str("confirm = \"off\"").unwrap());
+        let vault = Arc::new(
+            MockLpass::logged_in()
+                .with_ed25519("1")
+                .with_field("1", "NoteType", b"SSH Key")
+                .with_field("2", "Public Key", ECDSA_PUB.as_bytes())
+                .with_field("2", "NoteType", b"SSH Key"),
+        );
+        let mut two = MockLpass::logged_in();
+        two.items = vec![
+            crate::lpass::ItemSummary {
+                id: "1".into(),
+                name: "one".into(),
+            },
+            crate::lpass::ItemSummary {
+                id: "2".into(),
+                name: "two".into(),
+            },
+        ];
+        // the refresher's own view of the vault lists both items
+        let listing = Arc::new(
+            two.with_field("1", "NoteType", b"SSH Key")
+                .with_ed25519_public("1")
+                .with_field("2", "NoteType", b"SSH Key")
+                .with_field("2", "Public Key", ECDSA_PUB.as_bytes()),
+        );
+        // served: key 1 only, as an earlier start remembered it
+        let served = Served::new(
+            KeyStore::load(
+                &*vault,
+                &[crate::config::KeyConfig {
+                    id: "1".into(),
+                    name: None,
+                    confirm: None,
+                    passphrase_fallback: None,
+                }],
+                &config,
+            )
+            .await
+            .unwrap(),
+        );
+        let refresher = Arc::new(crate::refresh::Refresher::new(
+            served.clone(),
+            dir.path().join("agent.sock.identities"),
+            config,
+            listing,
+            std::time::Duration::ZERO,
+        ));
+        let mut agent = LpassAgent::new(
+            served.clone(),
+            vault.clone(),
+            Arc::new(NoConfirmer),
+            unlocking(&vault, Arc::new(NoPrompt)),
+            no_host_names(),
+        )
+        .with_refresher(refresher);
+
+        assert!(agent
+            .sign(sign_request(ED25519_PUB, b"payload", 0))
+            .await
+            .is_ok());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while served.current().len() != 2 {
+            assert!(
+                deadline > std::time::Instant::now(),
+                "the refresh never landed"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_vault_that_contradicts_the_remembered_identities_discards_them() {
+        // A key pair rotated inside the same item: the file goes on advertising
+        // the old public key, so every start would refuse every signature until
+        // someone found the file. The refusal itself has to clear the way.
+        let dir = tempfile::tempdir().unwrap();
+        let remembered = dir.path().join("agent.sock.identities");
+        std::fs::write(&remembered, "[[keys]]\n").unwrap();
+
+        let client = MockLpass::logged_in().with_ed25519_public("1").with_field(
+            "1",
+            "Private Key",
+            ECDSA.as_bytes(),
+        );
+        let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"")
+            .await
+            .with_remembered_file(remembered.clone());
+        assert!(agent
+            .sign(sign_request(ED25519_PUB, b"payload", 0))
+            .await
+            .is_err());
+        assert!(
+            !remembered.exists(),
+            "the next start must read the vault, not the file"
         );
     }
 
@@ -622,9 +1365,11 @@ mod tests {
 
     #[tokio::test]
     async fn garbage_private_key_fails() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", b"this is not a PEM at all");
+        let client = MockLpass::logged_in().with_ed25519_public("1").with_field(
+            "1",
+            "Private Key",
+            b"this is not a PEM at all",
+        );
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
@@ -839,7 +1584,7 @@ mod tests {
         );
         // confirmation left on, so every request confirms *and* prompts
         let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -896,14 +1641,13 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let client = Arc::new(
             MockLpass::logged_in()
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-                .with_field("1", "Private Key", ED25519.as_bytes())
+                .with_ed25519("1")
                 .with_field("2", "Public Key", ECDSA_PUB.as_bytes())
                 .with_field("2", "Private Key", ECDSA.as_bytes()),
         );
         let config: Config =
             toml::from_str("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"\nconfirm = false").unwrap();
-        let store = Arc::new(
+        let store = Served::new(
             KeyStore::load(&*client, &config.keys, &config)
                 .await
                 .unwrap(),
@@ -941,40 +1685,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_vault_that_can_ask_for_a_password_signs_under_the_gate() {
-        // With the vault locked to the screen, the fetch itself may prompt —
-        // lpass asks for the master password through a helper of ours, from
-        // inside a subprocess the gate cannot see into. So the gate is taken
-        // before the fetch, and this pair must not overlap even though neither
-        // request confirms.
+    async fn a_vault_found_locked_is_asked_under_the_gate() {
+        // The quiet client reports the vault locked; only then does the fetch
+        // take the gate and reach for the client that asks. Two such requests
+        // at once must not overlap on screen, even though neither confirms —
+        // and both sign.
         let watch = Arc::new(ChannelWatch::default());
-        let client = Arc::new(
+        let vault = Arc::new(
             MockLpass::logged_in()
-                .prompting()
                 .with_field("1", "Public Key", ED25519_PW_PUB.as_bytes())
                 .with_field("1", "Private Key", ED25519_PW.as_bytes())
                 .with_field("1", "Passphrase", b""),
         );
+        let quiet: Arc<dyn LpassClient> = Arc::new(
+            MockLpass::logged_in()
+                .with_field("1", "Public Key", ED25519_PW_PUB.as_bytes())
+                .with_field("1", "Private Key", ED25519_PW.as_bytes())
+                .with_field("1", "Passphrase", b"")
+                .with_locked_field("1", "Private Key"),
+        );
         let config: Config = toml::from_str(PW_KEY).unwrap();
-        let store = Arc::new(
-            KeyStore::load(&*client, &config.keys, &config)
+        let store = Served::new(
+            KeyStore::load(&*vault, &config.keys, &config)
                 .await
                 .unwrap(),
         );
-        let unlocker = unlocking(
-            &client,
+        let unlocker = Arc::new(Unlocker::new(
+            quiet.clone(),
             Arc::new(WatchingPrompt(
                 watch.clone(),
                 b"fixture-passphrase".to_vec(),
             )),
-        );
+        ));
         let agent = LpassAgent::new(
             store,
-            client,
+            quiet,
             Arc::new(NoConfirmer),
             unlocker,
             no_host_names(),
-        );
+        )
+        .with_asking(vault.clone());
 
         let mut first = agent.with_peer(None);
         let mut second = agent.with_peer(None);
@@ -984,29 +1734,30 @@ mod tests {
         );
         assert!(a.is_ok() && b.is_ok());
         assert!(!watch.overlapped(), "two prompts shared one screen");
+        assert_eq!(
+            vault
+                .fetch_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, field)| field == "Private Key")
+                .count(),
+            2,
+            "both fetched through the client that asks"
+        );
     }
 
     #[tokio::test]
     async fn an_unencrypted_key_resolves_no_passphrase_at_all() {
         let prompt = TypedPassphrase::new(b"never needed");
-        let client = Arc::new(
-            MockLpass::logged_in()
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-                .with_field("1", "Private Key", ED25519.as_bytes()),
-        );
-        let config: Config = toml::from_str(PW_KEY).unwrap();
-        let store = Arc::new(
-            KeyStore::load(&*client, &config.keys, &config)
-                .await
-                .unwrap(),
-        );
-        let mut agent = LpassAgent::new(
-            store,
+        let client = Arc::new(MockLpass::logged_in().with_ed25519("1"));
+        let mut agent = agent_over(
             client.clone(),
+            PW_KEY,
             Arc::new(NoConfirmer),
-            unlocking(&client, prompt.clone()),
-            no_host_names(),
-        );
+            prompt.clone(),
+        )
+        .await;
         assert!(agent
             .sign(sign_request(ED25519_PUB, b"payload", 0))
             .await
@@ -1030,7 +1781,7 @@ mod tests {
         // log. Extension probes arrive on every OpenSSH connection.
         use ssh_agent_lib::proto::{AddIdentity, Extension, PrivateCredential, RemoveIdentity};
 
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         let private = PrivateKey::from_openssh(ED25519).unwrap();
 
@@ -1080,6 +1831,63 @@ mod tests {
         )
     }
 
+    /// A binding from a host whose key is a certificate, as a server with
+    /// `HostCertificate` sends it: the certificate travels as the host key
+    /// and the key inside it signs the session id.
+    fn certificate_bind(host: &PrivateKey, session_id: &[u8], is_forwarding: bool) -> Request {
+        use signature::Signer as _;
+        use ssh_agent_lib::ssh_encoding::Encode as _;
+        let ca = PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        let mut builder = ssh_key::certificate::Builder::new(
+            [0u8; 16],
+            host.public_key().key_data().clone(),
+            0,
+            u64::from(u32::MAX),
+        )
+        .unwrap();
+        builder
+            .cert_type(ssh_key::certificate::CertType::Host)
+            .unwrap()
+            .all_principals_valid()
+            .unwrap();
+        let certificate = builder.sign(&ca).unwrap().to_bytes().unwrap();
+        let mut payload = Vec::new();
+        certificate.encode(&mut payload).unwrap();
+        session_id.to_vec().encode(&mut payload).unwrap();
+        host.try_sign(session_id)
+            .unwrap()
+            .encode_prefixed(&mut payload)
+            .unwrap();
+        u8::from(is_forwarding).encode(&mut payload).unwrap();
+        Request::Extension(Extension {
+            name: SessionBind::NAME.into(),
+            details: payload.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_certificate_host_key_binds_like_a_plain_one() {
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone()).await;
+        let host = PrivateKey::from_openssh(ED25519).unwrap();
+        let response = agent
+            .handle(certificate_bind(&host, b"cert-session", true))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Success), "{response:?}");
+        assert_eq!(agent.bindings.len(), 1);
+        assert_eq!(agent.bindings[0].session_id, b"cert-session");
+        assert!(agent.bindings[0].is_forwarding);
+        // named by the key inside the certificate, which is what known_hosts
+        // could record and what the fingerprint of a plain host would be
+        assert_eq!(
+            agent.bindings[0].host_fingerprint,
+            host.public_key()
+                .fingerprint(ssh_key::HashAlg::Sha256)
+                .to_string()
+        );
+    }
+
     /// Captures the prompt a signing request would have shown.
     #[derive(Default)]
     struct RecordingConfirmer(std::sync::Mutex<Vec<String>>);
@@ -1096,26 +1904,20 @@ mod tests {
     }
 
     async fn agent_recording(confirmer: Arc<RecordingConfirmer>) -> LpassAgent {
-        let client = Arc::new(
-            MockLpass::logged_in()
-                .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-                .with_field("1", "Private Key", ED25519.as_bytes()),
-        );
-        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
-        let store = Arc::new(
-            KeyStore::load(&*client, &config.keys, &config)
-                .await
-                .unwrap(),
-        );
-        let unlocker = unlocking(&client, Arc::new(NoPrompt));
-        LpassAgent::new(store, client, confirmer, unlocker, no_host_names())
+        agent_over(
+            Arc::new(MockLpass::logged_in().with_ed25519("1")),
+            "[[keys]]\nid = \"1\"",
+            confirmer,
+            Arc::new(NoPrompt),
+        )
+        .await
     }
 
     #[tokio::test]
     async fn query_advertises_session_bind() {
         // a client that negotiates before binding must be told we bind,
         // or forwarded requests would quietly lose their host chain
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
 
         let response = agent
@@ -1149,7 +1951,11 @@ mod tests {
             Response::Success
         ));
         agent
-            .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth(b"session-one", ED25519_PUB),
+                0,
+            )))
             .await
             .unwrap();
 
@@ -1184,7 +1990,11 @@ mod tests {
             .await
             .unwrap();
         agent
-            .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth(b"hop-two", ED25519_PUB),
+                0,
+            )))
             .await
             .unwrap();
 
@@ -1211,28 +2021,75 @@ mod tests {
         let mut agent = agent_recording(confirmer.clone()).await;
         let host = PrivateKey::from_openssh(ED25519).unwrap();
 
-        // the same hop repeated adds nothing
-        for _ in 0..3 {
+        // the same hop repeated adds nothing; the same host under a new
+        // session is a new connection to it, and is a hop of its own
+        for session in [&b"same-host"[..], b"same-host", b"same-host-again"] {
             assert!(matches!(
                 agent
-                    .handle(session_bind(&host, b"same-host", false))
+                    .handle(session_bind(&host, session, true))
                     .await
                     .unwrap(),
                 Response::Success
             ));
         }
-        assert_eq!(agent.bindings.len(), 1);
+        assert_eq!(agent.bindings.len(), 2);
+        assert_eq!(agent.bindings[0].session_id, b"same-host");
+        assert_eq!(agent.bindings[1].session_id, b"same-host-again");
 
-        // distinct hops accumulate only up to our own cap
+        // a session already bound cannot be claimed by another host key
+        let other = PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        assert!(matches!(
+            agent
+                .handle(session_bind(&other, b"same-host", true))
+                .await
+                .unwrap(),
+            Response::Failure
+        ));
+        assert_eq!(agent.bindings.len(), 2);
+
+        // distinct forwarding hops accumulate only up to our own cap
         for hop in 0..MAX_SESSION_BINDINGS + 4 {
             let key =
                 PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
             let _ = agent
-                .handle(session_bind(&key, format!("hop{hop}").as_bytes(), false))
+                .handle(session_bind(&key, format!("hop{hop}").as_bytes(), true))
                 .await
                 .unwrap();
         }
         assert_eq!(agent.bindings.len(), MAX_SESSION_BINDINGS);
+    }
+
+    #[tokio::test]
+    async fn nothing_binds_after_the_destination() {
+        // A hop that is not forwarding the agent is where the connection
+        // ends; a binding after it could only be a peer rewriting the chain.
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone()).await;
+        let first = PrivateKey::from_openssh(ED25519).unwrap();
+        let destination =
+            PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        agent
+            .handle(session_bind(&first, b"hop-one", true))
+            .await
+            .unwrap();
+        agent
+            .handle(session_bind(&destination, b"the-end", false))
+            .await
+            .unwrap();
+        // neither a new host nor a replay of the first hop gets in
+        let another =
+            PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        for (key, session) in [(&another, &b"later"[..]), (&first, b"hop-one")] {
+            assert!(matches!(
+                agent
+                    .handle(session_bind(key, session, false))
+                    .await
+                    .unwrap(),
+                Response::Failure
+            ));
+        }
+        assert_eq!(agent.bindings.len(), 2);
+        assert_eq!(agent.bindings.last().unwrap().session_id, b"the-end");
     }
 
     #[tokio::test]
@@ -1271,21 +2128,168 @@ mod tests {
         assert!(!prompts[0].contains("WARNING"), "{}", prompts[0]);
     }
 
+    /// `string host_key, string session_id, string signature, byte flag`,
+    /// followed by whatever `trailing` is — nothing, for a well-formed one.
+    fn bind_payload(host_key: &[u8], signature: &[u8], trailing: &[u8]) -> Vec<u8> {
+        use ssh_agent_lib::ssh_encoding::Encode as _;
+        let mut payload = Vec::new();
+        for field in [host_key, b"session", signature] {
+            field.to_vec().encode(&mut payload).unwrap();
+        }
+        1u8.encode(&mut payload).unwrap();
+        payload.extend_from_slice(trailing);
+        payload
+    }
+
     #[tokio::test]
     async fn a_malformed_binding_is_refused() {
-        use ssh_agent_lib::proto::extension::MessageExtension as _;
+        use signature::Signer as _;
+        use ssh_agent_lib::ssh_encoding::Encode as _;
         let confirmer = Arc::new(RecordingConfirmer::default());
         let mut agent = agent_recording(confirmer).await;
+        let host = PrivateKey::from_openssh(ED25519).unwrap();
+        let key = host.public_key().to_bytes().unwrap();
+        let signature = Vec::<u8>::try_from(host.try_sign(b"session").unwrap()).unwrap();
+        let mut algorithm_only = Vec::new();
+        "ssh-ed25519".encode(&mut algorithm_only).unwrap();
+        let mut cert_without_body = Vec::new();
+        "ssh-ed25519-cert-v01@openssh.com"
+            .encode(&mut cert_without_body)
+            .unwrap();
 
-        // right extension name, payload that cannot decode
-        let malformed = Request::Extension(Extension {
-            name: SessionBind::NAME.into(),
-            details: vec![0xff, 0x00, 0x01].into(),
-        });
-        assert!(matches!(
-            agent.handle(malformed).await.unwrap(),
-            Response::Failure
-        ));
+        // right extension name, payload that does not decode — at each of
+        // the places it could fail to
+        let malformed: [(&str, Vec<u8>); 7] = [
+            ("truncated", vec![0xff, 0x00, 0x01]),
+            ("bytes after the flag", bind_payload(&key, &signature, b"!")),
+            ("empty host key", bind_payload(b"", &signature, b"")),
+            (
+                "plain key without its bytes",
+                bind_payload(&algorithm_only, &signature, b""),
+            ),
+            (
+                "certificate without its body",
+                bind_payload(&cert_without_body, &signature, b""),
+            ),
+            (
+                "signature that is not one",
+                bind_payload(&key, &[0xff], b""),
+            ),
+            (
+                "bytes after the signature",
+                bind_payload(&key, &[&signature[..], b"!"].concat(), b""),
+            ),
+        ];
+        for (case, details) in malformed {
+            let response = agent
+                .handle(Request::Extension(Extension {
+                    name: SessionBind::NAME.into(),
+                    details: details.into(),
+                }))
+                .await
+                .unwrap();
+            assert!(
+                matches!(response, Response::Failure),
+                "{case}: {response:?}"
+            );
+        }
+        assert!(agent.bindings.is_empty());
+
+        // and the well-formed version of the same bytes binds
+        let response = agent
+            .handle(Request::Extension(Extension {
+                name: SessionBind::NAME.into(),
+                details: bind_payload(&key, &signature, b"").into(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Success), "{response:?}");
+    }
+
+    #[tokio::test]
+    async fn a_bound_connection_signs_only_userauth_requests_for_its_session() {
+        // A binding is replayable by anyone who has connected to that host, so
+        // the data must say which session it is for, and that must be the one
+        // bound last: anything else would put the wrong host on the prompt.
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone()).await;
+        let host = PrivateKey::from_openssh(ED25519).unwrap();
+        agent
+            .handle(session_bind(&host, b"bound", false))
+            .await
+            .unwrap();
+
+        // another session's userauth request, and data that is no userauth
+        // request at all: refused before any prompt
+        for data in [userauth(b"other", ED25519_PUB), b"just bytes".to_vec()] {
+            let response = agent
+                .handle(Request::SignRequest(sign_request(ED25519_PUB, &data, 0)))
+                .await
+                .unwrap();
+            assert!(matches!(response, Response::Failure));
+        }
+        assert!(confirmer.0.lock().unwrap().is_empty(), "nothing was asked");
+
+        // the bound session's own request is signed
+        let response = agent
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth(b"bound", ED25519_PUB),
+                0,
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::SignResponse(_)));
+
+        // the host-bound form names the server: the bound host is signed for,
+        // a host in the middle naming the one beyond it is not
+        let beyond = PrivateKey::from_openssh(ED25519_PW)
+            .unwrap()
+            .decrypt("fixture-passphrase")
+            .unwrap();
+        let response = agent
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth_to(b"bound", ED25519_PUB, Some(&host)),
+                0,
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::SignResponse(_)));
+        let response = agent
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth_to(b"bound", ED25519_PUB, Some(&beyond)),
+                0,
+            )))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Failure));
+
+        // a session id longer than any key exchange produces is refused
+        let response = agent
+            .handle(session_bind(&host, &[7u8; MAX_SESSION_ID_BYTES + 1], false))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Failure));
+
+        // as is a host key larger than any host sends, before it is parsed
+        let response = agent
+            .handle(Request::Extension(Extension {
+                name: SessionBind::NAME.into(),
+                details: bind_payload(&vec![7u8; MAX_HOST_KEY_BYTES + 1], b"", b"").into(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::Failure));
+
+        // an unbound connection is under no such rule
+        let mut plain = agent_recording(confirmer.clone()).await;
+        let response = plain
+            .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
+            .await
+            .unwrap();
+        assert!(matches!(response, Response::SignResponse(_)));
     }
 
     #[tokio::test]
@@ -1312,19 +2316,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_denied_signature_answers_failure_without_erroring() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
-        let config: Config = toml::from_str("[[keys]]\nid = \"1\"").unwrap();
-        let client = Arc::new(client);
-        let store = Arc::new(
-            KeyStore::load(&*client, &config.keys, &config)
-                .await
-                .unwrap(),
-        );
-        let unlocker = unlocking(&client, Arc::new(NoPrompt));
-        let mut agent =
-            LpassAgent::new(store, client, Arc::new(DenyAll), unlocker, no_host_names());
+        let mut agent = agent_over(
+            Arc::new(MockLpass::logged_in().with_ed25519("1")),
+            "[[keys]]\nid = \"1\"",
+            Arc::new(DenyAll),
+            Arc::new(NoPrompt),
+        )
+        .await;
 
         let response = agent
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
@@ -1335,9 +2333,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_granted_signature_answers_with_the_signature() {
-        let client = MockLpass::logged_in()
-            .with_field("1", "Public Key", ED25519_PUB.as_bytes())
-            .with_field("1", "Private Key", ED25519.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
         let response = agent
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
@@ -1349,7 +2345,7 @@ mod tests {
     #[tokio::test]
     async fn trait_defaults_still_refuse_direct_calls() {
         use ssh_agent_lib::proto::{AddIdentity, PrivateCredential, RemoveIdentity};
-        let client = MockLpass::logged_in().with_field("1", "Public Key", ED25519_PUB.as_bytes());
+        let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
 
         let private = PrivateKey::from_openssh(ED25519).unwrap();

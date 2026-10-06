@@ -38,7 +38,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned with checks.yml and the Dockerfile; see checks.yml.
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2.9.2

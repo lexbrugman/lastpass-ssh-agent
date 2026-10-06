@@ -10,7 +10,7 @@
 #
 #   docker compose build --pull --no-cache
 #
-# Both flags are needed: --pull alone only re-fetches rust:1-slim, and when
+# Both flags are needed: --pull alone only re-fetches the base image, and when
 # nightly or a cargo plugin advances without that tag moving, the cached RUN
 # layers are reused and the gate keeps running older tooling than CI does.
 

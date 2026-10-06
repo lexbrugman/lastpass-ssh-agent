@@ -14,10 +14,9 @@ use crate::error::Result;
 /// half-written file.
 ///
 /// Staged beside the destination and renamed over it. `rename` swaps the name
-/// in one step, so a reader — or an `exec`, for the wrapper — either sees the
-/// old file or the new one and never a partial write. Opening the destination
-/// with `O_TRUNC` instead would be visible to anything reading it at that
-/// moment, and for an executable it is the `ETXTBSY` race `AGENTS.md` describes.
+/// in one step, so a reader either sees the old file or the new one and never
+/// a partial write. Opening the destination with `O_TRUNC` instead would be
+/// visible to anything reading it at that moment.
 ///
 /// The staging name carries this process's id, so two agents doing this at once
 /// stage into files of their own instead of truncating each other's work or
@@ -27,6 +26,15 @@ use crate::error::Result;
 /// world-readable even for an instant, and once afterwards, because a staging
 /// file left behind by an earlier crash is reopened rather than created and
 /// keeps whatever mode it already had.
+/// A file of the agent's own, named after its socket: the socket path is the
+/// one thing every part of a running agent already agrees on, so nothing else
+/// has to be configured to keep them together.
+pub fn beside(socket: &Path, suffix: &str) -> PathBuf {
+    let mut name = socket.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 pub fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -35,11 +43,14 @@ pub fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     staging.push(format!(".{}", std::process::id()));
     let staging = PathBuf::from(staging);
 
+    // Never through a symlink: the staging name is predictable, and one planted
+    // there would have the contents written wherever it points.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&staging)?;
     file.write_all(contents)?;
     // Closed before the rename: a descriptor still open for writing is exactly
@@ -96,6 +107,14 @@ pub fn open_regular(path: &Path) -> Result<Option<std::fs::File>> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_beside_the_socket_takes_its_name_and_a_suffix() {
+        assert_eq!(
+            beside(Path::new("/run/user/1000/agent.sock"), ".identities"),
+            PathBuf::from("/run/user/1000/agent.sock.identities")
+        );
+    }
     use std::io::Read as _;
     use std::os::unix::fs::PermissionsExt as _;
 

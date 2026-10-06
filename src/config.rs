@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -43,19 +44,17 @@ pub enum PassphraseFallback {
     SecretService,
 }
 
-/// Where the vault's master password comes from when `lpass` has forgotten the
-/// key it derived and asks for it again.
+/// Where the vault's master password comes from when the agent needs the
+/// vault and holds no password for it.
 ///
-/// Not about *why* it was forgotten: the hourly timeout and a screen lock reach
-/// here alike.
+/// Not about *why* it holds none: the idle time, a screen lock and a fresh
+/// start reach here alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MasterPassword {
-    /// Never asked for. A locked vault fails the signature, and you reopen it
-    /// yourself — what the agent did before any of this existed.
+    /// Asked for through the agent's own prompt, and kept nowhere but in the
+    /// running agent's memory.
     #[default]
-    Off,
-    /// Asked for through the agent's own prompt, and never kept.
     Prompt,
     /// Kept encrypted to a key held in the Secure Enclave, which releases it
     /// only on Touch ID — so it cannot be taken silently by anything able to
@@ -117,34 +116,34 @@ pub struct Config {
     #[serde(default)]
     pub passphrase_fallback: PassphraseFallback,
 
-    /// How long the vault stays unlocked once `lpass` has derived its key.
+    /// How long the agent keeps the master password once it has asked for it,
+    /// counted from the last signature that used it.
     ///
-    /// Unset leaves lpass to its own default, an hour. `0` means never expire,
-    /// which is lpass's own encoding and a deliberate footgun rather than one
-    /// to forbid.
-    ///
-    /// Only governs an `lpass` agent *this* agent starts: whichever process
-    /// gets there first fixes it, so a shell that has already run `lpass` keeps
-    /// whatever it set. `lastpass-ssh-agent env` prints this so a shell profile
-    /// can take the same value from here rather than repeating it.
+    /// Unset is an hour, matching what `lpass` gives a shell. `0` keeps it
+    /// until the screen locks or the agent stops — a deliberate footgun rather
+    /// than one to forbid. See `master_password_idle`.
     #[serde(default)]
-    pub vault_unlock_timeout_secs: Option<u64>,
+    pub master_password_idle_secs: Option<u64>,
 
-    /// Where the master password comes from when `lpass` asks for one.
-    ///
-    /// Opt-in because it changes what a locked vault does to a signature, and
-    /// because anything but `off` means the agent handles the master password
-    /// at all — which by default it never does.
+    /// Where the master password comes from when the agent needs the vault
+    /// and holds none.
     #[serde(default)]
     pub master_password: MasterPassword,
 
-    /// Drop the vault's cached key when the screen locks, so walking away
-    /// shuts the vault and not just the display.
-    ///
-    /// Worth pairing with a `master_password` source: without one, every lock
-    /// costs one failed signature before you re-authenticate by hand.
-    #[serde(default)]
+    /// Forget the master password when the screen locks, so walking away
+    /// shuts the vault and not just the display. On by default where the
+    /// screen's lock state can be read at all.
+    #[serde(default = "default_lock_on_screen_lock")]
     pub lock_on_screen_lock: bool,
+
+    /// Once a signature is approved, approve the same key for the same
+    /// requester and hosts without asking, until the vault locks.
+    ///
+    /// Opt-in: it trades a prompt per signature for a prompt per application
+    /// per unlock, and anything driving that application can then sign
+    /// unasked while the vault is open.
+    #[serde(default)]
+    pub remember_approvals: bool,
 
     #[serde(default)]
     pub keys: Vec<KeyConfig>,
@@ -153,6 +152,22 @@ pub struct Config {
 const fn default_confirm_timeout() -> u64 {
     30
 }
+
+/// On wherever it can work: reading the screen's lock state is the one part a
+/// platform has to provide, and macOS and Linux do.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const fn default_lock_on_screen_lock() -> bool {
+    true
+}
+
+/// Off where the setting is refused, so that an empty config still loads.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const fn default_lock_on_screen_lock() -> bool {
+    false
+}
+
+/// What `master_password_idle_secs` means when unset.
+const DEFAULT_MASTER_PASSWORD_IDLE: Duration = Duration::from_secs(3600);
 
 /// An hour is already far longer than anyone waits at a signing prompt, and
 /// the bound keeps `Instant::now() + timeout` well inside what the platform
@@ -199,6 +214,7 @@ impl Config {
                 })
             }
         };
+        refuse_misnamed(&raw)?;
         let mut config: Self = toml::from_str(&raw).map_err(|e| Error::ConfigParse {
             path: path.to_path_buf(),
             source: Box::new(e),
@@ -212,7 +228,7 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         for key in &self.keys {
-            if key.id.is_empty() || !key.id.bytes().all(|b| b.is_ascii_digit()) {
+            if !crate::lpass::is_item_id(&key.id) {
                 return Err(Error::ConfigInvalid(format!(
                     "key id {:?} must be a numeric LastPass item id (use `lastpass-ssh-agent search` to find it)",
                     key.id
@@ -233,6 +249,17 @@ impl Config {
                 )));
             }
         }
+        // Resolved from a working directory nothing chooses on purpose — a
+        // service's is `/` — and `doctor` and `start` could resolve them from
+        // different ones, so what one checks is not what the other runs.
+        for (name, path) in [("lpass_path", &self.lpass_path), ("askpass", &self.askpass)] {
+            if let Some(path) = path.as_deref().filter(|path| !path.is_absolute()) {
+                return Err(Error::ConfigInvalid(format!(
+                    "{name} {} must be absolute",
+                    path.display()
+                )));
+            }
+        }
         if self.confirm == ConfirmMode::Askpass && self.askpass.is_none() {
             return Err(Error::ConfigInvalid(
                 "confirm = \"askpass\" requires `askpass` to point at a helper program".into(),
@@ -241,20 +268,6 @@ impl Config {
         if self.confirm_timeout_secs == 0 || self.confirm_timeout_secs > MAX_CONFIRM_TIMEOUT_SECS {
             return Err(Error::ConfigInvalid(format!(
                 "confirm_timeout_secs must be between 1 and {MAX_CONFIRM_TIMEOUT_SECS}"
-            )));
-        }
-        // lpass hands this to `alarm`, whose argument is 32-bit: anything
-        // larger wraps, and a value that wraps to zero means *never expire* —
-        // the opposite of a short timeout, arrived at silently. Refused here
-        // rather than discovered by a vault that never locks.
-        if self
-            .vault_unlock_timeout_secs
-            .is_some_and(|seconds| seconds > u64::from(u32::MAX))
-        {
-            return Err(Error::ConfigInvalid(format!(
-                "vault_unlock_timeout_secs must be at most {} — lpass truncates it to 32 \
-                 bits, and a larger value can wrap to 0, which means never expire",
-                u32::MAX
             )));
         }
         // Refused at load, not at the first signature — and by validation
@@ -318,6 +331,16 @@ impl Config {
             .any(|key| self.passphrase_fallback(key) == wanted)
     }
 
+    /// How long a held master password may go unused: the configured idle
+    /// time, an hour when none is, and no limit for `0`.
+    pub const fn master_password_idle(&self) -> Option<Duration> {
+        match self.master_password_idle_secs {
+            None => Some(DEFAULT_MASTER_PASSWORD_IDLE),
+            Some(0) => None,
+            Some(seconds) => Some(Duration::from_secs(seconds)),
+        }
+    }
+
     /// Resolved socket path (config override or platform default).
     pub fn socket_path(&self) -> Result<PathBuf> {
         self.socket
@@ -339,6 +362,24 @@ impl Config {
     pub fn passphrase_fallback(&self, key: &KeyConfig) -> PassphraseFallback {
         key.passphrase_fallback.unwrap_or(self.passphrase_fallback)
     }
+}
+
+/// Names a setting that is written under another name, and says which.
+///
+/// Ahead of the parse, because "unknown field" is what the parse would say,
+/// and a reader who spelt the idle time as the vault's own timeout would
+/// otherwise have nothing pointing at the setting that does what they meant.
+fn refuse_misnamed(raw: &str) -> Result<()> {
+    const MISNAMED: &str = "vault_unlock_timeout_secs";
+    let names_it =
+        toml::from_str::<toml::Table>(raw).is_ok_and(|table| table.contains_key(MISNAMED));
+    if names_it {
+        return Err(Error::ConfigInvalid(format!(
+            "`{MISNAMED}` is not a setting: how long the master password is kept is \
+             `master_password_idle_secs`"
+        )));
+    }
+    Ok(())
 }
 
 /// Reachable only when the platform reports no home directory at all,
@@ -364,11 +405,14 @@ mod tests {
     use super::*;
 
     fn parse(s: &str) -> Result<Config> {
+        refuse_misnamed(s)?;
         let mut config: Config = toml::from_str(s).map_err(|e| Error::ConfigParse {
             path: PathBuf::from("<test>"),
             source: Box::new(e),
         })?;
         config.socket = config.socket.map(expand_tilde);
+        config.lpass_path = config.lpass_path.map(expand_tilde);
+        config.askpass = config.askpass.map(expand_tilde);
         config.validate()?;
         Ok(config)
     }
@@ -535,40 +579,50 @@ id = "1"
         assert!(parse("passphrase_fallback = true").is_err());
     }
 
-    /// `keychain` parses everywhere — it is a reasonable thing to write in a
-    /// config shared between machines — and is accepted or refused by platform
-    /// at load, never at the first signature.
     #[test]
-    fn the_vault_timeout_is_bounded_by_what_lpass_can_hold() {
-        assert_eq!(parse("").unwrap().vault_unlock_timeout_secs, None);
+    fn the_idle_time_is_an_hour_unless_said_otherwise_and_zero_is_forever() {
         assert_eq!(
-            parse("vault_unlock_timeout_secs = 300")
-                .unwrap()
-                .vault_unlock_timeout_secs,
-            Some(300)
+            parse("").unwrap().master_password_idle(),
+            Some(Duration::from_secs(3600))
         );
-        // 0 is lpass's own encoding for "never expire" — a footgun, but its
-        // footgun, and one a config is entitled to ask for.
         assert_eq!(
-            parse("vault_unlock_timeout_secs = 0")
+            parse("master_password_idle_secs = 300")
                 .unwrap()
-                .vault_unlock_timeout_secs,
-            Some(0)
+                .master_password_idle(),
+            Some(Duration::from_secs(300))
         );
-        // the boundary itself is fine; one past it wraps in lpass's `alarm`
-        assert!(parse(&format!("vault_unlock_timeout_secs = {}", u32::MAX)).is_ok());
-        let error = parse(&format!(
-            "vault_unlock_timeout_secs = {}",
-            u64::from(u32::MAX) + 1
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("never expire"), "{error}");
+        // a footgun, but one a config is entitled to ask for
+        assert_eq!(
+            parse("master_password_idle_secs = 0")
+                .unwrap()
+                .master_password_idle(),
+            None
+        );
     }
 
     #[test]
-    fn the_master_password_source_is_off_by_default() {
-        assert_eq!(parse("").unwrap().master_password, MasterPassword::Off);
+    fn the_idle_time_written_as_a_vault_timeout_is_refused_with_its_name() {
+        let error = parse("vault_unlock_timeout_secs = 300")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("master_password_idle_secs"), "{error}");
+        // a broken file is left to the parse to describe
+        assert!(parse("not = valid = toml").is_err());
+    }
+
+    #[test]
+    fn approvals_are_not_remembered_unless_asked_for() {
+        assert!(!parse("").unwrap().remember_approvals);
+        assert!(
+            parse("remember_approvals = true")
+                .unwrap()
+                .remember_approvals
+        );
+    }
+
+    #[test]
+    fn the_master_password_is_asked_for_by_default() {
+        assert_eq!(parse("").unwrap().master_password, MasterPassword::Prompt);
         assert_eq!(
             parse("master_password = \"prompt\"")
                 .unwrap()
@@ -580,11 +634,13 @@ id = "1"
             "case matters"
         );
         assert!(parse("master_password = true").is_err(), "not a bool");
+        // there is no way to switch this off: an unknown value is refused,
+        // never read as a vault that fails every signature
+        assert!(parse("master_password = \"off\"").is_err());
     }
 
-    /// `prompt` is deliberately not macOS-only: `lpass` forgets its key on its
-    /// own timeout everywhere, and being asked rather than failing is worth
-    /// having on any platform. Only the Touch ID half needs a platform.
+    /// `prompt` is deliberately not macOS-only: nothing about being asked for
+    /// a password is platform-specific. Only the Touch ID half needs one.
     #[test]
     #[cfg(target_os = "macos")]
     fn the_touchid_source_is_accepted_here() {
@@ -609,14 +665,13 @@ id = "1"
 
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn lock_on_screen_lock_is_accepted_here() {
+    fn lock_on_screen_lock_is_on_here_unless_switched_off() {
+        assert!(parse("").unwrap().lock_on_screen_lock);
         assert!(
-            parse("lock_on_screen_lock = true")
+            !parse("lock_on_screen_lock = false")
                 .unwrap()
                 .lock_on_screen_lock
         );
-        // and the default is off, so an ordinary config never watches
-        assert!(!parse("").unwrap().lock_on_screen_lock);
     }
 
     #[test]
@@ -756,6 +811,16 @@ passphrase_fallback = "error"
     #[test]
     fn duplicate_ids_rejected() {
         assert!(parse("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"1\"").is_err());
+    }
+
+    #[test]
+    fn helper_paths_must_be_absolute() {
+        assert!(parse("lpass_path = \"lpass\"").is_err());
+        assert!(parse("lpass_path = \"bin/lpass\"").is_err());
+        assert!(parse("askpass = \"ssh-askpass\"").is_err());
+        assert!(parse("lpass_path = \"/opt/homebrew/bin/lpass\"").is_ok());
+        // ~ expands to an absolute path before validation
+        assert!(parse("lpass_path = \"~/bin/lpass\"").is_ok());
     }
 
     #[test]

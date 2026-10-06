@@ -7,7 +7,8 @@ pub use osascript::OsascriptConfirmer;
 pub use tty::TtyConfirmer;
 
 use crate::keystore::KeyEntry;
-use crate::text::escape_for_display;
+use crate::requester::Requester;
+use crate::text::{display_bounded, escape_for_display};
 
 /// What the user is being asked to approve. Everything here may be shown in
 /// a dialog; none of it is secret. `key_name` comes from the vault/config
@@ -19,6 +20,9 @@ pub struct ConfirmContext {
     pub item_id: String,
     /// pid/uid of the connecting process, when the socket tells us.
     pub peer: Option<PeerInfo>,
+    /// The process behind that pid, looked up once when this is built, so
+    /// the prompt and a remembered approval describe the same snapshot.
+    pub requester: Option<Requester>,
     /// Hosts this connection is bound to, oldest hop first. Empty when the
     /// client sent no binding (local tools like `ssh-add`, or OpenSSH < 8.9).
     pub bindings: Vec<SessionBinding>,
@@ -39,15 +43,39 @@ pub struct SessionBinding {
     /// Untrusted text like any other: escaped before display.
     pub host_name: Option<String>,
     pub is_forwarding: bool,
+    /// The session the host signed for, which a signature on this connection
+    /// has to be for as well.
+    pub session_id: Vec<u8>,
+    /// The host's key as it travels on the wire, which a host-bound request
+    /// has to name.
+    pub host_key: Vec<u8>,
 }
 
 impl ConfirmContext {
     pub fn new(entry: &KeyEntry, peer: Option<PeerInfo>, bindings: Vec<SessionBinding>) -> Self {
-        Self {
-            key_name: entry.name.clone(),
-            fingerprint: entry.fingerprint(),
-            item_id: entry.item_id.clone(),
+        Self::describing(
+            entry.name.clone(),
+            entry.fingerprint(),
+            entry.item_id.clone(),
             peer,
+            bindings,
+        )
+    }
+
+    /// For a request about no real key — `doctor`'s test prompt.
+    pub fn describing(
+        key_name: String,
+        fingerprint: String,
+        item_id: String,
+        peer: Option<PeerInfo>,
+        bindings: Vec<SessionBinding>,
+    ) -> Self {
+        Self {
+            key_name,
+            fingerprint,
+            item_id,
+            peer,
+            requester: peer.and_then(|peer| peer.pid).and_then(Requester::of),
             bindings,
         }
     }
@@ -88,29 +116,50 @@ pub fn from_config(
 
 /// Human-readable description of a signing request, shared by all confirmers.
 ///
-/// The key name, the requester's path and the host name are all untrusted — the
-/// vault, whoever spawned the process, and `known_hosts` respectively. They only
-/// ever travel as data, but control characters could still redraw a TTY prompt
-/// and a bidi override could reverse how a line renders, either of which spoofs
-/// what is being approved. So everything interpolated here is escaped.
+/// The key name, the requester's path, its ancestors' names and the host name
+/// are all untrusted — the vault, whoever spawned the processes, and
+/// `known_hosts` respectively. They only ever travel as data, but control
+/// characters could still redraw a TTY prompt and a bidi override could
+/// reverse how a line renders, either of which spoofs what is being approved.
+/// So everything interpolated here is escaped.
 pub fn describe_request(ctx: &ConfirmContext) -> String {
     use std::fmt::Write as _;
-    let requester = ctx.peer.map_or_else(
-        || "unknown".to_string(),
-        |peer| {
-            peer.pid.map_or_else(
-                || format!("uid {}", peer.uid),
-                |pid| {
-                    let process = process_path(pid)
-                        .map_or_else(|| "unknown process".to_string(), |p| escape_for_display(&p));
-                    format!("{process} (pid {pid}, uid {})", peer.uid)
-                },
-            )
-        },
-    );
+    let requester = match (ctx.peer, &ctx.requester) {
+        (None, _) => "unknown".to_string(),
+        (Some(peer), None) => peer.pid.map_or_else(
+            || format!("uid {}", peer.uid),
+            |pid| format!("unknown process (pid {pid}, uid {})", peer.uid),
+        ),
+        (Some(peer), Some(requester)) => {
+            let mut line = format!(
+                "{} (pid {}, uid {})",
+                requester.process,
+                // A requester is only ever looked up by a pid.
+                peer.pid.unwrap_or_default(),
+                peer.uid
+            );
+            // `ssh` says nothing about whether it was you. What it was started
+            // from — a shell in a terminal, an editor, a build — is what the
+            // person reading this recognises, and what a request from
+            // somewhere unexpected stands out by.
+            if !requester.origin.is_empty() {
+                let names: Vec<&str> = requester
+                    .origin
+                    .iter()
+                    .map(|ancestor| ancestor.name.as_str())
+                    .collect();
+                let _ = write!(line, "\nStarted from: {}", names.join(" → "));
+            }
+            line
+        }
+    };
+    // The name is cut to a bound and the rest only escaped: a fingerprint and
+    // an item id are already the size they are, and the requester's paths are
+    // the kernel's. The name is the vault's, and as long as whoever wrote it
+    // cared to make it.
     let mut text = format!(
         "SSH signature request\n\nKey: {}\nFingerprint: {}\nLastPass item: {}\nRequested by: {requester}",
-        escape_for_display(&ctx.key_name),
+        display_bounded(&ctx.key_name),
         escape_for_display(&ctx.fingerprint),
         escape_for_display(&ctx.item_id),
     );
@@ -126,52 +175,93 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
                 // host exactly and says nothing to the person reading it. The
                 // log keeps the fingerprint either way.
                 let mut hop =
-                    escape_for_display(bind.host_name.as_ref().unwrap_or(&bind.host_fingerprint));
+                    display_bounded(bind.host_name.as_ref().unwrap_or(&bind.host_fingerprint));
                 if bind.is_forwarding {
                     hop.push_str(" (forwarding the agent onward)");
                 }
                 hop
             })
             .collect();
-        let _ = write!(text, "\nSSH session: {}", chain.join(" → "));
+        // The warning ahead of the hops rather than after them: a chain is as
+        // long as a forwarded peer cares to make it, and a dialog clips at the
+        // bottom.
         if ctx.bindings.iter().any(|bind| bind.is_forwarding) {
             text.push_str(
-                "\n\nWARNING: the agent is forwarded to that host — this request may \
+                "\n\nWARNING: the agent is forwarded to a host below — this request may \
                  have originated there rather than on this machine.",
             );
         }
+        let _ = write!(text, "\nSSH session: {}", chain.join(" → "));
     }
     text
 }
 
-/// Executable path of a pid, best effort.
-fn process_path(pid: i32) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let size = usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE).expect("positive constant");
-        let mut buf = vec![0u8; size];
-        // SAFETY: proc_pidpath writes at most buf.len() bytes into buf.
-        let len = unsafe {
-            libc::proc_pidpath(
-                pid,
-                buf.as_mut_ptr().cast::<libc::c_void>(),
-                u32::try_from(size).expect("buffer fits u32"),
-            )
-        };
-        let len = usize::try_from(len).ok().filter(|l| *l > 0)?;
-        Some(String::from_utf8_lossy(&buf[..len]).to_string())
+/// What a remembered approval answers for: the key, and everything the
+/// prompt says about who asked — the process and its uid, what it was started
+/// from, and the hosts the session is bound to. The same words on screen are
+/// the same question; anything else asks again. The pid is left out, since a
+/// new `ssh` has a new one every time and is the point of remembering.
+///
+/// `None` when the requester cannot be told from another: no pid from the
+/// socket, or a pid whose executable cannot be read. An approval for
+/// "whatever runs as this uid" would answer for every process, so such a
+/// request is asked every time.
+pub fn approval_question(ctx: &ConfirmContext) -> Option<String> {
+    // Every piece is escaped text, which cannot contain a control character —
+    // so control characters as the separators make the encoding unambiguous:
+    // one between the items of a list, another between the fields of a hop,
+    // and every field always present. Joining on anything printable would let
+    // a process named for the separator make two ancestries read as one.
+    const SEP: char = '\x1f';
+    const FIELD: char = '\x1e';
+    let peer = ctx.peer?;
+    let requester = ctx.requester.as_ref()?;
+    // Each hop by its fingerprint and by the name the prompt shows for it: the
+    // name is looked up per signature, and one that comes and goes changes the
+    // words on screen, which is a different question.
+    let hosts: Vec<String> = ctx
+        .bindings
+        .iter()
+        .map(|bind| {
+            let mut hop = escape_for_display(&bind.host_fingerprint);
+            hop.push(FIELD);
+            hop.push_str(
+                &bind
+                    .host_name
+                    .as_deref()
+                    .map_or_else(String::new, escape_for_display),
+            );
+            hop.push(FIELD);
+            if bind.is_forwarding {
+                hop.push_str("forwarding");
+            }
+            hop
+        })
+        .collect();
+    // The fingerprint and name as well as the item: a key rotated or renamed
+    // inside its item between two requests is a different question, as the
+    // prompt would show.
+    let mut question = String::new();
+    for piece in [
+        escape_for_display(&ctx.item_id),
+        escape_for_display(&ctx.fingerprint),
+        escape_for_display(&ctx.key_name),
+        requester.process.clone(),
+        peer.uid.to_string(),
+        // By path, not by the name the prompt shows: a name is a file name
+        // anything can take, a path at least has to be that file.
+        requester
+            .origin
+            .iter()
+            .map(|ancestor| ancestor.path.as_str())
+            .collect::<Vec<_>>()
+            .join(&SEP.to_string()),
+        hosts.join(&SEP.to_string()),
+    ] {
+        question.push_str(&piece);
+        question.push('\n');
     }
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .map(|p| p.display().to_string())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = pid;
-        None
-    }
+    Some(question)
 }
 
 /// Used when `confirm = "off"` globally. A per-key override is handled by not
@@ -190,8 +280,9 @@ impl Confirmer for NoConfirmer {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::requester::Ancestor;
 
-    const ED25519_PUB: &str = include_str!("../../tests/fixtures/ed25519.pub");
+    use crate::testutil::fixtures::*;
 
     fn entry() -> KeyEntry {
         KeyEntry {
@@ -233,6 +324,8 @@ mod tests {
             host_fingerprint: "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU".into(),
             host_name: host_name.map(str::to_string),
             is_forwarding: false,
+            session_id: Vec::new(),
+            host_key: Vec::new(),
         }]
     }
 
@@ -268,22 +361,27 @@ mod tests {
         assert!(text.contains("\\x1b[2J"), "{text}");
     }
 
+    /// A context for a request from `peer`.
+    fn from_peer(peer: Option<PeerInfo>) -> ConfirmContext {
+        ConfirmContext::new(&entry(), peer, Vec::new())
+    }
+
     #[test]
     fn describe_request_names_the_requester() {
-        let mut ctx = ConfirmContext::new(&entry(), None, Vec::new());
+        let ctx = from_peer(None);
         assert!(describe_request(&ctx).contains("Requested by: unknown"));
 
-        ctx.peer = Some(PeerInfo {
+        let ctx = from_peer(Some(PeerInfo {
             pid: None,
             uid: 501,
-        });
+        }));
         assert!(describe_request(&ctx).contains("Requested by: uid 501"));
 
         // our own pid resolves to a real executable path
-        ctx.peer = Some(PeerInfo {
+        let ctx = from_peer(Some(PeerInfo {
             pid: Some(std::process::id().cast_signed()),
             uid: 501,
-        });
+        }));
         let text = describe_request(&ctx);
         assert!(
             text.contains(&format!("pid {}", std::process::id())),
@@ -331,17 +429,113 @@ mod tests {
     }
 
     #[test]
-    fn process_path_handles_bogus_pid() {
-        assert!(process_path(std::process::id().cast_signed()).is_some());
-        // pid 0 / absurd pids have no executable path
-        assert!(process_path(0).is_none());
-        let bogus = ConfirmContext {
-            peer: Some(PeerInfo {
-                pid: Some(0),
-                uid: 501,
+    fn the_request_says_what_it_was_started_from() {
+        // This process has a parent (the test runner, at least), so the line
+        // is there; pid 1's ancestry is nobody's application, so it is not.
+        let ctx = from_peer(Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        }));
+        let text = describe_request(&ctx);
+        assert!(text.contains("\nStarted from: "), "{text}");
+        // a process with no readable ancestry is named without the line
+        let rootless = ConfirmContext {
+            requester: Some(Requester {
+                process: "/usr/bin/ssh".into(),
+                origin: Vec::new(),
             }),
-            ..ConfirmContext::new(&entry(), None, Vec::new())
+            ..ctx
         };
-        assert!(describe_request(&bogus).contains("unknown process"));
+        let text = describe_request(&rootless);
+        assert!(text.contains("Requested by: /usr/bin/ssh (pid"), "{text}");
+        assert!(!text.contains("Started from"), "{text}");
+    }
+
+    #[test]
+    fn the_approval_question_is_the_prompt_without_the_pid() {
+        // A requester that cannot be told from another has no question to
+        // remember: no peer, no pid, or a pid with no readable executable.
+        assert!(approval_question(&from_peer(None)).is_none());
+        assert!(approval_question(&from_peer(Some(PeerInfo {
+            pid: None,
+            uid: 501,
+        })))
+        .is_none());
+        assert!(approval_question(&from_peer(Some(PeerInfo {
+            pid: Some(0),
+            uid: 501,
+        })))
+        .is_none());
+
+        let pid = std::process::id().cast_signed();
+        let mut ctx = from_peer(Some(PeerInfo {
+            pid: Some(pid),
+            uid: 501,
+        }));
+        let question = approval_question(&ctx).unwrap();
+        assert!(question.starts_with("42\nSHA256:"), "{question}");
+        assert!(question.contains("\nctx key\n"), "{question}");
+        assert!(!question.contains(&format!("{pid}\n")), "{question}");
+        assert!(question.contains("\n501\n"), "{question}");
+        // two ancestries that would read alike joined on the arrow the prompt
+        // uses are still two questions
+        let at = |path: &str| Ancestor {
+            name: path.rsplit('/').next().unwrap().to_string(),
+            path: path.to_string(),
+        };
+        let mut split = ctx.clone();
+        split.requester = Some(Requester {
+            process: "ssh".into(),
+            origin: vec![at("/bin/shell"), at("/bin/Terminal")],
+        });
+        let mut joined = ctx.clone();
+        joined.requester = Some(Requester {
+            process: "ssh".into(),
+            origin: vec![at("/bin/shell → /bin/Terminal")],
+        });
+        assert_ne!(approval_question(&split), approval_question(&joined));
+        // and two ancestries that share names but not paths are two questions
+        let mut elsewhere = split.clone();
+        elsewhere.requester = Some(Requester {
+            process: "ssh".into(),
+            origin: vec![at("/tmp/x/shell"), at("/tmp/x/Terminal")],
+        });
+        assert_ne!(approval_question(&split), approval_question(&elsewhere));
+
+        // the hosts tell two sessions apart, and forwarding is part of that
+        ctx.bindings = vec![
+            SessionBinding {
+                host_fingerprint: "SHA256:aaa".into(),
+                host_name: Some("a".into()),
+                is_forwarding: true,
+                session_id: Vec::new(),
+                host_key: Vec::new(),
+            },
+            SessionBinding {
+                host_fingerprint: "SHA256:bbb".into(),
+                host_name: None,
+                is_forwarding: false,
+                session_id: Vec::new(),
+                host_key: Vec::new(),
+            },
+        ];
+        let bound = approval_question(&ctx).unwrap();
+        assert!(
+            bound.ends_with("\nSHA256:aaa\x1ea\x1eforwarding\x1fSHA256:bbb\x1e\x1e\n"),
+            "{bound:?}"
+        );
+        assert_ne!(bound, question);
+        // a name that comes or goes is a different question too
+        ctx.bindings[0].host_name = None;
+        assert_ne!(approval_question(&ctx).unwrap(), bound);
+    }
+
+    #[test]
+    fn a_pid_with_no_executable_is_named_as_unknown() {
+        let bogus = from_peer(Some(PeerInfo {
+            pid: Some(0),
+            uid: 501,
+        }));
+        assert!(describe_request(&bogus).contains("unknown process (pid 0, uid 501)"));
     }
 }

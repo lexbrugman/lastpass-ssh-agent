@@ -13,6 +13,17 @@
   },
   "packageRules": [
     {
+      "description": "In-range releases of direct crates are accepted on the strength of the gate, not reviewed one by one, so they arrive as one pull request rather than one per crate; majors keep a PR of their own, since those are read. Lock file maintenance still refreshes the transitive tree weekly and overlaps with this on purpose — whichever lands first empties the other. The pinned pairs below match by name and stay disabled regardless of this grouping.",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "cargo non-major updates"
+    },
+    {
       "description": "One exception, not three: these are all pinned by the same chain. ssh-agent-lib 0.6 depends on ssh-key ^0.6, and ssh-key 0.6 is built on signature 2, rand_core 0.6 and rsa 0.9. We declare signature and rand_core directly only to import the traits ssh-key and rsa implement, and to guarantee the getrandom feature OsRng needs (see Cargo.toml) — so their versions are not ours to choose. Bumping one alone puts two incompatible copies of a crate in one binary, and cargo either fails to resolve or compiles the wrong traits; neither is fixable on this side. Lift all three together, and only once ssh-agent-lib publishes a release built on ssh-key 0.7+ — that is what unblocks the RustCrypto next generation (signature 3, rand_core 0.9+, rsa 0.10), which is still in release candidate. rsa 0.10 is also what would retire the RUSTSEC-2023-0071 exception in .cargo/audit.toml, so there is a real reason to revisit rather than let this sit. Patch updates are unaffected, and the caret ranges already absorb anything compatible through lockFileMaintenance.",
       "matchManagers": [
         "cargo"
@@ -44,12 +55,13 @@
       "enabled": false
     },
     {
-      "description": "The dev image's base tag floats within a major (rust:1-slim picks up new minors on 'docker compose build --pull', matching how CI floats on dtolnay/rust-toolchain@stable), so only the major needs a pull request. Grouping it keeps the Dockerfile and compose file in one change.",
+      "description": "The stable toolchain is pinned to one exact release in three places: the Dockerfile's base image, the dtolnay/rust-toolchain ref in the workflows, and rust-version in Cargo.toml (a per-version branch of that repository, which the github-actions manager cannot look up — the custom manager below reads it against the rust image tags instead). Grouped so a toolchain bump is one pull request that moves both, and the local gate and CI never run different compilers.",
       "matchManagers": [
         "dockerfile",
-        "docker-compose"
+        "docker-compose",
+        "custom.regex"
       ],
-      "groupName": "dev container base image"
+      "groupName": "rust toolchain"
     },
     {
       "description": "compose.yaml names the locally built dev image so all four services share one build. It is not published anywhere, so there is no registry for Renovate to look it up in.",
@@ -60,6 +72,33 @@
         "lastpass-ssh-agent-dev"
       ],
       "enabled": false
+    },
+    {
+      "description": "dtolnay/rust-toolchain is pinned to a per-version branch, not a release tag, so the github-actions manager has nothing to look up; the custom manager above tracks it.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "dtolnay/rust-toolchain"
+      ],
+      "enabled": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The stable toolchain pin in the workflows and Cargo.toml's rust-version, versioned by the rust image's tags so they move with the Dockerfile.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.yml$/",
+        "/^Cargo\\.toml$/"
+      ],
+      "matchStrings": [
+        "dtolnay/rust-toolchain@(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "rust-version = \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "semver"
     }
   ]
 }

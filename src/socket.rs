@@ -32,16 +32,7 @@ impl Drop for SocketGuard {
 /// - a dead leftover socket is removed
 /// - the socket itself is chmod 0600 after bind
 pub fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
-    let dir = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .ok_or_else(|| {
-            Error::Socket(format!(
-                "socket path {} has no parent directory",
-                path.display()
-            ))
-        })?;
-    prepare_dir(dir)?;
+    prepare_parent(path)?;
 
     match fs::symlink_metadata(path) {
         Ok(meta) if !is_socket(&meta) => {
@@ -92,9 +83,24 @@ pub fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
     ))
 }
 
+/// The directory a socket path lives in, created and checked as `bind` needs
+/// it. Also for whatever else the agent keeps beside its socket, when that is
+/// written before any agent has bound there — `list` on a fresh install.
+pub fn prepare_parent(path: &Path) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| {
+            Error::Socket(format!(
+                "socket path {} has no parent directory",
+                path.display()
+            ))
+        })?;
+    prepare_dir(dir)
+}
+
 /// Create the socket directory if it is missing and check the invariants
-/// `bind` relies on. Called by `bind`, and separately by `start` when the
-/// askpass wrapper has to be written there before anything is spawned.
+/// `bind` relies on.
 pub fn prepare_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
         fs::create_dir_all(dir)?;

@@ -14,8 +14,12 @@ on:
         required: true
         type: string
 
+# `id-token` and `attestations` are for the provenance attestation below;
+# the caller has to grant them too.
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   publish:
@@ -43,6 +47,16 @@ jobs:
           # files users download. Checking them here is what makes the two the
           # same bytes, rather than assuming the artifact round-trip was clean.
           sha256sum -c ./*.sha256
+
+      # A signed statement, kept by GitHub against each archive's digest, that
+      # this workflow built it from this commit. It is what `gh attestation
+      # verify` checks at install time, and the only thing here a checksum
+      # cannot stand in for: the .sha256 files come from the same job as the
+      # archives, so whoever could replace one could replace the other. Done
+      # before the draft exists, so a release never goes out unattested.
+      - uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: dist/*.tar.xz
 
       - name: Create the draft release
         env:

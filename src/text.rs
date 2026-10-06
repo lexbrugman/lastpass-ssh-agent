@@ -37,6 +37,24 @@ pub fn escape_for_display(text: &str) -> String {
     out
 }
 
+/// The most of one untrusted string a prompt shows. A dialog has a fixed
+/// height and clips at the bottom, so a key name long enough pushes the lines
+/// that say who is asking and for which host off it. Far more than any name
+/// needs; the log keeps the whole text.
+pub const MAX_DISPLAY_CHARS: usize = 200;
+
+/// `escape_for_display`, cut to `MAX_DISPLAY_CHARS` with a marker saying how
+/// much was left out. Measured after escaping, so the escapes themselves
+/// cannot carry the text past the bound.
+pub fn display_bounded(text: &str) -> String {
+    let escaped = escape_for_display(text);
+    let Some((cut, _)) = escaped.char_indices().nth(MAX_DISPLAY_CHARS) else {
+        return escaped;
+    };
+    let omitted = escaped[cut..].chars().count();
+    format!("{}… [{omitted} more]", &escaped[..cut])
+}
+
 /// Characters that render as nothing, as inclusive codepoint ranges.
 ///
 /// This is Unicode's own `Default_Ignorable_Code_Point` — the property the
@@ -93,6 +111,20 @@ fn is_invisible(c: char) -> bool {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_text_is_cut_with_a_count_of_what_was_left_out() {
+        let at_the_bound = "é".repeat(MAX_DISPLAY_CHARS);
+        assert_eq!(display_bounded(&at_the_bound), at_the_bound);
+        let over = format!("{at_the_bound}xyz");
+        assert_eq!(display_bounded(&over), format!("{at_the_bound}… [3 more]"));
+        // measured after escaping: one control character is four
+        let escapes = "\x01".repeat(60);
+        assert_eq!(
+            display_bounded(&escapes),
+            format!("{}… [40 more]", "\\x01".repeat(50))
+        );
+    }
 
     #[test]
     fn ordinary_text_is_untouched() {

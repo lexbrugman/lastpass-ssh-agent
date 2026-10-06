@@ -2,8 +2,10 @@ use rsa::pkcs1v15::SigningKey;
 use rsa::sha2::{Sha256, Sha512};
 use signature::{RandomizedSigner, SignatureEncoding, Signer};
 use ssh_agent_lib::proto::signature as sigflag;
+use ssh_agent_lib::ssh_encoding::{Decode as _, Reader as _};
 use ssh_key::private::KeypairData;
-use ssh_key::{Algorithm, EcdsaCurve, PrivateKey, Signature};
+use ssh_key::public::KeyData;
+use ssh_key::{Algorithm, Certificate, EcdsaCurve, PrivateKey, PublicKey, Signature};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SignError {
@@ -44,6 +46,144 @@ fn crypto_err<E: std::fmt::Display>(e: E) -> SignError {
 
 /// Produce an SSH signature honoring the agent-protocol flags.
 ///
+/// The session id a userauth request is for, when `data` is one — whole,
+/// for `public_key`, and in the host-bound form for `host_key`.
+///
+/// What `ssh` asks an agent to sign for public-key authentication (RFC 4252
+/// §7, and OpenSSH's host-bound variant): the session id, the message
+/// number, user, service, method, the flag that a signature follows, the
+/// algorithm and the key — and for the host-bound method the server's host
+/// key after that, which has to be the one the connection is bound to, or a
+/// host in the middle could sign its own session id and pass the request
+/// off as one for the host beyond it. Anything shaped otherwise is `None`:
+/// a bound connection gets nothing else signed.
+pub fn userauth_session_id<'a>(
+    data: &'a [u8],
+    public_key: &[u8],
+    host_key: &[u8],
+) -> Option<&'a [u8]> {
+    const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
+    let mut request = Wire(data);
+    let session_id = request.string()?;
+    (request.byte()? == SSH_MSG_USERAUTH_REQUEST).then_some(())?;
+    let _user = request.string()?;
+    (request.string()? == b"ssh-connection").then_some(())?;
+    let method = request.string()?;
+    let host_bound = method == b"publickey-hostbound-v00@openssh.com";
+    (host_bound || method == b"publickey").then_some(())?;
+    (request.byte()? == 1).then_some(())?;
+    let _algorithm = request.string()?;
+    (request.string()? == public_key).then_some(())?;
+    if host_bound {
+        (request.string()? == host_key).then_some(())?;
+    }
+    request.0.is_empty().then_some(session_id)
+}
+
+/// A `session-bind@openssh.com` request as OpenSSH lays it out: the host's
+/// key as it travelled in the key exchange, the session id, the host's
+/// signature over it, and whether the agent is forwarded onward from there.
+///
+/// The host key is kept as the bytes it arrived in. A host-bound userauth
+/// request carries the same bytes, so that is what `userauth_session_id`
+/// compares against — and when the host's key is a certificate, re-encoding
+/// it from the parsed key would drop the certificate and match nothing.
+pub struct SessionBindRequest<'a> {
+    pub host_key: &'a [u8],
+    pub session_id: &'a [u8],
+    pub signature: &'a [u8],
+    pub is_forwarding: bool,
+}
+
+/// Why a binding is refused, worded for the log.
+#[derive(Debug, thiserror::Error)]
+pub enum BindError {
+    #[error("the host key does not parse: {0}")]
+    HostKey(ssh_key::Error),
+
+    #[error("the host's signature does not parse: {0}")]
+    Signature(ssh_key::Error),
+
+    #[error("the host's signature does not verify: {0}")]
+    Unverified(signature::Error),
+}
+
+/// The fields of a `session-bind@openssh.com` request, when `data` is one —
+/// whole, with nothing after the forwarding flag.
+pub fn session_bind(data: &[u8]) -> Option<SessionBindRequest<'_>> {
+    let mut request = Wire(data);
+    let host_key = request.string()?;
+    let session_id = request.string()?;
+    let signature = request.string()?;
+    let is_forwarding = request.byte()? != 0;
+    request.0.is_empty().then_some(SessionBindRequest {
+        host_key,
+        session_id,
+        signature,
+        is_forwarding,
+    })
+}
+
+/// The key a binding's host proved itself with: the one it sent, or the one
+/// inside the certificate it sent.
+///
+/// A server set up with `HostCertificate` presents the certificate as its
+/// host key, and `ssh` binds whatever the server presented. The certificate
+/// is not checked against any authority here, the same as in OpenSSH's own
+/// agent: what a binding proves is that the far end holds the key it named,
+/// and the key inside the certificate is what signed the session id. It is
+/// also what `known_hosts` could record and what the prompt fingerprints.
+pub fn bound_host_key(bind: &SessionBindRequest<'_>) -> Result<KeyData, BindError> {
+    use signature::Verifier as _;
+
+    // The algorithm id is the first string in either encoding, and it is the
+    // id — not whether the rest happens to parse as one or the other — that
+    // says which the host sent.
+    let is_certificate = Wire(bind.host_key)
+        .string()
+        .is_some_and(|id| id.ends_with(b"-cert-v01@openssh.com"));
+    let host_key = if is_certificate {
+        Certificate::from_bytes(bind.host_key).map(|cert| cert.public_key().clone())
+    } else {
+        PublicKey::from_bytes(bind.host_key).map(|key| key.key_data().clone())
+    }
+    .map_err(BindError::HostKey)?;
+
+    let mut reader = bind.signature;
+    let signature = Signature::decode(&mut reader).map_err(BindError::Signature)?;
+    let signature = reader.finish(signature).map_err(trailing_signature_bytes)?;
+
+    host_key
+        .verify(bind.session_id, &signature)
+        .map_err(BindError::Unverified)?;
+    Ok(host_key)
+}
+
+/// Bytes after a signature mean the blob is not one signature, however well
+/// the front of it parsed.
+fn trailing_signature_bytes(e: ssh_agent_lib::ssh_encoding::Error) -> BindError {
+    BindError::Signature(e.into())
+}
+
+/// A cursor over SSH wire encoding: length-prefixed strings and single bytes.
+struct Wire<'a>(&'a [u8]);
+
+impl<'a> Wire<'a> {
+    fn byte(&mut self) -> Option<u8> {
+        let (first, rest) = self.0.split_first()?;
+        self.0 = rest;
+        Some(*first)
+    }
+
+    fn string(&mut self) -> Option<&'a [u8]> {
+        let len = usize::try_from(u32::from_be_bytes(self.0.get(..4)?.try_into().ok()?)).ok()?;
+        let end = 4usize.checked_add(len)?;
+        let value = self.0.get(4..end)?;
+        self.0 = &self.0[end..];
+        Some(value)
+    }
+}
+
 /// RSA cannot go through ssh-key 0.6.7's own `Signer`: it hard-codes
 /// rsa-sha2-512 (ignoring the flags) and its `RsaKeypair -> rsa::RsaPrivateKey`
 /// conversion passes `p` twice. So the components are converted here and the
@@ -106,15 +246,122 @@ fn to_biguint(mpint: &ssh_key::Mpint) -> Result<rsa::BigUint, SignError> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    /// A userauth request as `ssh` builds one, field by field.
+    fn userauth(fields: &[&[u8]], message: u8, flag: u8) -> Vec<u8> {
+        let string = |value: &[u8]| {
+            let mut out = u32::try_from(value.len()).unwrap().to_be_bytes().to_vec();
+            out.extend_from_slice(value);
+            out
+        };
+        let mut data = string(fields[0]);
+        data.push(message);
+        data.extend(string(fields[1]));
+        data.extend(string(fields[2]));
+        data.extend(string(fields[3]));
+        data.push(flag);
+        for field in &fields[4..] {
+            data.extend(string(field));
+        }
+        data
+    }
+
+    #[test]
+    fn a_userauth_request_names_its_session_and_anything_else_does_not() {
+        let key = b"blob";
+        let ok = userauth(
+            &[
+                b"sid",
+                b"user",
+                b"ssh-connection",
+                b"publickey",
+                b"ssh-ed25519",
+                key,
+            ],
+            50,
+            1,
+        );
+        let host = b"host key";
+        assert_eq!(userauth_session_id(&ok, key, host), Some(&b"sid"[..]));
+        let bound = userauth(
+            &[
+                b"sid",
+                b"user",
+                b"ssh-connection",
+                b"publickey-hostbound-v00@openssh.com",
+                b"ssh-ed25519",
+                key,
+                b"host key",
+            ],
+            50,
+            1,
+        );
+        assert_eq!(userauth_session_id(&bound, key, host), Some(&b"sid"[..]));
+        // bound to a host, for another: a host in the middle passing a
+        // request off as one for the host beyond it
+        assert_eq!(userauth_session_id(&bound, key, b"other host"), None);
+
+        // another message, another service, another method, no signature
+        // flag, another key, trailing bytes, and a host-bound request
+        // without its host key: none of them is this request
+        let fields: &[&[u8]] = &[
+            b"sid",
+            b"user",
+            b"ssh-connection",
+            b"publickey",
+            b"ssh-ed25519",
+            key,
+        ];
+        assert_eq!(
+            userauth_session_id(&userauth(fields, 51, 1), key, host),
+            None
+        );
+        assert_eq!(
+            userauth_session_id(&userauth(fields, 50, 0), key, host),
+            None
+        );
+        assert_eq!(userauth_session_id(&ok, b"other", host), None);
+        let mut trailing = ok;
+        trailing.push(0);
+        assert_eq!(userauth_session_id(&trailing, key, host), None);
+        let wrong_service = userauth(
+            &[
+                b"sid",
+                b"user",
+                b"ssh-userauth",
+                b"publickey",
+                b"ssh-ed25519",
+                key,
+            ],
+            50,
+            1,
+        );
+        assert_eq!(userauth_session_id(&wrong_service, key, host), None);
+        let wrong_method = userauth(
+            &[
+                b"sid",
+                b"user",
+                b"ssh-connection",
+                b"password",
+                b"ssh-ed25519",
+                key,
+            ],
+            50,
+            1,
+        );
+        assert_eq!(userauth_session_id(&wrong_method, key, host), None);
+        let mut unbound_host = bound.clone();
+        unbound_host.truncate(bound.len() - 12);
+        assert_eq!(userauth_session_id(&unbound_host, key, host), None);
+        // and shapes that are not even a request
+        assert_eq!(userauth_session_id(&[0, 0, 0, 3, b'a'], key, host), None);
+        assert_eq!(userauth_session_id(&[0, 0], key, host), None);
+        assert_eq!(userauth_session_id(&[0, 0, 0, 0], key, host), None);
+        assert_eq!(userauth_session_id(b"x", key, host), None);
+    }
     use signature::Verifier;
 
-    const ED25519: &str = include_str!("../tests/fixtures/ed25519");
-    const ED25519_PUB: &str = include_str!("../tests/fixtures/ed25519.pub");
-    const RSA: &str = include_str!("../tests/fixtures/rsa");
-    const RSA_PUB: &str = include_str!("../tests/fixtures/rsa.pub");
-    const ECDSA: &str = include_str!("../tests/fixtures/ecdsa");
-    const ECDSA_PUB: &str = include_str!("../tests/fixtures/ecdsa.pub");
-    const ED25519_PW: &str = include_str!("../tests/fixtures/ed25519_pw");
+    use crate::testutil::fixtures::*;
 
     fn keypair(private: &str, public: &str) -> (PrivateKey, ssh_key::PublicKey) {
         (
