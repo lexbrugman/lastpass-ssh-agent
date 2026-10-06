@@ -123,7 +123,7 @@ Or build it yourself:
 
 ```sh
 brew install lastpass-cli
-cargo build --release        # needs rustup; rust-version >= 1.87
+cargo build --release        # needs rustup; the release Cargo.toml names as rust-version
 cp target/release/lastpass-ssh-agent /usr/local/bin/  # or anywhere on PATH
 ```
 
@@ -751,12 +751,13 @@ version is tracked as precisely as its own format allows:
   all; a floating major tag stays silent until the next major. Digests are
   deliberately not pinned (`"pinDigests": false`) — an exact tag is specific
   enough to track and stays readable.
-- **The stable toolchain is one version in two places**: `rust:<version>-slim`
-  in the Dockerfile and `dtolnay/rust-toolchain@<version>` in the workflows.
-  Renovate moves both in a single pull request (a regex manager in
-  `renovate.json` reads the workflow pin against the `rust` image tags), so
-  the local gate and CI always run the same compiler and a new release's
-  lints arrive as a reviewed change rather than as a red build.
+- **The stable toolchain is one version in three places**: `rust:<version>-slim`
+  in the Dockerfile, `dtolnay/rust-toolchain@<version>` in the workflows, and
+  `rust-version` in `Cargo.toml`. Renovate moves all three in a single pull
+  request (a regex manager in `renovate.json` reads the latter two against the
+  `rust` image tags), so the local gate and CI always run the same compiler, a
+  new release's lints arrive as a reviewed change rather than as a red build,
+  and the minimum version the crate claims is the one that is actually built.
 Two things are deliberately not tracked, because a version is the wrong
 thing to pin:
 

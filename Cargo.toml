@@ -6,7 +6,9 @@ name = "lastpass-ssh-agent"
 # released. `--version` reports the stamp build.rs resolves, not this.
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.87"
+# The release the gate and CI run (Dockerfile, checks.yml). Nothing older is
+# ever built, so nothing older is claimed; Renovate moves it with them.
+rust-version = "1.99.0"
 description = "SSH agent backed by the LastPass CLI: private keys never persist on disk, every signature is fetched, confirmed, used, and zeroized."
 license = "MIT"
 # Where the project lives. The release URLs are built from the repository the

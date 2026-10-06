@@ -44,7 +44,7 @@
       "enabled": false
     },
     {
-      "description": "The stable toolchain is pinned to one exact release in two places: the Dockerfile's base image and the dtolnay/rust-toolchain ref in the workflows (a per-version branch of that repository, which the github-actions manager cannot look up — the custom manager below reads it against the rust image tags instead). Grouped so a toolchain bump is one pull request that moves both, and the local gate and CI never run different compilers.",
+      "description": "The stable toolchain is pinned to one exact release in three places: the Dockerfile's base image, the dtolnay/rust-toolchain ref in the workflows, and rust-version in Cargo.toml (a per-version branch of that repository, which the github-actions manager cannot look up — the custom manager below reads it against the rust image tags instead). Grouped so a toolchain bump is one pull request that moves both, and the local gate and CI never run different compilers.",
       "matchManagers": [
         "dockerfile",
         "docker-compose",
@@ -76,12 +76,14 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "The stable toolchain pin in the workflows, versioned by the rust image's tags so it moves with the Dockerfile.",
+      "description": "The stable toolchain pin in the workflows and Cargo.toml's rust-version, versioned by the rust image's tags so they move with the Dockerfile.",
       "managerFilePatterns": [
-        "/^\\.github/workflows/.+\\.yml$/"
+        "/^\\.github/workflows/.+\\.yml$/",
+        "/^Cargo\\.toml$/"
       ],
       "matchStrings": [
-        "dtolnay/rust-toolchain@(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+        "dtolnay/rust-toolchain@(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "rust-version = \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
       ],
       "depNameTemplate": "rust",
       "datasourceTemplate": "docker",
