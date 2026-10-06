@@ -13,7 +13,7 @@
   },
   "packageRules": [
     {
-      "description": "In-range releases of direct crates are accepted on the strength of the gate, not reviewed one by one, so they arrive as one pull request rather than one per crate; majors keep a PR of their own, since those are read. Lock file maintenance still refreshes the transitive tree weekly and overlaps with this on purpose — whichever lands first empties the other. The pinned pairs below match by name and stay disabled regardless of this grouping.",
+      "description": "In-range releases of direct crates are accepted on the strength of the gate, not reviewed one by one, so they arrive as one pull request rather than one per crate. Excluded: anything still on 0.x, whose next minor cargo's caret treats as a breaking major — Renovate calls it a minor, so without this it would be grouped with the lock-file-only bumps. Those, like majors, keep a pull request of their own, since those are read. Lock file maintenance still refreshes the transitive tree weekly and overlaps with this on purpose — whichever lands first empties the other. The pinned pairs below match by name and stay disabled regardless of this grouping.",
       "matchManagers": [
         "cargo"
       ],
@@ -21,7 +21,8 @@
         "minor",
         "patch"
       ],
-      "groupName": "cargo non-major updates"
+      "groupName": "cargo non-major updates",
+      "matchCurrentVersion": "!/^0\\./"
     },
     {
       "description": "One exception, not three: these are all pinned by the same chain. ssh-agent-lib 0.6 depends on ssh-key ^0.6, and ssh-key 0.6 is built on signature 2, rand_core 0.6 and rsa 0.9. We declare signature and rand_core directly only to import the traits ssh-key and rsa implement, and to guarantee the getrandom feature OsRng needs (see Cargo.toml) — so their versions are not ours to choose. Bumping one alone puts two incompatible copies of a crate in one binary, and cargo either fails to resolve or compiles the wrong traits; neither is fixable on this side. Lift all three together, and only once ssh-agent-lib publishes a release built on ssh-key 0.7+ — that is what unblocks the RustCrypto next generation (signature 3, rand_core 0.9+, rsa 0.10), which is still in release candidate. rsa 0.10 is also what would retire the RUSTSEC-2023-0071 exception in .cargo/audit.toml, so there is a real reason to revisit rather than let this sit. Patch updates are unaffected, and the caret ranges already absorb anything compatible through lockFileMaintenance.",
