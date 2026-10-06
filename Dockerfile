@@ -1,9 +1,10 @@
 # Everything the local gate needs, so the host needs Docker and nothing
 # else: stable Rust with rustfmt + clippy for the lint gate, nightly with
 # llvm-tools for branch-instrumented coverage, cargo-llvm-cov, and
-# cargo-audit. Toolchains float with upstream exactly like CI's, so the gate
-# behaves identically in both places.
-FROM rust:1.98.0-slim-trixie
+# cargo-audit. Stable is the release CI pins (checks.yml, build-release.yml)
+# and nightly floats as CI's does, so the gate behaves identically in both
+# places.
+FROM rust:1.99.0-slim-trixie
 
 # git: build.rs stamps the binary with the current commit.
 # curl + ca-certificates: fetching the cargo-llvm-cov release binary below.

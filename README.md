@@ -751,12 +751,18 @@ version is tracked as precisely as its own format allows:
   all; a floating major tag stays silent until the next major. Digests are
   deliberately not pinned (`"pinDigests": false`) — an exact tag is specific
   enough to track and stays readable.
+- **The stable toolchain is one version in two places**: `rust:<version>-slim`
+  in the Dockerfile and `dtolnay/rust-toolchain@<version>` in the workflows.
+  Renovate moves both in a single pull request (a regex manager in
+  `renovate.json` reads the workflow pin against the `rust` image tags), so
+  the local gate and CI always run the same compiler and a new release's
+  lints arrive as a reviewed change rather than as a red build.
 Two things are deliberately not tracked, because a version is the wrong
 thing to pin:
 
-- **`dtolnay/rust-toolchain@stable` and `@nightly`** are branch references,
-  not versions. The point is to compile against whatever those resolve to
-  today, which is also what the dev container does.
+- **`dtolnay/rust-toolchain@nightly`** is a branch reference, not a version.
+  It only runs the coverage build, and the point is to instrument with
+  whatever nightly is today.
 - **The `tool:` inputs to `taiki-e/install-action`** name `cargo-audit` and
   `cargo-llvm-cov` without versions, matching how the dev container fetches
   them. Pinning one side only would let CI and the container drift apart.

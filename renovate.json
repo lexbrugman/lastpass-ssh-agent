@@ -44,12 +44,13 @@
       "enabled": false
     },
     {
-      "description": "The dev image's base tag floats within a major (rust:1-slim picks up new minors on 'docker compose build --pull', matching how CI floats on dtolnay/rust-toolchain@stable), so only the major needs a pull request. Grouping it keeps the Dockerfile and compose file in one change.",
+      "description": "The stable toolchain is pinned to one exact release in two places: the Dockerfile's base image and the dtolnay/rust-toolchain ref in the workflows (a per-version branch of that repository, which the github-actions manager cannot look up — the custom manager below reads it against the rust image tags instead). Grouped so a toolchain bump is one pull request that moves both, and the local gate and CI never run different compilers.",
       "matchManagers": [
         "dockerfile",
-        "docker-compose"
+        "docker-compose",
+        "custom.regex"
       ],
-      "groupName": "dev container base image"
+      "groupName": "rust toolchain"
     },
     {
       "description": "compose.yaml names the locally built dev image so all four services share one build. It is not published anywhere, so there is no registry for Renovate to look it up in.",
@@ -60,6 +61,31 @@
         "lastpass-ssh-agent-dev"
       ],
       "enabled": false
+    },
+    {
+      "description": "dtolnay/rust-toolchain is pinned to a per-version branch, not a release tag, so the github-actions manager has nothing to look up; the custom manager above tracks it.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "dtolnay/rust-toolchain"
+      ],
+      "enabled": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The stable toolchain pin in the workflows, versioned by the rust image's tags so it moves with the Dockerfile.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.yml$/"
+      ],
+      "matchStrings": [
+        "dtolnay/rust-toolchain@(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "semver"
     }
   ]
 }

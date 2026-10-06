@@ -18,15 +18,18 @@ env:
 
 # Actions are pinned to exact releases rather than floating major tags, so
 # Renovate raises a pull request for every patch; @v7 would stay silent until
-# v8. The toolchain actions are the exception — `stable` and `nightly` are
-# branch references, and resolving them fresh is the whole point.
+# v8. The stable toolchain is pinned to a release too, in step with the
+# Dockerfile; `nightly` is the one exception — a branch reference, resolved
+# fresh, since it only instruments the coverage build.
 jobs:
   lint:
     name: fmt + clippy (check only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
+      # The release the dev image is built on (Dockerfile), so the gate here
+      # and the gate there run one compiler; Renovate moves both in one PR.
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
           # Type-checking only: the macOS-gated code never compiles on the
