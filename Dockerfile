@@ -4,7 +4,7 @@
 # cargo-audit. Stable is the release CI pins (checks.yml, build-release.yml)
 # and nightly floats as CI's does, so the gate behaves identically in both
 # places.
-FROM rust:1.99.0-slim-trixie
+FROM rust:1.99.1-slim-trixie
 
 # git: build.rs stamps the binary with the current commit.
 # curl + ca-certificates: fetching the cargo-llvm-cov release binary below.
