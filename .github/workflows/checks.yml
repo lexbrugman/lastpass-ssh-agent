@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
       # The release the dev image is built on (Dockerfile), so the gate here
       # and the gate there run one compiler; Renovate moves both in one PR.
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
           # Type-checking only: the macOS-gated code never compiles on the
