@@ -36,7 +36,7 @@ jobs:
           # Linux runner otherwise, and the test job that does build it runs
           # the suite rather than clippy.
           targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --target aarch64-apple-darwin --all-targets -- -D warnings
@@ -74,7 +74,7 @@ jobs:
       - uses: taiki-e/install-action@v2.87.27
         with:
           tool: cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       # On both platforms, because both are release build platforms:
       # archive.sh picks a different checksum tool per platform and tars with
