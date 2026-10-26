@@ -22,5 +22,20 @@
 # fixed. It matters most with `confirm = "off"` on a forwarded RSA key.
 #
 # Revisit when a fixed release appears: the audit is what will say so.
+#
+# RUSTSEC-2026-0387 — secret-dependent timing in `crypto-bigint` 0.5
+# (subtraction, division, Montgomery multiplication, limb-wise equality).
+# Accepted rather than fixed for the same reason: the fix is 0.7.6, and 0.5 is
+# what elliptic-curve 0.13 builds on, which p256 and p384 pin for ssh-key 0.6 —
+# the chain renovate.json describes. It lifts with ssh-key 0.7, together with
+# the exception above.
+#
+# Where it reaches: the scalar arithmetic of an ECDSA signature over a P-256
+# or P-384 key. ed25519 and RSA keys do not go through it.
+#
+# Mitigation: as above — signing is gated on a human confirmation by default,
+# bounding samples to roughly one per dialog, and no key is cached, so the
+# private scalar exists only for the one operation.
+#
 # Every other advisory, present or future, remains a hard failure.
-ignore = ["RUSTSEC-2023-0071"]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]

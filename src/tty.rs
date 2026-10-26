@@ -33,7 +33,10 @@ pub fn open(path: &Path) -> std::io::Result<Terminal> {
         .write(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)?;
-    AsyncFd::new(tty)
+    // SAFETY: the descriptor stays open and unchanged for as long as it is
+    // registered — the `File` is owned by the `AsyncFd`, which is what closes
+    // it.
+    unsafe { AsyncFd::register(tty) }.map_err(std::io::Error::from)
 }
 
 /// Drop anything typed before the prompt was shown.
