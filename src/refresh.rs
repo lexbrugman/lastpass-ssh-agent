@@ -115,10 +115,9 @@ impl Refresher {
         else {
             return;
         };
-        let remembered = store.remember();
-        let count = remembered.keys.len();
+        keystore::remember_if_complete(&self.remembered_at, &store);
+        let count = store.entries().count();
         self.served.replace(store);
-        crate::identities::save_best_effort(&self.remembered_at, &remembered);
         tracing::info!(keys = count, "refreshed the identities from the vault");
     }
 }

@@ -20,7 +20,7 @@ pub async fn list(config_path: &Path) -> Result<()> {
     // is not there.
     let socket_path = config.socket_path()?;
     socket::prepare_parent(&socket_path)?;
-    super::remember_if_complete(&identities::path_for(&socket_path), &store, keys.len());
+    keystore::remember_if_complete(&identities::path_for(&socket_path), &store);
     for entry in store.entries() {
         println!(
             "{}  {}  {}  [id: {}]  confirm={}",

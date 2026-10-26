@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::lpass::{self, LpassClient};
-use crate::{identities, keystore, master, passphrase, unlock};
+use crate::{master, passphrase, unlock};
 
 /// The agent's master-password holder, from the config: the platform's store
 /// beside the socket, the prompt `confirm` selects, and the idle time.
@@ -68,23 +68,6 @@ fn client_from(config: &Config) -> Result<lpass::LpassCli> {
         )
     })?;
     Ok(lpass::LpassCli::new(binary))
-}
-
-/// Write a scanned set down for the next start — but only a set nothing was
-/// skipped from. `KeyStore::load` carries on past an item the vault would not
-/// answer for, which is right for serving and wrong for the file: a set missing a
-/// key would be trusted until something refreshed it.
-fn remember_if_complete(path: &Path, store: &keystore::KeyStore, wanted: usize) {
-    let skipped = wanted - store.entries().count();
-    if skipped == 0 {
-        identities::save_best_effort(path, &store.remember());
-    } else {
-        tracing::warn!(
-            skipped,
-            "not writing the remembered identities down: a set missing a key must not be \
-             what the next start trusts"
-        );
-    }
 }
 
 /// Fixtures the subcommands' tests share.

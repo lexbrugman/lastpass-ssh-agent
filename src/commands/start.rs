@@ -66,10 +66,9 @@ pub async fn run(config_path: &Path) -> Result<()> {
     // needs it, which is the scan's — so a start the file spares never asks,
     // and one that cannot ask says what to do instead of failing bare.
     let remembered_at = identities::path_for(&socket_path);
-    // `scanned_for` is how many keys the scan set out to load, when there was
-    // one: what the file is written from has to be checked against it.
-    let (store, scanned_for) = if let Some(store) = remembered_store(&remembered_at, &config)? {
-        (store, None)
+    // Only a scan is written down: what the file supplied is already in it.
+    let (store, scanned) = if let Some(store) = remembered_store(&remembered_at, &config)? {
+        (store, false)
     } else {
         let keys = keystore::effective_keys(&asking, &config)
             .await
@@ -77,7 +76,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
         let store = keystore::KeyStore::load(asking.as_ref(), &keys, &config)
             .await
             .map_err(first_start_needs_the_vault)?;
-        (store, Some(keys.len()))
+        (store, true)
     };
     let store = keystore::Served::new(store);
     for entry in store.current().entries() {
@@ -103,8 +102,8 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let (listener, guard) = socket::bind(&socket_path)?;
     // After the bind, which is what guarantees the directory exists. Best
     // effort: a start that cannot write beside its own socket still serves.
-    if let Some(wanted) = scanned_for {
-        super::remember_if_complete(&remembered_at, &store.current(), wanted);
+    if scanned {
+        keystore::remember_if_complete(&remembered_at, &store.current());
     }
     // Refreshes through a client fed only what is already held, so a scan can
     // never put a prompt on screen: the vault is either open, and the scan is
