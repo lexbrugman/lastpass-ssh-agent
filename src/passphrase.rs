@@ -10,7 +10,6 @@
 //! Nothing here logs, formats or stores a passphrase. Secrets travel in
 //! `Zeroizing` buffers and are wiped when the signature is done.
 
-mod askpass;
 // Excluded from coverage as a whole, which is the point of it being this
 // small: every line in it talks to the real Keychain of whoever runs the
 // tests, and the suite must never do that. The rules around these calls are
@@ -18,22 +17,19 @@ mod askpass;
 #[cfg(target_os = "macos")]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod keychain;
-mod osascript;
 // Not excluded as a whole: only the two calls that reach the bus are, and what
 // identifies a stored item is decided and tested beside them.
 #[cfg(target_os = "linux")]
 mod secretservice;
-mod tty;
 
-pub use askpass::AskpassPrompt;
-pub use osascript::OsascriptPrompt;
-pub use tty::TtyPrompt;
+use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
 use crate::config::PassphraseFallback;
 use crate::keystore::KeyEntry;
 use crate::lpass::{Access, LpassClient};
+use crate::prompt::{Failure, Transport};
 use crate::text::{display_bounded, escape_for_display};
 
 /// What the user is being asked to unlock. Display context only — no secret
@@ -132,71 +128,6 @@ impl std::fmt::Display for PromptError {
 /// bytes of passphrase always fit.
 pub const MAX_PASSPHRASE_BYTES: usize = 1024;
 
-/// A prompt helper's pipe or exit could not be read.
-///
-/// A named function rather than an inline closure so its body is not a line of
-/// its own in the coverage report: no test can make a helper's pipe error or
-/// its `wait` fail once it has closed stdout, and excluding one shared mapping
-/// beats excluding the readers that enforce the cap.
-#[cfg_attr(coverage_nightly, coverage(off))]
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "by value is what map_err hands a function; taking a reference \
-              would require wrapping it in a closure, and that closure body \
-              would be the uncovered line this exists to avoid"
-)]
-fn helper_failed(e: std::io::Error) -> PromptError {
-    PromptError::Unavailable(format!("passphrase helper failed: {e}"))
-}
-
-/// Read a helper's answer into a buffer that is allocated once and wiped on
-/// drop, refusing anything past the cap instead of growing to fit it.
-async fn read_secret(
-    pipe: &mut tokio::process::ChildStdout,
-) -> Result<Zeroizing<Vec<u8>>, PromptError> {
-    use tokio::io::AsyncReadExt as _;
-    let mut out = Zeroizing::new(Vec::with_capacity(MAX_PASSPHRASE_BYTES));
-    let mut chunk = Zeroizing::new([0u8; 256]);
-    loop {
-        let read = pipe.read(&mut chunk[..]).await.map_err(helper_failed)?;
-        if read == 0 {
-            return Ok(out);
-        }
-        if out.len() + read > MAX_PASSPHRASE_BYTES {
-            return Err(PromptError::TooLong(MAX_PASSPHRASE_BYTES));
-        }
-        out.extend_from_slice(&chunk[..read]);
-    }
-}
-
-/// Read a helper's diagnostics, which say why it failed rather than what was
-/// typed. Capped so a spewing helper cannot exhaust memory here either.
-async fn read_diagnostics(pipe: &mut tokio::process::ChildStderr) -> Result<Vec<u8>, PromptError> {
-    use tokio::io::AsyncReadExt as _;
-    let mut out = Vec::new();
-    pipe.take(4096)
-        .read_to_end(&mut out)
-        .await
-        .map_err(helper_failed)?;
-    Ok(out)
-}
-
-/// Wait for a prompt helper that has already closed its pipes.
-async fn reap(child: &mut tokio::process::Child) -> Result<std::process::ExitStatus, PromptError> {
-    child.wait().await.map_err(helper_failed)
-}
-
-/// Strip the single line ending a helper adds when printing the answer. Never
-/// more than one: a passphrase may legitimately end in whitespace.
-fn strip_line_ending(secret: &mut Zeroizing<Vec<u8>>) {
-    if secret.last() == Some(&b'\n') {
-        secret.pop();
-        if secret.last() == Some(&b'\r') {
-            secret.pop();
-        }
-    }
-}
-
 /// Asks the user for a passphrase, with the text hidden as it is typed.
 ///
 /// Distinct from `Confirmer` on purpose. That one answers a yes/no question
@@ -205,6 +136,35 @@ fn strip_line_ending(secret: &mut Zeroizing<Vec<u8>>) {
 #[async_trait::async_trait]
 pub trait PassphrasePrompt: Send + Sync {
     async fn prompt(&self, request: &PassphraseRequest) -> Result<Zeroizing<Vec<u8>>, PromptError>;
+}
+
+/// Passphrase entry over whichever transport reaches the user.
+pub struct TransportPrompt {
+    transport: Arc<dyn Transport>,
+}
+
+impl TransportPrompt {
+    pub fn new(transport: Arc<dyn Transport>) -> Self {
+        Self { transport }
+    }
+}
+
+#[async_trait::async_trait]
+impl PassphrasePrompt for TransportPrompt {
+    async fn prompt(&self, request: &PassphraseRequest) -> Result<Zeroizing<Vec<u8>>, PromptError> {
+        match self.transport.ask_for_secret(&request.describe()).await {
+            Ok(Some(secret)) => Ok(secret),
+            Ok(None) => Err(PromptError::Cancelled),
+            // Nobody typed anything. Indistinguishable from a refusal, and
+            // treated as one.
+            Err(Failure::TimedOut) => {
+                tracing::info!("passphrase entry timed out");
+                Err(PromptError::Cancelled)
+            }
+            Err(Failure::Unavailable(why)) => Err(PromptError::Unavailable(why)),
+            Err(Failure::TooLong(max)) => Err(PromptError::TooLong(max)),
+        }
+    }
 }
 
 /// Somewhere a verified passphrase can be kept between signatures, keyed by the
@@ -462,33 +422,11 @@ impl PassphraseStore for NoStore {
 /// so that case takes the platform default instead.
 pub fn from_config(
     config: &crate::config::Config,
-) -> crate::error::Result<std::sync::Arc<dyn PassphrasePrompt>> {
-    use crate::config::ConfirmMode;
-    use std::time::Duration;
-    let timeout = Duration::from_secs(config.confirm_timeout_secs);
-    Ok(match config.confirm {
-        ConfirmMode::Osascript => std::sync::Arc::new(OsascriptPrompt::new(timeout)),
-        ConfirmMode::Tty => std::sync::Arc::new(TtyPrompt::new(timeout)),
-        ConfirmMode::Askpass => {
-            // validated at config load
-            let program = config.askpass.clone().ok_or_else(|| {
-                crate::error::Error::ConfigInvalid("askpass mode without helper".into())
-            })?;
-            std::sync::Arc::new(AskpassPrompt::new(program, timeout))
-        }
-        ConfirmMode::Off => default_prompt(timeout),
-    })
-}
-
-/// The platform's native prompt, for when `confirm` names no transport.
-#[cfg(target_os = "macos")]
-fn default_prompt(timeout: std::time::Duration) -> std::sync::Arc<dyn PassphrasePrompt> {
-    std::sync::Arc::new(OsascriptPrompt::new(timeout))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn default_prompt(timeout: std::time::Duration) -> std::sync::Arc<dyn PassphrasePrompt> {
-    std::sync::Arc::new(TtyPrompt::new(timeout))
+) -> crate::error::Result<Arc<dyn PassphrasePrompt>> {
+    let timeout = std::time::Duration::from_secs(config.confirm_timeout_secs);
+    let transport = crate::prompt::from_config(config)?
+        .unwrap_or_else(|| crate::prompt::default_transport(timeout));
+    Ok(Arc::new(TransportPrompt::new(transport)))
 }
 
 /// Refuses every request, so a test can prove the prompt was never reached —
@@ -1173,6 +1111,77 @@ mod tests {
             .unwrap();
         assert_unlocked(&key);
         assert_eq!(prompt.calls(), 1);
+    }
+
+    /// A transport that answers as told, and keeps what it was asked.
+    struct FakeTransport {
+        answer: Result<Option<Vec<u8>>, Failure>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for FakeTransport {
+        async fn ask_to_confirm(&self, _message: &str) -> Result<bool, Failure> {
+            unreachable!("a passphrase prompt never asks a yes/no question")
+        }
+        async fn ask_for_secret(
+            &self,
+            message: &str,
+        ) -> Result<Option<Zeroizing<Vec<u8>>>, Failure> {
+            self.asked.lock().unwrap().push(message.to_string());
+            self.answer.clone().map(|answer| answer.map(Zeroizing::new))
+        }
+    }
+
+    /// Shared body: what each thing a transport can come back with means.
+    async fn expect_prompted(
+        answer: Result<Option<Vec<u8>>, Failure>,
+        expected: Result<Vec<u8>, PromptError>,
+    ) {
+        let transport = Arc::new(FakeTransport {
+            answer: answer.clone(),
+            asked: Mutex::new(Vec::new()),
+        });
+        let prompt = TransportPrompt::new(transport.clone());
+        let request = PassphraseRequest::new(&entry(PassphraseFallback::default()));
+        assert_eq!(
+            prompt.prompt(&request).await.map(|s| s.to_vec()),
+            expected,
+            "{answer:?}"
+        );
+        // the question put is the request's description
+        let asked = transport.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0], request.describe());
+    }
+
+    #[tokio::test]
+    async fn a_typed_secret_is_the_answer() {
+        expect_prompted(Ok(Some(b"typed".to_vec())), Ok(b"typed".to_vec())).await;
+    }
+
+    #[tokio::test]
+    async fn a_dismissal_is_a_cancellation_not_an_empty_answer() {
+        expect_prompted(Ok(None), Err(PromptError::Cancelled)).await;
+    }
+
+    #[tokio::test]
+    async fn a_timeout_is_a_cancellation_too() {
+        expect_prompted(Err(Failure::TimedOut), Err(PromptError::Cancelled)).await;
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_transport_says_why() {
+        expect_prompted(
+            Err(Failure::Unavailable("no screen".into())),
+            Err(PromptError::Unavailable("no screen".into())),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_overlong_answer_is_refused_by_name() {
+        expect_prompted(Err(Failure::TooLong(1024)), Err(PromptError::TooLong(1024))).await;
     }
 
     #[test]

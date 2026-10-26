@@ -34,6 +34,7 @@ mod lpass;
 mod master;
 mod passphrase;
 mod platform;
+mod prompt;
 mod refresh;
 mod requester;
 mod signing;
@@ -41,7 +42,6 @@ mod socket;
 #[cfg(test)]
 mod testutil;
 mod text;
-mod tty;
 mod unlock;
 mod vaultlock;
 

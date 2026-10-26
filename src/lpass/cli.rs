@@ -469,7 +469,9 @@ mod tests {
             "askpass",
             &format!("echo asked >> '{}'; {answer}", asks.display()),
         );
-        let prompt = crate::passphrase::AskpassPrompt::new(script, Duration::from_secs(5));
+        let prompt = crate::passphrase::TransportPrompt::new(Arc::new(
+            crate::prompt::AskpassTransport::new(script, Duration::from_secs(5)),
+        ));
         let unlock = Unlock::new(
             crate::config::MasterPassword::Prompt,
             Arc::new(crate::master::NoStore),
