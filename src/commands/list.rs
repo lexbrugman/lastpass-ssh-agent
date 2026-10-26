@@ -4,14 +4,15 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::{identities, keystore, lpass, socket, text};
+use crate::lpass::{self, Access};
+use crate::{identities, keystore, socket, text};
 
 /// Print the keys the agent would serve, and write them down for the next
 /// start.
 pub async fn list(config_path: &Path) -> Result<()> {
     let config = Config::load_or_default(config_path)?;
-    let client = super::asking_client(&config)?;
-    let keys = keystore::effective_keys(&client, &config).await?;
+    let client = super::one_shot_client(&config)?;
+    let keys = keystore::effective_keys(&client, &config, Access::Asking).await?;
     let store = keystore::KeyStore::load(client.as_ref(), &keys, &config).await?;
     // Rewrites what the next start reads. A running agent does not read
     // this; it refreshes itself after a signature.
@@ -39,8 +40,8 @@ pub async fn list(config_path: &Path) -> Result<()> {
 pub async fn search(config_path: &Path, query: Option<&str>) -> Result<()> {
     // Must work before any config exists — it's the setup helper.
     let config = Config::load_or_default(config_path)?;
-    let client = super::asking_client(&config)?;
-    let found = lpass::discover_ssh_key_items(client.clone(), query).await?;
+    let client = super::one_shot_client(&config)?;
+    let found = lpass::discover_ssh_key_items(client.clone(), query, Access::Asking).await?;
     if found.is_empty() {
         match query {
             Some(query) => println!("no SSH Key items matching {query:?}"),

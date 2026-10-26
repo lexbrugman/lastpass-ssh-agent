@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use super::{ItemSummary, LpassClient, LpassError};
+use super::{Access, ItemSummary, LpassClient, LpassError};
 use crate::unlock::Unlock;
 
 /// A `show` against the local vault cache takes 100–500 ms, but the first
@@ -23,21 +23,15 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// A call with nothing held is first made without one: `lpass` still reads an
 /// agent a shell has left running, and a vault the user opened themselves is
 /// used as they left it. Only a call that fails for want of the key reaches
-/// for this.
+/// for this — and only one whose `Access` allows asking.
 pub enum MasterPasswordSource {
     /// Nowhere. A locked vault fails fast, in `LpassError::Locked`.
     None,
     /// This candidate, for `store-master-password` to check against the vault.
     Fixed(Zeroizing<Vec<u8>>),
-    /// What the agent holds, asking for it when it holds nothing.
+    /// What the agent holds, asking for it when it holds nothing and the call
+    /// may.
     Unlock(Arc<Unlock>),
-    /// What the agent holds, and nothing when it holds nothing — for work that
-    /// must never put a prompt on screen and does not count as using it.
-    HeldOnly(Arc<Unlock>),
-    /// What the agent holds, and nothing when it holds nothing — for a
-    /// signature, which is what the idle time counts: a call fed from here
-    /// renews it.
-    Signing(Arc<Unlock>),
 }
 
 impl MasterPasswordSource {
@@ -47,37 +41,32 @@ impl MasterPasswordSource {
             Self::None => None,
             Self::Fixed(secret) => Some(secret.clone()),
             // Not asking, so it cannot fail.
-            Self::Unlock(unlock) | Self::HeldOnly(unlock) | Self::Signing(unlock) => {
-                unlock.password(false).await.unwrap_or_default()
-            }
+            Self::Unlock(unlock) => unlock.password(false).await.unwrap_or_default(),
         }
     }
 
-    /// The password after asking for it, when this source may.
-    async fn asked(&self) -> Result<Option<Zeroizing<Vec<u8>>>, LpassError> {
-        match self {
-            Self::Unlock(unlock) => unlock
+    /// The password after asking for it, when this source and the call may.
+    async fn asked(&self, access: Access) -> Result<Option<Zeroizing<Vec<u8>>>, LpassError> {
+        match (self, access) {
+            (Self::Unlock(unlock), Access::Asking) => unlock
                 .password(true)
                 .await
                 .map_err(LpassError::NoMasterPassword),
-            Self::None | Self::Fixed(_) | Self::HeldOnly(_) | Self::Signing(_) => Ok(None),
+            (Self::None | Self::Fixed(_), _) | (_, Access::Signing | Access::Scanning) => Ok(None),
         }
     }
 
     /// `lpass` did not accept what it was fed.
     async fn rejected(&self) {
-        if let Self::Unlock(unlock) | Self::HeldOnly(unlock) | Self::Signing(unlock) = self {
+        if let Self::Unlock(unlock) = self {
             unlock.rejected().await;
         }
     }
 
-    /// A call has just finished, so what is held was in use until now.
-    ///
-    /// Not for `HeldOnly`: the idle time counts signatures, and a background
-    /// scan renewing it would keep the password for as long as the vault is
-    /// large.
-    async fn used(&self) {
-        if let Self::Unlock(unlock) | Self::Signing(unlock) = self {
+    /// A call has just finished, so what is held was in use until now — unless
+    /// the call was a scan, which `Access::Scanning` says is not a use.
+    async fn used(&self, access: Access) {
+        if let (Self::Unlock(unlock), Access::Asking | Access::Signing) = (self, access) {
             unlock.touch().await;
         }
     }
@@ -171,18 +160,24 @@ impl LpassCli {
     }
 
     /// Run once without the master password, and again with it if the vault
-    /// turns out to need one and the source will supply it.
-    async fn run(&self, args: &[&str], max_bytes: usize) -> Result<CmdOutput, LpassError> {
+    /// turns out to need one and the source will supply it to a call with
+    /// this `access`.
+    async fn run(
+        &self,
+        args: &[&str],
+        max_bytes: usize,
+        access: Access,
+    ) -> Result<CmdOutput, LpassError> {
         let held = self.source.held().await;
         // Stamped before the call as well as after it: a call that begins
         // just short of the idle time would otherwise see the sweep drop the
         // password from under it, and the stamp after would find nothing.
-        self.source.used().await;
+        self.source.used(access).await;
         let mut out = self
             .exec(args, held.as_ref().map(|held| &held[..]), max_bytes)
             .await?;
         if out.locked() {
-            if let Some(password) = self.source.asked().await? {
+            if let Some(password) = self.source.asked(access).await? {
                 out = self.exec(args, Some(&password), max_bytes).await?;
             }
         }
@@ -191,7 +186,7 @@ impl LpassCli {
         }
         // And after it, so the idle clock runs from when the password was
         // last needed rather than from when the call began.
-        self.source.used().await;
+        self.source.used(access).await;
         Ok(out)
     }
 
@@ -417,10 +412,11 @@ impl LpassClient for LpassCli {
         &self,
         item_id: &str,
         field: &str,
+        access: Access,
     ) -> Result<Zeroizing<Vec<u8>>, LpassError> {
         let field_arg = format!("--field={field}");
         let out = self
-            .run(&["show", &field_arg, item_id], MAX_FIELD_BYTES)
+            .run(&["show", &field_arg, item_id], MAX_FIELD_BYTES, access)
             .await?;
         if !out.success {
             return Err(Self::classify(Some(item_id), &out));
@@ -428,11 +424,11 @@ impl LpassClient for LpassCli {
         Ok(out.stdout)
     }
 
-    async fn ls(&self) -> Result<Vec<ItemSummary>, LpassError> {
+    async fn ls(&self, access: Access) -> Result<Vec<ItemSummary>, LpassError> {
         // Plain `ls` output ("Group/Name [id: 123]") is the only listing
         // format documented in every lastpass-cli release; --format is not.
         let out = self
-            .run(&["ls", "--color=never"], MAX_LISTING_BYTES)
+            .run(&["ls", "--color=never"], MAX_LISTING_BYTES, access)
             .await?;
         if !out.success {
             return Err(Self::classify(None, &out));
@@ -498,7 +494,10 @@ mod tests {
 printf 'SECRET-VALUE\n'"#,
         );
         let client = LpassCli::new(bin);
-        let value = client.show_field("42", "Private Key").await.unwrap();
+        let value = client
+            .show_field("42", "Private Key", Access::Asking)
+            .await
+            .unwrap();
         assert_eq!(&*value, b"SECRET-VALUE");
     }
 
@@ -509,7 +508,7 @@ printf 'SECRET-VALUE\n'"#,
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_lpass(dir.path(), r"printf 'pass\n\n'");
         let value = LpassCli::new(bin)
-            .show_field("42", "Passphrase")
+            .show_field("42", "Passphrase", Access::Asking)
             .await
             .unwrap();
         assert_eq!(&*value, b"pass\n");
@@ -518,7 +517,7 @@ printf 'SECRET-VALUE\n'"#,
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_lpass(dir.path(), r"printf 'pass\r\n'");
         let value = LpassCli::new(bin)
-            .show_field("42", "Passphrase")
+            .show_field("42", "Passphrase", Access::Asking)
             .await
             .unwrap();
         assert_eq!(&*value, b"pass");
@@ -527,7 +526,7 @@ printf 'SECRET-VALUE\n'"#,
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_lpass(dir.path(), r"printf 'pass'");
         let value = LpassCli::new(bin)
-            .show_field("42", "Passphrase")
+            .show_field("42", "Passphrase", Access::Asking)
             .await
             .unwrap();
         assert_eq!(&*value, b"pass");
@@ -546,7 +545,7 @@ while [ $i -lt 1500 ]; do
     i=$((i + 1))
 done"#,
         );
-        let items = LpassCli::new(bin).ls().await.unwrap();
+        let items = LpassCli::new(bin).ls(Access::Asking).await.unwrap();
         assert_eq!(items.len(), 1500);
         assert_eq!(items[0].id, "0");
     }
@@ -557,7 +556,10 @@ done"#,
         // it is a broken vault item, not a key
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_lpass(dir.path(), "head -c 200000 /dev/zero | tr '\\0' 'x'");
-        let err = LpassCli::new(bin).show_field("42", "x").await.unwrap_err();
+        let err = LpassCli::new(bin)
+            .show_field("42", "x", Access::Asking)
+            .await
+            .unwrap_err();
         assert!(matches!(err, LpassError::FieldTooLarge(_)), "{err:?}");
     }
 
@@ -566,7 +568,10 @@ done"#,
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_lpass(dir.path(), "printf '\\n'");
         let client = LpassCli::new(bin);
-        let value = client.show_field("42", "Passphrase").await.unwrap();
+        let value = client
+            .show_field("42", "Passphrase", Access::Asking)
+            .await
+            .unwrap();
         assert!(value.is_empty());
     }
 
@@ -575,11 +580,14 @@ done"#,
         // Nothing to feed and nobody to ask: the one attempt is the answer.
         let dir = tempfile::tempdir().unwrap();
         let client = LpassCli::new(locked_vault(dir.path()));
-        let err = client.show_field("42", "Private Key").await.unwrap_err();
+        let err = client
+            .show_field("42", "Private Key", Access::Asking)
+            .await
+            .unwrap_err();
         assert!(matches!(err, LpassError::Locked), "{err:?}");
         assert!(matches!(
             LpassCli::new(locked_vault(dir.path()))
-                .ls()
+                .ls(Access::Asking)
                 .await
                 .unwrap_err(),
             LpassError::Locked
@@ -596,9 +604,15 @@ done"#,
         let fixed = LpassCli::new(bin.clone()).feeding(MasterPasswordSource::Fixed(
             Zeroizing::new(b"hunter2".to_vec()),
         ));
-        assert_eq!(&*fixed.show_field("42", "x").await.unwrap(), b"fed hunter2");
         assert_eq!(
-            &*LpassCli::new(bin).show_field("42", "x").await.unwrap(),
+            &*fixed.show_field("42", "x", Access::Asking).await.unwrap(),
+            b"fed hunter2"
+        );
+        assert_eq!(
+            &*LpassCli::new(bin)
+                .show_field("42", "x", Access::Asking)
+                .await
+                .unwrap(),
             b"nothing"
         );
     }
@@ -613,7 +627,7 @@ done"#,
         let client = LpassCli::new(locked_vault(dir.path()))
             .feeding(MasterPasswordSource::Unlock(unlock.clone()));
         assert_eq!(
-            &*client.show_field("42", "x").await.unwrap(),
+            &*client.show_field("42", "x", Access::Asking).await.unwrap(),
             b"opened with secret"
         );
         assert_eq!(times_asked(&asks), 1);
@@ -626,53 +640,64 @@ done"#,
         let (unlock, asks) = unlock_answering(dir.path(), "echo secret");
         let client =
             LpassCli::new(locked_vault(dir.path())).feeding(MasterPasswordSource::Unlock(unlock));
-        client.show_field("42", "x").await.unwrap();
-        client.show_field("42", "x").await.unwrap();
+        client.show_field("42", "x", Access::Asking).await.unwrap();
+        client.show_field("42", "x", Access::Asking).await.unwrap();
         assert_eq!(times_asked(&asks), 1, "held after the first");
     }
 
     #[tokio::test]
-    async fn a_source_that_may_not_ask_gets_the_locked_answer() {
-        // The refresher's client: silent with the vault shut, and served from
-        // what the agent holds once a signature has had it asked for.
+    async fn a_call_that_may_not_ask_gets_the_locked_answer() {
+        // A scan, and a signature's first attempt: silent with the vault shut,
+        // and served from what the agent holds once a call that may ask has.
         let dir = tempfile::tempdir().unwrap();
         let (unlock, asks) = unlock_answering(dir.path(), "echo secret");
-        let client = LpassCli::new(locked_vault(dir.path()))
-            .feeding(MasterPasswordSource::HeldOnly(unlock.clone()));
-        assert!(matches!(
-            client.show_field("42", "x").await.unwrap_err(),
-            LpassError::Locked
-        ));
+        let client =
+            LpassCli::new(locked_vault(dir.path())).feeding(MasterPasswordSource::Unlock(unlock));
+        for access in [Access::Scanning, Access::Signing] {
+            assert!(
+                matches!(
+                    client.show_field("42", "x", access).await.unwrap_err(),
+                    LpassError::Locked
+                ),
+                "{access:?}"
+            );
+        }
         assert_eq!(times_asked(&asks), 0);
 
-        unlock.password(true).await.unwrap();
-        assert_eq!(
-            &*client.show_field("42", "x").await.unwrap(),
-            b"opened with secret"
-        );
+        client.show_field("42", "x", Access::Asking).await.unwrap();
+        assert_eq!(times_asked(&asks), 1);
+        for access in [Access::Scanning, Access::Signing] {
+            assert_eq!(
+                &*client.show_field("42", "x", access).await.unwrap(),
+                b"opened with secret",
+                "{access:?}"
+            );
+        }
+        assert_eq!(times_asked(&asks), 1, "held, so never asked again");
     }
 
     #[tokio::test]
     async fn a_signature_renews_the_idle_clock_and_a_scan_does_not() {
-        // The idle time counts signatures: the agent's client stamps what it
-        // was fed, the refresher's leaves the stamp where it found it.
+        // The idle time counts signatures: a signing call stamps what it was
+        // fed, a scanning one leaves the stamp where it found it.
         let dir = tempfile::tempdir().unwrap();
         let (unlock, _asks) = unlock_answering(dir.path(), "echo secret");
         unlock.password(true).await.unwrap();
         let held_at = unlock.last_used().await.unwrap();
+        let client = LpassCli::new(locked_vault(dir.path()))
+            .feeding(MasterPasswordSource::Unlock(unlock.clone()));
 
-        let scan = LpassCli::new(locked_vault(dir.path()))
-            .feeding(MasterPasswordSource::HeldOnly(unlock.clone()));
-        scan.show_field("42", "x").await.unwrap();
+        client
+            .show_field("42", "x", Access::Scanning)
+            .await
+            .unwrap();
         assert_eq!(
             unlock.last_used().await.unwrap(),
             held_at,
             "a scan is not use"
         );
 
-        let signing = LpassCli::new(locked_vault(dir.path()))
-            .feeding(MasterPasswordSource::Signing(unlock.clone()));
-        signing.show_field("42", "x").await.unwrap();
+        client.show_field("42", "x", Access::Signing).await.unwrap();
         assert!(
             unlock.last_used().await.unwrap() > held_at,
             "a signature is"
@@ -685,7 +710,10 @@ done"#,
         let (unlock, _asks) = unlock_answering(dir.path(), "exit 1");
         let client =
             LpassCli::new(locked_vault(dir.path())).feeding(MasterPasswordSource::Unlock(unlock));
-        let err = client.show_field("42", "x").await.unwrap_err();
+        let err = client
+            .show_field("42", "x", Access::Asking)
+            .await
+            .unwrap_err();
         assert!(matches!(err, LpassError::NoMasterPassword(_)), "{err:?}");
     }
 
@@ -703,7 +731,10 @@ done"#,
         let (unlock, asks) = unlock_answering(dir.path(), "echo typo");
         let client =
             LpassCli::new(bin.clone()).feeding(MasterPasswordSource::Unlock(unlock.clone()));
-        let err = client.show_field("42", "x").await.unwrap_err();
+        let err = client
+            .show_field("42", "x", Access::Asking)
+            .await
+            .unwrap_err();
         assert!(matches!(err, LpassError::WrongMasterPassword), "{err:?}");
         assert_eq!(times_asked(&asks), 1);
         assert!(
@@ -716,7 +747,7 @@ done"#,
             b"typo".to_vec(),
         )));
         assert!(matches!(
-            fixed.ls().await.unwrap_err(),
+            fixed.ls(Access::Asking).await.unwrap_err(),
             LpassError::WrongMasterPassword
         ));
     }
@@ -731,7 +762,10 @@ done"#,
             b"right".to_vec(),
         )));
         assert!(matches!(
-            client.show_field("42", "Private Key").await.unwrap_err(),
+            client
+                .show_field("42", "Private Key", Access::Asking)
+                .await
+                .unwrap_err(),
             LpassError::NotLoggedIn
         ));
     }
@@ -743,7 +777,10 @@ done"#,
             let bin = fake_lpass(dir.path(), &format!("echo '{words}' >&2; exit 1"));
             assert!(
                 matches!(
-                    LpassCli::new(bin).show_field("42", "x").await.unwrap_err(),
+                    LpassCli::new(bin)
+                        .show_field("42", "x", Access::Asking)
+                        .await
+                        .unwrap_err(),
                     LpassError::NotLoggedIn
                 ),
                 "{words}"
@@ -761,7 +798,11 @@ done"#,
             dir.path(),
             "printf 'Error: no such item \\033[2J\\n' >&2; exit 1",
         );
-        let err = LpassCli::new(bin).ls().await.unwrap_err().to_string();
+        let err = LpassCli::new(bin)
+            .ls(Access::Asking)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(!err.contains('\x1b'), "{err}");
         assert!(err.contains("\\x1b[2J"), "{err}");
     }
@@ -775,7 +816,7 @@ done"#,
             "echo \"Error: Could not find specified field 'NoteType'.\" >&2; exit 1",
         );
         let err = LpassCli::new(bin)
-            .show_field("42", "NoteType")
+            .show_field("42", "NoteType", Access::Asking)
             .await
             .unwrap_err();
         assert!(
@@ -793,7 +834,10 @@ done"#,
             "echo 'Error: Could not find specified account(s).' >&2; exit 1",
         );
         let client = LpassCli::new(bin);
-        let err = client.show_field("42", "Private Key").await.unwrap_err();
+        let err = client
+            .show_field("42", "Private Key", Access::Asking)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, LpassError::ItemNotFound(ref id) if id == "42"),
             "{err:?}"
@@ -806,7 +850,10 @@ done"#,
         let bin = fake_lpass(dir.path(), "sleep 30");
         let client = LpassCli::with_timeout(bin, Duration::from_millis(200));
         let start = std::time::Instant::now();
-        let err = client.show_field("42", "Private Key").await.unwrap_err();
+        let err = client
+            .show_field("42", "Private Key", Access::Asking)
+            .await
+            .unwrap_err();
         assert!(matches!(err, LpassError::Timeout(_)), "{err:?}");
         assert!(start.elapsed() < Duration::from_secs(5));
     }
@@ -817,7 +864,10 @@ done"#,
         // ItemNotFound unless lpass says so
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_lpass(dir.path(), "echo 'Error: something exploded' >&2; exit 3");
-        let err = LpassCli::new(bin).show_field("42", "x").await.unwrap_err();
+        let err = LpassCli::new(bin)
+            .show_field("42", "x", Access::Asking)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, LpassError::CommandFailed { code: Some(3), ref stderr } if stderr.contains("exploded")),
             "{err:?}"
@@ -830,13 +880,13 @@ done"#,
             dir.path(),
             "echo 'Error: Could not find specified account(s).' >&2; exit 1",
         );
-        let err = LpassCli::new(bin).ls().await.unwrap_err();
+        let err = LpassCli::new(bin).ls(Access::Asking).await.unwrap_err();
         assert!(matches!(err, LpassError::CommandFailed { .. }), "{err:?}");
 
         // missing binary -> Spawn
         assert!(matches!(
             LpassCli::new(PathBuf::from("/nonexistent/lpass"))
-                .ls()
+                .ls(Access::Asking)
                 .await
                 .unwrap_err(),
             LpassError::Spawn(_)
@@ -855,7 +905,7 @@ done"#,
         // parallel tests cannot collide.
         std::env::set_var("SUPER_SECRET_TOKEN", "leaked");
         let client = LpassCli::new(bin);
-        let value = client.show_field("42", "x").await.unwrap();
+        let value = client.show_field("42", "x", Access::Asking).await.unwrap();
         let text = String::from_utf8_lossy(&value);
         let (secret, home) = text.split_once('|').unwrap();
         assert_eq!(secret, "", "parent env must not leak into lpass");
@@ -872,7 +922,10 @@ done"#,
         // unique names: env is process-global across parallel tests
         std::env::set_var("LPASS_COVERAGE_PROBE", "lp-ok");
         std::env::set_var("XDG_COVERAGE_PROBE", "xdg-ok");
-        let value = LpassCli::new(bin).show_field("42", "x").await.unwrap();
+        let value = LpassCli::new(bin)
+            .show_field("42", "x", Access::Asking)
+            .await
+            .unwrap();
         let text = String::from_utf8_lossy(&value).to_string();
         let mut parts = text.split('|');
         assert_eq!(parts.next(), Some("lp-ok"));
@@ -889,7 +942,10 @@ done"#,
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_lpass(dir.path(), r#"printf '[%s]' "$LPASS_ASKPASS""#);
         assert_eq!(
-            &*LpassCli::new(bin).show_field("42", "x").await.unwrap(),
+            &*LpassCli::new(bin)
+                .show_field("42", "x", Access::Asking)
+                .await
+                .unwrap(),
             b"[]"
         );
     }
@@ -906,14 +962,17 @@ done"#,
         // to leave set: this is the rule under test.
         std::env::set_var("LPASS_AGENT_DISABLE", "1");
         let value = LpassCli::new(bin.clone())
-            .show_field("42", "x")
+            .show_field("42", "x", Access::Asking)
             .await
             .unwrap();
         assert_eq!(&*value, b"[]|1");
         // fed: the key it derives must not outlive the call
         let fed =
             LpassCli::new(bin).feeding(MasterPasswordSource::Fixed(Zeroizing::new(b"pw".to_vec())));
-        assert_eq!(&*fed.show_field("42", "x").await.unwrap(), b"[1]|1");
+        assert_eq!(
+            &*fed.show_field("42", "x", Access::Asking).await.unwrap(),
+            b"[1]|1"
+        );
     }
 
     #[test]
@@ -929,7 +988,7 @@ done"#,
             r#"[ "$1" = ls ] || exit 9
 printf 'Personal/SSH Key [id: 123]\nWork/Deploy Key [id: 456]\nmalformed line\n'"#,
         );
-        let items = LpassCli::new(bin).ls().await.unwrap();
+        let items = LpassCli::new(bin).ls(Access::Asking).await.unwrap();
         assert_eq!(
             items,
             vec![

@@ -33,7 +33,7 @@ use zeroize::Zeroizing;
 
 use crate::config::PassphraseFallback;
 use crate::keystore::KeyEntry;
-use crate::lpass::LpassClient;
+use crate::lpass::{Access, LpassClient};
 use crate::text::{display_bounded, escape_for_display};
 
 /// What the user is being asked to unlock. Display context only — no secret
@@ -272,9 +272,12 @@ impl Unlocker {
         encrypted: &ssh_key::PrivateKey,
         gate: &mut crate::interaction::InteractionGate,
     ) -> Result<ssh_key::PrivateKey, String> {
+        // Part of a signature: fed what is held, never asking. A lock landing
+        // between this fetch and the private key's fails the signature rather
+        // than asking, and the retry asks.
         let stored: Zeroizing<Vec<u8>> = self
             .lpass
-            .show_field(&entry.item_id, "Passphrase")
+            .show_field(&entry.item_id, "Passphrase", Access::Signing)
             .await
             .map_err(|e| format!("fetching passphrase: {e}"))?;
 

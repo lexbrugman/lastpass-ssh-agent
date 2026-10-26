@@ -28,7 +28,7 @@ fn unlock_from(config: &Config, socket_path: &Path) -> Result<Arc<unlock::Unlock
 
 /// A client for a command that runs and exits: asks for the master password
 /// if the vault turns out to need it, and holds it for the rest of the command.
-fn asking_client(config: &Config) -> Result<Arc<dyn LpassClient>> {
+fn one_shot_client(config: &Config) -> Result<Arc<dyn LpassClient>> {
     let source = one_shot_source(config, &config.socket_path()?)?;
     Ok(Arc::new(client_from(config)?.feeding(source)))
 }

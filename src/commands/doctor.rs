@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::config::{self, Config};
 use crate::error::{Error, Result};
-use crate::lpass::{self, LpassClient};
+use crate::lpass::{self, Access, LpassClient};
 use crate::{confirm, enclave, identities, keystore, master, socket};
 
 /// One line of the `doctor` checklist.
@@ -170,7 +170,7 @@ async fn check_login(
     let Some(client) = client else {
         return (None, false);
     };
-    match client.ls().await {
+    match client.ls(Access::Asking).await {
         Ok(_) => (
             Some(Check::passed(
                 "lpass login",
@@ -215,25 +215,26 @@ fn not_logged_in() -> Check {
 /// The policy itself lives in `keystore::inspect_keys`, which `start` uses too,
 /// so what `doctor` reports cannot drift from what the agent does.
 async fn check_keys(client: &Arc<dyn LpassClient>, config: &Config) -> Vec<Check> {
-    let keys = match keystore::effective_keys(client, config).await {
+    let keys = match keystore::effective_keys(client, config, Access::Asking).await {
         Ok(keys) => keys,
         Err(e) => return vec![Check::failed("keys", e.to_string())],
     };
-    let mut checks: Vec<Check> = keystore::inspect_keys(client.as_ref(), &keys, config)
-        .await
-        .into_iter()
-        .map(|inspection| match inspection {
-            keystore::KeyInspection::Usable(entry) => Check::passed(
-                &format!("key {} [id: {}]", entry.name, entry.item_id),
-                format!("{} {}", entry.public.algorithm(), entry.fingerprint()),
-            ),
-            keystore::KeyInspection::Unusable {
-                item_id,
-                name,
-                issue,
-            } => Check::failed(&format!("key {name} [id: {item_id}]"), issue.to_string()),
-        })
-        .collect();
+    let mut checks: Vec<Check> =
+        keystore::inspect_keys(client.as_ref(), &keys, config, Access::Asking)
+            .await
+            .into_iter()
+            .map(|inspection| match inspection {
+                keystore::KeyInspection::Usable(entry) => Check::passed(
+                    &format!("key {} [id: {}]", entry.name, entry.item_id),
+                    format!("{} {}", entry.public.algorithm(), entry.fingerprint()),
+                ),
+                keystore::KeyInspection::Unusable {
+                    item_id,
+                    name,
+                    issue,
+                } => Check::failed(&format!("key {name} [id: {item_id}]"), issue.to_string()),
+            })
+            .collect();
     let served = checks.iter().filter(|check| check.ok).count();
     checks.extend(too_many_keys("key count", served));
     checks

@@ -1,10 +1,11 @@
 //! Keeping the remembered identities current while the agent runs.
 //!
 //! A scan costs a vault call per item, so it runs when a signature has just
-//! proved the vault reachable, at most once an hour, and through a client that
-//! cannot prompt: fed only what the agent already holds, it is silent with the
-//! vault open, and with the vault shut it fails fast and nothing changes. What it produces replaces both the served set and
-//! the file, and only whole — `KeyStore::load_complete` says what "whole" means.
+//! proved the vault reachable, at most once an hour, and as `Access::Scanning`:
+//! fed only what the agent already holds, it is silent with the vault open,
+//! and with the vault shut it fails fast and nothing changes. What it produces
+//! replaces both the served set and the file, and only whole —
+//! `KeyStore::load_complete` says what "whole" means.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::keystore::{self, KeyStore, Served};
-use crate::lpass::LpassClient;
+use crate::lpass::{Access, LpassClient};
 
 /// The identities change rarely, and a scan is a vault call per item.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
@@ -21,8 +22,8 @@ pub struct Refresher {
     served: Served,
     remembered_at: PathBuf,
     config: Arc<Config>,
-    /// Fed only the master password the agent already holds, so nothing it
-    /// does can put a prompt on screen — a shut vault fails fast instead.
+    /// Every call a scan, so nothing it does can put a prompt on screen — a
+    /// shut vault fails fast instead.
     client: Arc<dyn LpassClient>,
     interval: Duration,
     /// When the last attempt began. Attempts rather than successes: a vault
@@ -104,13 +105,14 @@ impl Refresher {
     /// leaves the served set and the file exactly as they were, and says why at
     /// debug — a shut vault is routine here, not a fault.
     pub async fn refresh_now(&self) {
-        let keys = match keystore::effective_keys(&self.client, &self.config).await {
-            Ok(keys) => keys,
-            Err(e) => {
-                tracing::debug!("not refreshing the identities: {e}");
-                return;
-            }
-        };
+        let keys =
+            match keystore::effective_keys(&self.client, &self.config, Access::Scanning).await {
+                Ok(keys) => keys,
+                Err(e) => {
+                    tracing::debug!("not refreshing the identities: {e}");
+                    return;
+                }
+            };
         let Some(store) = KeyStore::load_complete(self.client.as_ref(), &keys, &self.config).await
         else {
             return;

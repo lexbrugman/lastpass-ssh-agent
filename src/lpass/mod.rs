@@ -108,6 +108,24 @@ pub enum LpassError {
     CommandFailed { code: Option<i32>, stderr: String },
 }
 
+/// What a call is for, which is what decides what it may do about the master
+/// password: whether it may ask for one, and whether it counts as using the
+/// one held. Said at every call rather than fixed per client, so a fetch
+/// states its own intent where it is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// May ask for the master password when the vault is locked. Asking is an
+    /// interaction, so the caller arranges that no other is on screen.
+    Asking,
+    /// Fed only what is already held; a locked vault is `LpassError::Locked`.
+    /// Counts as use: a signature is what the idle time measures.
+    Signing,
+    /// Fed only what is already held, like `Signing`, but not a use: a
+    /// background scan renewing the idle clock would keep the password for as
+    /// long as the vault is large.
+    Scanning,
+}
+
 /// The only interface through which the rest of the program talks to
 /// `LastPass`. Field values come back in `Zeroizing` buffers; callers must not
 /// copy them into non-zeroizing storage.
@@ -119,11 +137,12 @@ pub trait LpassClient: Send + Sync {
         &self,
         item_id: &str,
         field: &str,
+        access: Access,
     ) -> Result<Zeroizing<Vec<u8>>, LpassError>;
 
     /// `lpass ls` over the whole vault. Used by interactive `search` and by
     /// agent startup when no keys are pinned in the config.
-    async fn ls(&self) -> Result<Vec<ItemSummary>, LpassError>;
+    async fn ls(&self, access: Access) -> Result<Vec<ItemSummary>, LpassError>;
 }
 
 /// Find the vault's SSH Key items: one `ls` for ids/names (metadata only),
@@ -132,10 +151,11 @@ pub trait LpassClient: Send + Sync {
 pub async fn discover_ssh_key_items(
     client: std::sync::Arc<dyn LpassClient>,
     name_filter: Option<&str>,
+    access: Access,
 ) -> Result<Vec<ItemSummary>, LpassError> {
     let needle = name_filter.map(str::to_lowercase);
     let candidates: Vec<ItemSummary> = client
-        .ls()
+        .ls(access)
         .await?
         .into_iter()
         .filter(|item| {
@@ -168,7 +188,7 @@ pub async fn discover_ssh_key_items(
             };
             let client = client.clone();
             probes.spawn(async move {
-                match client.show_field(&item.id, "NoteType").await {
+                match client.show_field(&item.id, "NoteType", access).await {
                     Ok(note_type) => Ok((item, &*note_type == b"SSH Key")),
                     // The item is simply not a note (ordinary password entries
                     // have no NoteType), or vanished since `ls`.
@@ -375,7 +395,9 @@ mod discovery_tests {
 
     #[tokio::test]
     async fn finds_only_ssh_key_items_sorted_by_name_then_id() {
-        let found = discover_ssh_key_items(vault(), None).await.unwrap();
+        let found = discover_ssh_key_items(vault(), None, Access::Asking)
+            .await
+            .unwrap();
         let ids: Vec<_> = found.iter().map(|i| i.id.as_str()).collect();
         // sorted by name (GitHub Key < Work/...), equal names tie-break by id
         assert_eq!(ids, ["1", "4", "6"]);
@@ -396,7 +418,9 @@ mod discovery_tests {
             mock = mock.with_field(&id, "NoteType", b"SSH Key");
         }
 
-        let found = discover_ssh_key_items(Arc::new(mock), None).await.unwrap();
+        let found = discover_ssh_key_items(Arc::new(mock), None, Access::Asking)
+            .await
+            .unwrap();
         assert_eq!(found.len(), MAX_DISCOVERY_PROBES + 3);
         assert_eq!(found.first().unwrap().id, "0");
         assert_eq!(found.last().unwrap().id, "10");
@@ -405,7 +429,7 @@ mod discovery_tests {
     #[tokio::test]
     async fn name_filter_narrows_probes_and_results() {
         let mock = vault();
-        let found = discover_ssh_key_items(mock.clone(), Some("work"))
+        let found = discover_ssh_key_items(mock.clone(), Some("work"), Access::Asking)
             .await
             .unwrap();
         let ids: Vec<_> = found.iter().map(|i| i.id.as_str()).collect();
@@ -416,19 +440,21 @@ mod discovery_tests {
             .lock()
             .unwrap()
             .iter()
-            .all(|(id, _)| id == "3" || id == "4" || id == "6"));
+            .all(|(id, _, _)| id == "3" || id == "4" || id == "6"));
     }
 
     #[tokio::test]
     async fn discovery_never_touches_secret_fields() {
         let mock = vault();
-        discover_ssh_key_items(mock.clone(), None).await.unwrap();
+        discover_ssh_key_items(mock.clone(), None, Access::Asking)
+            .await
+            .unwrap();
         assert!(mock
             .fetch_log
             .lock()
             .unwrap()
             .iter()
-            .all(|(_, field)| field == "NoteType"));
+            .all(|(_, field, _)| field == "NoteType"));
     }
 
     #[tokio::test]
@@ -448,7 +474,9 @@ mod discovery_tests {
                 name: "Password".into(),
             },
         ];
-        let found = discover_ssh_key_items(Arc::new(mock), None).await.unwrap();
+        let found = discover_ssh_key_items(Arc::new(mock), None, Access::Asking)
+            .await
+            .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, "1");
     }
@@ -470,14 +498,16 @@ mod discovery_tests {
                 name: "Other".into(),
             },
         ];
-        assert!(discover_ssh_key_items(Arc::new(mock), None).await.is_err());
+        assert!(discover_ssh_key_items(Arc::new(mock), None, Access::Asking)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn discovery_requires_login() {
         let mock = Arc::new(MockLpass::default());
         assert!(matches!(
-            discover_ssh_key_items(mock, None).await,
+            discover_ssh_key_items(mock, None, Access::Asking).await,
             Err(LpassError::NotLoggedIn)
         ));
     }
@@ -526,13 +556,15 @@ pub mod mock {
         pub broken_fields: Vec<(String, String)>,
         /// (item id, field) pairs that report the vault as shut.
         pub logged_out_fields: Vec<(String, String)>,
-        /// (item id, field) pairs that report the vault as locked — what a
-        /// client fed no master password gets.
+        /// (item id, field) pairs that report the vault as locked to a call
+        /// that may not ask, and answer one that may — a vault that is shut,
+        /// and opens for the master password.
         pub locked_fields: Vec<(String, String)>,
         /// (item id, field) pairs the item simply does not have.
         pub absent_fields: Vec<(String, String)>,
-        /// Every (item, field) fetched, for assertions on what was touched.
-        pub fetch_log: Mutex<Vec<(String, String)>>,
+        /// Every (item, field, access) fetched, for assertions on what was
+        /// touched, and how.
+        pub fetch_log: Mutex<Vec<(String, String, Access)>>,
     }
 
     impl MockLpass {
@@ -607,18 +639,19 @@ pub mod mock {
             &self,
             item_id: &str,
             field: &str,
+            access: Access,
         ) -> Result<Zeroizing<Vec<u8>>, LpassError> {
             self.fetch_log
                 .lock()
                 .unwrap()
-                .push((item_id.into(), field.into()));
+                .push((item_id.into(), field.into(), access));
             if !self.logged_in {
                 return Err(LpassError::NotLoggedIn);
             }
             if lists(&self.logged_out_fields, item_id, field) {
                 return Err(LpassError::NotLoggedIn);
             }
-            if lists(&self.locked_fields, item_id, field) {
+            if lists(&self.locked_fields, item_id, field) && access != Access::Asking {
                 return Err(LpassError::Locked);
             }
             if lists(&self.absent_fields, item_id, field) {
@@ -647,7 +680,7 @@ pub mod mock {
             }
         }
 
-        async fn ls(&self) -> Result<Vec<ItemSummary>, LpassError> {
+        async fn ls(&self, _access: Access) -> Result<Vec<ItemSummary>, LpassError> {
             if !self.logged_in {
                 return Err(LpassError::NotLoggedIn);
             }

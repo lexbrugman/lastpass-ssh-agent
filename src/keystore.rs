@@ -7,7 +7,7 @@ use ssh_key::PublicKey;
 use crate::config::{Config, KeyConfig, PassphraseFallback};
 use crate::error::{Error, Result};
 use crate::identities::{Remembered, RememberedKey};
-use crate::lpass::{LpassClient, LpassError};
+use crate::lpass::{Access, LpassClient, LpassError};
 
 /// Why a configured/discovered item cannot be served. Shared by startup and
 /// `doctor` so the diagnostic command cannot drift from the real policy.
@@ -89,13 +89,14 @@ pub async fn inspect_keys(
     client: &dyn LpassClient,
     keys: &[KeyConfig],
     config: &Config,
+    access: Access,
 ) -> Vec<KeyInspection> {
     let mut inspected = Vec::with_capacity(keys.len());
     let mut seen: Vec<(KeyData, String)> = Vec::new();
 
     for key in keys {
         let name = crate::text::escape_for_display(key.display_name());
-        let public = match client.show_field(&key.id, "Public Key").await {
+        let public = match client.show_field(&key.id, "Public Key", access).await {
             Ok(raw) => accept(&raw),
             Err(e) => Err(e.into()),
         }
@@ -125,12 +126,13 @@ pub async fn inspect_keys(
 pub async fn effective_keys(
     client: &Arc<dyn LpassClient>,
     config: &Config,
+    access: Access,
 ) -> Result<Vec<KeyConfig>> {
     if !config.keys.is_empty() {
         return Ok(config.keys.clone());
     }
     tracing::info!("no [[keys]] configured — discovering SSH Key items in the vault");
-    let found = crate::lpass::discover_ssh_key_items(client.clone(), None).await?;
+    let found = crate::lpass::discover_ssh_key_items(client.clone(), None, access).await?;
     if found.is_empty() {
         return Err(Error::ConfigInvalid(
             "no SSH Key items found in the vault (create one in LastPass, or pin items with [[keys]] in the config)"
@@ -381,16 +383,18 @@ impl KeyStore {
     }
 
     /// Fetch the public half of every key (explicitly configured or
-    /// auto-discovered). Items that fail to load are skipped with a warning —
-    /// better some keys than none — and an empty result is an error. Whether
-    /// the vault answered for every item is kept, since a set it did not is
-    /// served but not written down.
+    /// auto-discovered), asking for the master password if the vault is
+    /// locked: this is a start or a listing, and the first call that needs the
+    /// vault is the one to ask. Items that fail to load are skipped with a
+    /// warning — better some keys than none — and an empty result is an error.
+    /// Whether the vault answered for every item is kept, since a set it did
+    /// not is served but not written down.
     pub async fn load(
         client: &dyn LpassClient,
         keys: &[KeyConfig],
         config: &Config,
     ) -> Result<Self> {
-        let (entries, complete) = gather(inspect_keys(client, keys, config).await)?;
+        let (entries, complete) = gather(inspect_keys(client, keys, config, Access::Asking).await)?;
         if entries.is_empty() {
             return Err(Error::ConfigInvalid(
                 "no usable keys: every configured item failed to load (see warnings above)".into(),
@@ -401,7 +405,9 @@ impl KeyStore {
 
     /// As `load`, for a refresh that will replace a set already being served.
     ///
-    /// Stricter on one point: only a set the vault answered in full replaces
+    /// A scan, so it never asks for the master password and does not count as
+    /// using it: with the vault shut it fails fast and nothing changes. And
+    /// stricter on one point: only a set the vault answered in full replaces
     /// one. A refresh replacing a complete set with one missing a key because
     /// the vault shut halfway would be a loss dressed as an update, so any
     /// such scan is `None`, and the caller keeps what it has.
@@ -410,15 +416,16 @@ impl KeyStore {
         keys: &[KeyConfig],
         config: &Config,
     ) -> Option<Self> {
-        let (entries, complete) = match gather(inspect_keys(client, keys, config).await) {
-            Ok(gathered) => gathered,
-            Err(e) => {
-                tracing::debug!(
-                    "keeping the served set as it is, this scan cannot replace it: {e}"
-                );
-                return None;
-            }
-        };
+        let (entries, complete) =
+            match gather(inspect_keys(client, keys, config, Access::Scanning).await) {
+                Ok(gathered) => gathered,
+                Err(e) => {
+                    tracing::debug!(
+                        "keeping the served set as it is, this scan cannot replace it: {e}"
+                    );
+                    return None;
+                }
+            };
         if !complete {
             tracing::debug!(
                 "keeping the served set as it is: an item went unanswered, so this scan cannot \
@@ -841,6 +848,6 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .all(|(_, field)| field == "Public Key"));
+            .all(|(_, field, _)| field == "Public Key"));
     }
 }
