@@ -41,13 +41,17 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let config = Arc::new(Config::load_or_default(config_path)?);
     let socket_path = config.socket_path()?;
     let unlock = super::unlock_from(&config, &socket_path)?;
-    // Two views of one vault: `asking` reaches for the master password when
-    // the vault is locked, `quiet` is fed only what is already held and so
-    // can never put a prompt on screen. The agent fetches through `quiet`
-    // without taking the interaction gate, and reaches for `asking` only
-    // under it.
+    // Three views of one vault: `asking` reaches for the master password when
+    // the vault is locked; `signing` and `quiet` are fed only what is already
+    // held and so can never put a prompt on screen. The agent fetches through
+    // `signing` without taking the interaction gate, and reaches for `asking`
+    // only under it. `quiet` is the refresher's: the same silence, but a scan
+    // is not use, so it leaves the idle clock alone.
     let asking: Arc<dyn LpassClient> = Arc::new(
         super::client_from(&config)?.feeding(lpass::MasterPasswordSource::Unlock(unlock.clone())),
+    );
+    let signing: Arc<dyn LpassClient> = Arc::new(
+        super::client_from(&config)?.feeding(lpass::MasterPasswordSource::Signing(unlock.clone())),
     );
     let quiet: Arc<dyn LpassClient> = Arc::new(
         super::client_from(&config)?.feeding(lpass::MasterPasswordSource::HeldOnly(unlock.clone())),
@@ -88,12 +92,12 @@ pub async fn run(config_path: &Path) -> Result<()> {
     }
 
     let confirmer = confirm::from_config(&config)?;
-    // Through `quiet` as well, so an encrypted key's passphrase fetch takes no
-    // gate either. A lock landing between that fetch and the private key's
+    // Through `signing` as well, so an encrypted key's passphrase fetch takes
+    // no gate either. A lock landing between that fetch and the private key's
     // fails the signature rather than asking, and the retry asks: rarer than
     // one encrypted-key signature queueing behind another would be common.
     let unlocker = Arc::new(passphrase::Unlocker::new(
-        quiet.clone(),
+        signing.clone(),
         passphrase::from_config(&config)?,
     ));
     let (listener, guard) = socket::bind(&socket_path)?;
@@ -109,7 +113,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
         store.clone(),
         remembered_at.clone(),
         config.clone(),
-        quiet.clone(),
+        quiet,
         refresh::REFRESH_INTERVAL,
     ));
     // So a restart with the vault open picks up a key added since, off the
@@ -142,7 +146,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let factory = AgentFactory {
         template: agent::LpassAgent::new(
             store,
-            quiet,
+            signing,
             confirmer,
             unlocker,
             Arc::new(knownhosts::HostNames::default()),

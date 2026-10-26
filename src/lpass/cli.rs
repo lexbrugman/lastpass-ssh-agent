@@ -20,9 +20,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where the master password comes from when a call finds the vault locked.
 ///
-/// Every call is first made without one: `lpass` still reads an agent a shell
-/// has left running, and a vault the user opened themselves is used as they
-/// left it. Only a call that fails for want of the key reaches for this.
+/// A call with nothing held is first made without one: `lpass` still reads an
+/// agent a shell has left running, and a vault the user opened themselves is
+/// used as they left it. Only a call that fails for want of the key reaches
+/// for this.
 pub enum MasterPasswordSource {
     /// Nowhere. A locked vault fails fast, in `LpassError::Locked`.
     None,
@@ -31,8 +32,12 @@ pub enum MasterPasswordSource {
     /// What the agent holds, asking for it when it holds nothing.
     Unlock(Arc<Unlock>),
     /// What the agent holds, and nothing when it holds nothing — for work that
-    /// must never put a prompt on screen.
+    /// must never put a prompt on screen and does not count as using it.
     HeldOnly(Arc<Unlock>),
+    /// What the agent holds, and nothing when it holds nothing — for a
+    /// signature, which is what the idle time counts: a call fed from here
+    /// renews it.
+    Signing(Arc<Unlock>),
 }
 
 impl MasterPasswordSource {
@@ -42,7 +47,7 @@ impl MasterPasswordSource {
             Self::None => None,
             Self::Fixed(secret) => Some(secret.clone()),
             // Not asking, so it cannot fail.
-            Self::Unlock(unlock) | Self::HeldOnly(unlock) => {
+            Self::Unlock(unlock) | Self::HeldOnly(unlock) | Self::Signing(unlock) => {
                 unlock.password(false).await.unwrap_or_default()
             }
         }
@@ -55,13 +60,13 @@ impl MasterPasswordSource {
                 .password(true)
                 .await
                 .map_err(LpassError::NoMasterPassword),
-            Self::None | Self::Fixed(_) | Self::HeldOnly(_) => Ok(None),
+            Self::None | Self::Fixed(_) | Self::HeldOnly(_) | Self::Signing(_) => Ok(None),
         }
     }
 
     /// `lpass` did not accept what it was fed.
     async fn rejected(&self) {
-        if let Self::Unlock(unlock) | Self::HeldOnly(unlock) = self {
+        if let Self::Unlock(unlock) | Self::HeldOnly(unlock) | Self::Signing(unlock) = self {
             unlock.rejected().await;
         }
     }
@@ -72,7 +77,7 @@ impl MasterPasswordSource {
     /// scan renewing it would keep the password for as long as the vault is
     /// large.
     async fn used(&self) {
-        if let Self::Unlock(unlock) = self {
+        if let Self::Unlock(unlock) | Self::Signing(unlock) = self {
             unlock.touch().await;
         }
     }
@@ -169,6 +174,10 @@ impl LpassCli {
     /// turns out to need one and the source will supply it.
     async fn run(&self, args: &[&str], max_bytes: usize) -> Result<CmdOutput, LpassError> {
         let held = self.source.held().await;
+        // Stamped before the call as well as after it: a call that begins
+        // just short of the idle time would otherwise see the sweep drop the
+        // password from under it, and the stamp after would find nothing.
+        self.source.used().await;
         let mut out = self
             .exec(args, held.as_ref().map(|held| &held[..]), max_bytes)
             .await?;
@@ -180,9 +189,8 @@ impl LpassCli {
         if out.stderr.contains("Incorrect master password") {
             self.source.rejected().await;
         }
-        // Stamped after the call as well as before it, so the idle clock runs
-        // from when the password was last needed rather than from when the
-        // call began.
+        // And after it, so the idle clock runs from when the password was
+        // last needed rather than from when the call began.
         self.source.used().await;
         Ok(out)
     }
@@ -641,6 +649,33 @@ done"#,
         assert_eq!(
             &*client.show_field("42", "x").await.unwrap(),
             b"opened with secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signature_renews_the_idle_clock_and_a_scan_does_not() {
+        // The idle time counts signatures: the agent's client stamps what it
+        // was fed, the refresher's leaves the stamp where it found it.
+        let dir = tempfile::tempdir().unwrap();
+        let (unlock, _asks) = unlock_answering(dir.path(), "echo secret");
+        unlock.password(true).await.unwrap();
+        let held_at = unlock.last_used().await.unwrap();
+
+        let scan = LpassCli::new(locked_vault(dir.path()))
+            .feeding(MasterPasswordSource::HeldOnly(unlock.clone()));
+        scan.show_field("42", "x").await.unwrap();
+        assert_eq!(
+            unlock.last_used().await.unwrap(),
+            held_at,
+            "a scan is not use"
+        );
+
+        let signing = LpassCli::new(locked_vault(dir.path()))
+            .feeding(MasterPasswordSource::Signing(unlock.clone()));
+        signing.show_field("42", "x").await.unwrap();
+        assert!(
+            unlock.last_used().await.unwrap() > held_at,
+            "a signature is"
         );
     }
 

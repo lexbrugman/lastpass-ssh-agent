@@ -207,6 +207,11 @@ impl Unlock {
     pub async fn is_held(&self) -> bool {
         self.held.lock().await.is_some()
     }
+
+    #[cfg(test)]
+    pub async fn last_used(&self) -> Option<Instant> {
+        self.held.lock().await.as_ref().map(|held| held.last_used)
+    }
 }
 
 /// What the lock watcher drives: the screen locking drops the password.
