@@ -64,7 +64,7 @@ secret-service = { version = "5", default-features = false, features = ["rt-toki
 # connection of their own. Default features off for the same reason
 # secret-service turns them off — they would pull in a second async runtime
 # alongside tokio.
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus = { version = "6", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
