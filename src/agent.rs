@@ -461,7 +461,7 @@ struct Fetch {
 /// Removing a file the agent itself wrote cannot fail in practice, so the edge
 /// is excluded from coverage rather than pretended testable.
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "by value is what unwrap_or_else hands a function"
 )]

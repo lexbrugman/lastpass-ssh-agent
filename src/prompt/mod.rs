@@ -89,7 +89,7 @@ pub fn default_transport(timeout: std::time::Duration) -> Arc<dyn Transport> {
 /// its `wait` fail once it has closed stdout, and excluding one shared mapping
 /// beats excluding the readers that enforce the cap.
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "by value is what map_err hands a function; taking a reference \
               would require wrapping it in a closure, and that closure body \

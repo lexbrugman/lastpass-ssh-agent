@@ -131,8 +131,7 @@ pub struct Config {
     pub master_password: MasterPassword,
 
     /// Forget the master password when the screen locks, so walking away
-    /// shuts the vault and not just the display. On by default where the
-    /// screen's lock state can be read at all.
+    /// shuts the vault and not just the display. On by default.
     #[serde(default = "default_lock_on_screen_lock")]
     pub lock_on_screen_lock: bool,
 
@@ -153,17 +152,8 @@ const fn default_confirm_timeout() -> u64 {
     30
 }
 
-/// On wherever it can work: reading the screen's lock state is the one part a
-/// platform has to provide, and macOS and Linux do.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 const fn default_lock_on_screen_lock() -> bool {
     true
-}
-
-/// Off where the setting is refused, so that an empty config still loads.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-const fn default_lock_on_screen_lock() -> bool {
-    false
 }
 
 /// What `master_password_idle_secs` means when unset.
@@ -295,17 +285,6 @@ impl Config {
         if self.master_password == MasterPassword::TouchId {
             return Err(Error::ConfigInvalid(
                 "master_password = \"touchid\" is only supported on macOS".into(),
-            ));
-        }
-        // Same treatment, and for the same reason: reading the screen's lock
-        // state is the one part of that feature a platform has to provide, and
-        // macOS and Linux are the two that do. Refused at load rather than
-        // ignored, since a setting silently doing nothing is worse than one that
-        // says so.
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        if self.lock_on_screen_lock {
-            return Err(Error::ConfigInvalid(
-                "lock_on_screen_lock is only supported on macOS and Linux".into(),
             ));
         }
         Ok(())
@@ -664,28 +643,13 @@ id = "1"
     }
 
     #[test]
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn lock_on_screen_lock_is_on_here_unless_switched_off() {
+    fn lock_on_screen_lock_is_on_unless_switched_off() {
         assert!(parse("").unwrap().lock_on_screen_lock);
         assert!(
             !parse("lock_on_screen_lock = false")
                 .unwrap()
                 .lock_on_screen_lock
         );
-    }
-
-    #[test]
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    fn lock_on_screen_lock_is_refused_here_with_a_reason() {
-        // Reading the screen's lock state is the one part a platform has to
-        // provide: macOS through its window server, Linux through logind.
-        // Refused at load elsewhere, named in the message.
-        let error = parse("lock_on_screen_lock = true").unwrap_err().to_string();
-        assert!(
-            error.contains("only supported on macOS and Linux"),
-            "{error}"
-        );
-        assert!(!parse("").unwrap().lock_on_screen_lock);
     }
 
     #[test]

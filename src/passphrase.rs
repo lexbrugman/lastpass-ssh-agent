@@ -384,36 +384,6 @@ fn default_store() -> std::sync::Arc<dyn PassphraseStore> {
     std::sync::Arc::new(secretservice::SecretServiceStore)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn default_store() -> std::sync::Arc<dyn PassphraseStore> {
-    std::sync::Arc::new(NoStore)
-}
-
-/// There is nowhere to save a passphrase on a platform with neither a Keychain
-/// nor a secret service.
-///
-/// A running agent never reaches this: both store modes are refused at config
-/// load on these platforms. It exists because an unreadable store already means
-/// "ask instead", so the portable rules stay honest here rather than depending
-/// on a store that cannot fail.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-struct NoStore;
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-#[async_trait::async_trait]
-impl PassphraseStore for NoStore {
-    fn name(&self) -> &'static str {
-        "no passphrase store"
-    }
-
-    async fn get(&self, _fingerprint: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
-        Err("this platform has no passphrase store".into())
-    }
-    async fn set(&self, _fingerprint: &str, _secret: &[u8]) -> Result<(), String> {
-        Err("this platform has no passphrase store".into())
-    }
-}
-
 /// Build the prompt selected by the config.
 ///
 /// It follows the confirmation transport: whoever set `confirm` has already
@@ -1089,28 +1059,6 @@ mod tests {
             Some(RIGHT),
             "the entry is keyed by fingerprint, so a rename finds it"
         );
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    #[tokio::test]
-    async fn without_a_platform_store_keychain_mode_falls_back_to_asking() {
-        // Config validation refuses the store modes on a platform with neither a
-        // Keychain nor a secret service, so a running agent never gets here —
-        // but the default store must still behave, and an unreadable one means
-        // "ask". Not run where a real store exists: `Unlocker::new` would reach
-        // it, and the suite must never touch the store of whoever runs it.
-        let prompt = FakePrompt::answering(RIGHT);
-        let unlocker = Unlocker::new(Arc::new(empty_field()), prompt.clone());
-        let key = unlocker
-            .unlock(
-                &entry(PassphraseFallback::Keychain),
-                &encrypted(),
-                &mut gate(),
-            )
-            .await
-            .unwrap();
-        assert_unlocked(&key);
-        assert_eq!(prompt.calls(), 1);
     }
 
     /// A transport that answers as told, and keeps what it was asked.

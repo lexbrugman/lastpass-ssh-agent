@@ -275,11 +275,16 @@ pub fn is_item_id(text: &str) -> bool {
 
 /// Locate the lpass binary: explicit config path first, then PATH.
 pub fn resolve_binary(configured: Option<&Path>) -> Option<PathBuf> {
+    binary_from(configured, std::env::var_os("PATH"))
+}
+
+/// Pure, so the search is tested against directories a test made rather than
+/// whatever `PATH` the suite happens to run under.
+fn binary_from(configured: Option<&Path>, search: Option<std::ffi::OsString>) -> Option<PathBuf> {
     if let Some(path) = configured {
         return is_executable(path).then(|| path.to_path_buf());
     }
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
+    std::env::split_paths(&search?)
         .map(|dir| dir.join("lpass"))
         .find(|candidate| is_executable(candidate))
 }
@@ -528,10 +533,26 @@ mod discovery_tests {
     }
 
     #[test]
-    fn resolve_binary_searches_path() {
-        // the dev machine and CI both have PATH; lpass may or may not be on
-        // it — both outcomes exercise the search without asserting presence
-        let _ = resolve_binary(None);
+    fn the_binary_is_the_first_executable_lpass_on_the_search_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let empty = tempfile::tempdir().unwrap();
+        let unusable = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let not_executable = crate::testutil::write_script(unusable.path(), "lpass", "");
+        std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let found = crate::testutil::write_script(first.path(), "lpass", "");
+        crate::testutil::write_script(second.path(), "lpass", "");
+
+        let search =
+            std::env::join_paths([empty.path(), unusable.path(), first.path(), second.path()])
+                .unwrap();
+        assert_eq!(binary_from(None, Some(search)), Some(found));
+
+        // nowhere on it, and no search path at all
+        let nowhere = std::env::join_paths([empty.path(), unusable.path()]).unwrap();
+        assert_eq!(binary_from(None, Some(nowhere)), None);
+        assert_eq!(binary_from(None, None), None);
     }
 }
 

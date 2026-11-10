@@ -212,6 +212,19 @@ impl Unlock {
     pub async fn last_used(&self) -> Option<Instant> {
         self.held.lock().await.as_ref().map(|held| held.last_used)
     }
+
+    /// Make what is held look last used `by` longer ago, so a test states an
+    /// idle time rather than sleeping through one.
+    #[cfg(test)]
+    async fn backdate(&self, by: Duration) {
+        let mut held = self.held.lock().await;
+        let current = held.as_mut().expect("nothing held to backdate");
+        current.last_used = current
+            .last_used
+            .checked_sub(by)
+            .expect("up for less than that");
+        drop(held);
+    }
 }
 
 /// What the lock watcher drives: the screen locking drops the password.
@@ -366,19 +379,25 @@ mod tests {
     #[tokio::test]
     async fn the_idle_time_drops_it_and_use_keeps_it() {
         let prompt = FakePrompt::answering(b"secret");
-        let unlock = prompting(prompt.clone(), Some(Duration::from_millis(50)));
+        // A few seconds, not hours: an `Instant` cannot be moved back past
+        // boot, and building this already took longer than the eleven needed.
+        // Half the idle time each step, so a stalled runner has five seconds
+        // to lose before an assertion notices.
+        let unlock = prompting(prompt.clone(), Some(Duration::from_secs(10)));
         unlock.password(true).await.unwrap();
         unlock.expire_if_idle().await;
         assert!(unlock.is_held().await, "just used");
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        unlock.backdate(Duration::from_secs(5)).await;
+        unlock.expire_if_idle().await;
+        assert!(unlock.is_held().await, "not idle for long enough yet");
         unlock.touch().await;
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        unlock.backdate(Duration::from_secs(5)).await;
         unlock.expire_if_idle().await;
         assert!(
             unlock.is_held().await,
             "used again before the idle time ran out"
         );
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        unlock.backdate(Duration::from_secs(6)).await;
         unlock.expire_if_idle().await;
         assert!(!unlock.is_held().await, "idle for longer than allowed");
         unlock.touch().await; // nothing held: nothing to note
@@ -387,7 +406,7 @@ mod tests {
         // and with no idle time it is kept indefinitely
         let forever = prompting(prompt, None);
         forever.password(true).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        forever.backdate(Duration::from_secs(11)).await;
         forever.expire_if_idle().await;
         assert!(forever.is_held().await);
     }
@@ -465,11 +484,16 @@ mod tests {
         let unlock = Arc::new(prompting(prompt, Some(Duration::ZERO)));
         unlock.password(true).await.unwrap();
         let sweep = tokio::spawn(expire_when_idle(unlock.clone(), Duration::from_millis(1)));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !unlock.is_held().await,
-            "a zero idle time expires on the first sweep"
-        );
+        // Waited for rather than slept through: how soon the sweep gets to
+        // run is the scheduler's business, and only "never" is a failure.
+        let dropped = async {
+            while unlock.is_held().await {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), dropped)
+            .await
+            .expect("a zero idle time expires on the first sweep");
         sweep.abort();
     }
 }

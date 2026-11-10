@@ -1,5 +1,10 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+// Said once, here, so no module carries a fallback for a platform that is
+// never built: an arm nothing compiles is one nothing lints or tests either.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("lastpass-ssh-agent supports macOS and Linux only");
+
 mod agent;
 mod approvals;
 // Excluded from coverage: one `spawn_blocking` shared by the two macOS stores,
