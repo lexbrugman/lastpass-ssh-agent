@@ -4,24 +4,18 @@
 # every accepted advisory carries its reasoning where a reviewer will find it.
 
 [advisories]
-# RUSTSEC-2023-0071 — "Marvin Attack", a timing sidechannel in `rsa`
-# (medium, 5.9). Accepted rather than fixed, because there is nothing to fix
-# to: the advisory has had no patched release in any version line since 2023.
-# This agent uses `rsa` directly because ssh-key 0.6 cannot honor the SSH
-# agent's requested RSA digest correctly; dropping it means dropping RSA key
-# support until that upstream path changes.
+# RUSTSEC-2023-0071 — "Marvin Attack", a timing sidechannel in the private-key
+# operation of `rsa` before 0.10 (medium, 5.9). No signature goes through an
+# affected release: signing.rs signs with rsa 0.10, which is the fix. The
+# advisory still matches the tree because ssh-key 0.6 builds on rsa 0.9, and
+# cargo audit judges what is locked, not what is called.
 #
-# Mitigation: every RSA signature uses the crate's randomized signing API
-# with fresh OsRng input. That enables RSA blinding around the private-key
-# operation, making repeated timings substantially harder to correlate with
-# client-chosen inputs. Signing is also gated on a human confirmation by
-# default, bounding samples to roughly one per dialog.
+# Where it reaches: verifying an RSA host key's signature when a connection
+# is bound to a session. That is a public-key operation — there is no secret
+# for its timing to reveal. ssh-key's own RSA signer, the affected path, is
+# never called; `sign_with_key` owns that decision.
 #
-# Residual risk: blinding is a mitigation, not a constant-time rewrite, so
-# the advisory remains applicable and ignored explicitly rather than called
-# fixed. It matters most with `confirm = "off"` on a forwarded RSA key.
-#
-# Revisit when a fixed release appears: the audit is what will say so.
+# It lifts with ssh-key 0.7, the chain renovate.json describes.
 #
 # RUSTSEC-2026-0387 — secret-dependent timing in `crypto-bigint` 0.5
 # (subtraction, division, Montgomery multiplication, limb-wise equality).
@@ -33,7 +27,7 @@
 # Where it reaches: the scalar arithmetic of an ECDSA signature over a P-256
 # or P-384 key. ed25519 and RSA keys do not go through it.
 #
-# Mitigation: as above — signing is gated on a human confirmation by default,
+# Mitigation: signing is gated on a human confirmation by default,
 # bounding samples to roughly one per dialog, and no key is cached, so the
 # private scalar exists only for the one operation.
 #
