@@ -20,12 +20,10 @@ ssh-agent-lib = "0.6"
 async-trait = "0.1"
 # Pinned to 0.6.x: ssh-agent-lib depends on ssh-key ^0.6.
 ssh-key = { version = "0.6.7", features = ["ed25519", "rsa", "p256", "p384", "encryption"] }
-rsa = { version = "0.9", features = ["sha2"] }
-# `getrandom` is what defines OsRng, which signing.rs uses to blind the RSA
-# private-key operation. rand_core does not enable it by default — the build
-# would otherwise compile only because ssh-key's own feature set happens to
-# turn it on, which is no basis for a security mitigation.
-rand_core = { version = "0.6", features = ["getrandom"] }
+# Default features stay on: `getrandom` is what makes the signer signing.rs
+# calls blind the private-key operation, and without it that call still
+# compiles and signs unblinded.
+rsa = { version = "0.10", features = ["pkcs1v15"] }
 signature = "2"
 # `sync` is what the interaction gate, every prompt that serializes itself and
 # the Linux screen-lock probe's cached connection are built from. None of the
@@ -67,6 +65,9 @@ secret-service = { version = "5", default-features = false, features = ["rt-toki
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
+# OsRng for generating ssh-key test keys, so the version is ssh-key's to
+# choose; `getrandom` is the feature that defines it.
+rand_core = { version = "0.6", features = ["getrandom"] }
 tempfile = "3"
 
 [lints.rust]
