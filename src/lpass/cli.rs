@@ -430,6 +430,7 @@ impl LpassClient for LpassCli {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::path::Path;
 
     /// Write a fake `lpass` shell script whose behavior is baked in.
@@ -550,7 +551,7 @@ done"#,
             .show_field("42", "x", Access::Asking)
             .await
             .unwrap_err();
-        assert!(matches!(err, LpassError::FieldTooLarge(_)), "{err:?}");
+        assert_matches!(err, LpassError::FieldTooLarge(_), "{err:?}");
     }
 
     #[tokio::test]
@@ -574,14 +575,14 @@ done"#,
             .show_field("42", "Private Key", Access::Asking)
             .await
             .unwrap_err();
-        assert!(matches!(err, LpassError::Locked), "{err:?}");
-        assert!(matches!(
+        assert_matches!(err, LpassError::Locked, "{err:?}");
+        assert_matches!(
             LpassCli::new(locked_vault(dir.path()))
                 .ls(Access::Asking)
                 .await
                 .unwrap_err(),
             LpassError::Locked
-        ));
+        );
     }
 
     #[tokio::test]
@@ -704,7 +705,7 @@ done"#,
             .show_field("42", "x", Access::Asking)
             .await
             .unwrap_err();
-        assert!(matches!(err, LpassError::NoMasterPassword(_)), "{err:?}");
+        assert_matches!(err, LpassError::NoMasterPassword(_), "{err:?}");
     }
 
     #[tokio::test]
@@ -725,7 +726,7 @@ done"#,
             .show_field("42", "x", Access::Asking)
             .await
             .unwrap_err();
-        assert!(matches!(err, LpassError::WrongMasterPassword), "{err:?}");
+        assert_matches!(err, LpassError::WrongMasterPassword, "{err:?}");
         assert_eq!(times_asked(&asks), 1);
         assert!(
             !unlock.is_held().await,
@@ -736,10 +737,10 @@ done"#,
         let fixed = LpassCli::new(bin).feeding(MasterPasswordSource::Fixed(Zeroizing::new(
             b"typo".to_vec(),
         )));
-        assert!(matches!(
+        assert_matches!(
             fixed.ls(Access::Asking).await.unwrap_err(),
             LpassError::WrongMasterPassword
-        ));
+        );
     }
 
     #[tokio::test]
@@ -751,13 +752,13 @@ done"#,
         let client = LpassCli::new(bin).feeding(MasterPasswordSource::Fixed(Zeroizing::new(
             b"right".to_vec(),
         )));
-        assert!(matches!(
+        assert_matches!(
             client
                 .show_field("42", "Private Key", Access::Asking)
                 .await
                 .unwrap_err(),
             LpassError::NotLoggedIn
-        ));
+        );
     }
 
     #[tokio::test]
@@ -844,7 +845,7 @@ done"#,
             .show_field("42", "Private Key", Access::Asking)
             .await
             .unwrap_err();
-        assert!(matches!(err, LpassError::Timeout(_)), "{err:?}");
+        assert_matches!(err, LpassError::Timeout(_), "{err:?}");
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
@@ -871,16 +872,16 @@ done"#,
             "echo 'Error: Could not find specified account(s).' >&2; exit 1",
         );
         let err = LpassCli::new(bin).ls(Access::Asking).await.unwrap_err();
-        assert!(matches!(err, LpassError::CommandFailed { .. }), "{err:?}");
+        assert_matches!(err, LpassError::CommandFailed { .. }, "{err:?}");
 
         // missing binary -> Spawn
-        assert!(matches!(
+        assert_matches!(
             LpassCli::new(PathBuf::from("/nonexistent/lpass"))
                 .ls(Access::Asking)
                 .await
                 .unwrap_err(),
             LpassError::Spawn(_)
-        ));
+        );
     }
 
     #[tokio::test]

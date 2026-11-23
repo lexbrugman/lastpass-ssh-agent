@@ -281,7 +281,7 @@ fn read_small(path: &Path) -> Option<String> {
     file.take(MAX_KNOWN_HOSTS_BYTES)
         .read_to_end(&mut bytes)
         .ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some(String::from_utf8_lossy_owned(bytes))
 }
 
 #[cfg(test)]

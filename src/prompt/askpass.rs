@@ -128,6 +128,7 @@ impl Transport for AskpassTransport {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn helper(dir: &std::path::Path, body: &str) -> PathBuf {
         crate::testutil::write_script(dir, "askpass", body)
@@ -212,14 +213,11 @@ mod tests {
             PathBuf::from("/nonexistent/askpass"),
             Duration::from_secs(5),
         );
-        assert!(matches!(
+        assert_matches!(
             t.ask_to_confirm("question").await,
             Err(Failure::Unavailable(_))
-        ));
-        assert!(matches!(
-            t.ask_for_secret("key").await,
-            Err(Failure::Unavailable(_))
-        ));
+        );
+        assert_matches!(t.ask_for_secret("key").await, Err(Failure::Unavailable(_)));
     }
 
     /// Shared body for the answer-framing cases, so each stays one line and

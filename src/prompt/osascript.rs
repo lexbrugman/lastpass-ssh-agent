@@ -207,6 +207,7 @@ impl Transport for OsascriptTransport {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::path::{Path, PathBuf};
 
     fn transport(dir: &Path, body: &str) -> OsascriptTransport {
@@ -256,10 +257,10 @@ mod tests {
             dir.path(),
             "echo 'execution error: No user interaction allowed. (-1713)' >&2; exit 1",
         );
-        assert!(matches!(
+        assert_matches!(
             t.ask_to_confirm("question").await,
             Err(Failure::Unavailable(_))
-        ));
+        );
         let error = t.ask_for_secret("key").await.unwrap_err();
         let Failure::Unavailable(why) = error else {
             panic!("expected unavailable, got {error:?}");
@@ -274,14 +275,11 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_millis(100),
         );
-        assert!(matches!(
+        assert_matches!(
             t.ask_to_confirm("question").await,
             Err(Failure::Unavailable(_))
-        ));
-        assert!(matches!(
-            t.ask_for_secret("key").await,
-            Err(Failure::Unavailable(_))
-        ));
+        );
+        assert_matches!(t.ask_for_secret("key").await, Err(Failure::Unavailable(_)));
     }
 
     #[tokio::test]

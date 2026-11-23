@@ -157,7 +157,7 @@ const fn default_lock_on_screen_lock() -> bool {
 }
 
 /// What `master_password_idle_secs` means when unset.
-const DEFAULT_MASTER_PASSWORD_IDLE: Duration = Duration::from_secs(3600);
+const DEFAULT_MASTER_PASSWORD_IDLE: Duration = Duration::from_hours(1);
 
 /// An hour is already far longer than anyone waits at a signing prompt, and
 /// the bound keeps `Instant::now() + timeout` well inside what the platform
@@ -382,6 +382,7 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn parse(s: &str) -> Result<Config> {
         refuse_misnamed(s)?;
@@ -406,7 +407,7 @@ mod tests {
     fn load_missing_file_and_load_or_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        assert!(matches!(Config::load(&path), Err(Error::ConfigMissing(_))));
+        assert_matches!(Config::load(&path), Err(Error::ConfigMissing(_)));
         let config = Config::load_or_default(&path).unwrap();
         assert!(config.keys.is_empty());
         assert_eq!(config.confirm, ConfirmMode::default());
@@ -422,10 +423,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "not = valid = toml").unwrap();
-        assert!(matches!(
-            Config::load(&path),
-            Err(Error::ConfigParse { .. })
-        ));
+        assert_matches!(Config::load(&path), Err(Error::ConfigParse { .. }));
         // load_or_default only forgives a MISSING file, not a broken one
         assert!(Config::load_or_default(&path).is_err());
     }
@@ -442,7 +440,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(matches!(Config::load(&path), Err(Error::ConfigRead { .. })));
+        assert_matches!(Config::load(&path), Err(Error::ConfigRead { .. }));
     }
 
     #[test]
@@ -562,13 +560,13 @@ id = "1"
     fn the_idle_time_is_an_hour_unless_said_otherwise_and_zero_is_forever() {
         assert_eq!(
             parse("").unwrap().master_password_idle(),
-            Some(Duration::from_secs(3600))
+            Some(Duration::from_hours(1))
         );
         assert_eq!(
             parse("master_password_idle_secs = 300")
                 .unwrap()
                 .master_password_idle(),
-            Some(Duration::from_secs(300))
+            Some(Duration::from_mins(5))
         );
         // a footgun, but one a config is entitled to ask for
         assert_eq!(

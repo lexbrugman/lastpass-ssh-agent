@@ -16,7 +16,7 @@ use crate::keystore::{self, KeyStore, Served};
 use crate::lpass::{Access, LpassClient};
 
 /// The identities change rarely, and a scan is a vault call per item.
-pub const REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+pub const REFRESH_INTERVAL: Duration = Duration::from_hours(1);
 
 pub struct Refresher {
     served: Served,

@@ -298,9 +298,10 @@ fn take(bytes: &[u8], max: usize) -> Result<(&[u8], &[u8])> {
         .ok_or_else(|| malformed("truncated value"))
 }
 
-/// Where the blob and ciphertext live, given the socket; see `files::beside`.
+/// Where the blob and ciphertext live: beside the socket, for the reason
+/// `identities::path_for` gives.
 pub fn path_for(socket: &Path) -> PathBuf {
-    crate::files::beside(socket, ".master")
+    socket.with_added_extension("master")
 }
 
 /// Read it back, or `None` when there is nothing stored yet.

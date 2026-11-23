@@ -38,9 +38,11 @@ pub struct RememberedKey {
 /// fails to decode rather than being cut to a length that happens to parse.
 const MAX_BYTES: usize = 1024 * 1024;
 
-/// Beside the socket; see `files::beside`.
+/// Named after the socket: the socket path is the one thing every part of a
+/// running agent already agrees on, so nothing else has to be configured to
+/// keep the agent's files together.
 pub fn path_for(socket: &Path) -> PathBuf {
-    crate::files::beside(socket, ".identities")
+    socket.with_added_extension("identities")
 }
 
 /// What the last start wrote down, or `None` when nothing is there yet.

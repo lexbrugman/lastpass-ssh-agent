@@ -6,18 +6,9 @@
 //! block forever on something that is not a file. Neither shows up in testing;
 //! both show up when something else is already going wrong.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::error::Result;
-
-/// A file of the agent's own, named after its socket: the socket path is the
-/// one thing every part of a running agent already agrees on, so nothing else
-/// has to be configured to keep them together.
-pub fn beside(socket: &Path, suffix: &str) -> PathBuf {
-    let mut name = socket.as_os_str().to_os_string();
-    name.push(suffix);
-    PathBuf::from(name)
-}
 
 /// Remove `path`. Already gone is the state this asks for, so that is success.
 pub fn remove_if_present(path: &Path) -> Result<()> {
@@ -48,7 +39,7 @@ pub fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let staging = beside(path, &format!(".{}", std::process::id()));
+    let staging = path.with_added_extension(std::process::id().to_string());
 
     // Never through a symlink: the staging name is predictable, and one planted
     // there would have the contents written wherever it points.
@@ -135,13 +126,6 @@ mod tests {
         assert!(remove_if_present(&path).is_err());
     }
 
-    #[test]
-    fn a_file_beside_the_socket_takes_its_name_and_a_suffix() {
-        assert_eq!(
-            beside(Path::new("/run/user/1000/agent.sock"), ".identities"),
-            PathBuf::from("/run/user/1000/agent.sock.identities")
-        );
-    }
     use std::io::Read as _;
     use std::os::unix::fs::PermissionsExt as _;
 

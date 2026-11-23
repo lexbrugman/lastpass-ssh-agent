@@ -265,7 +265,7 @@ fn too_many_keys(label: &str, served: usize) -> Option<Check> {
 fn check_socket(config: &Config) -> Check {
     let resolved = config.socket_path().and_then(|path| {
         path.parent()
-            .filter(|d| !d.as_os_str().is_empty())
+            .filter(|d| !d.is_empty())
             .map_or_else(
                 || Err(Error::Socket("socket path has no parent directory".into())),
                 socket::validate_dir,

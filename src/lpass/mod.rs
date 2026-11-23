@@ -299,6 +299,7 @@ fn is_executable(path: &Path) -> bool {
 mod discovery_tests {
     use super::mock::MockLpass;
     use super::*;
+    use std::assert_matches;
 
     type Vars<'a> = &'a [(&'a str, &'a str)];
 
@@ -511,10 +512,10 @@ mod discovery_tests {
     #[tokio::test]
     async fn discovery_requires_login() {
         let mock = Arc::new(MockLpass::default());
-        assert!(matches!(
+        assert_matches!(
             discover_ssh_key_items(mock, None, Access::Asking).await,
             Err(LpassError::NotLoggedIn)
-        ));
+        );
     }
 
     #[test]

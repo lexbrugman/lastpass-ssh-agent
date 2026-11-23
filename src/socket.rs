@@ -87,15 +87,12 @@ pub fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
 /// it. Also for whatever else the agent keeps beside its socket, when that is
 /// written before any agent has bound there — `list` on a fresh install.
 pub fn prepare_parent(path: &Path) -> Result<()> {
-    let dir = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .ok_or_else(|| {
-            Error::Socket(format!(
-                "socket path {} has no parent directory",
-                path.display()
-            ))
-        })?;
+    let dir = path.parent().filter(|d| !d.is_empty()).ok_or_else(|| {
+        Error::Socket(format!(
+            "socket path {} has no parent directory",
+            path.display()
+        ))
+    })?;
     prepare_dir(dir)
 }
 

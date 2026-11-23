@@ -339,6 +339,7 @@ async fn read_line(
 mod tests {
     use super::*;
     use crate::testutil::open_pty;
+    use std::assert_matches;
     use std::fs::File;
     use std::time::Instant;
 
@@ -371,7 +372,7 @@ mod tests {
     /// longest of them needs sixty-odd round trips and is the first to feel a
     /// loaded machine. Tighten this and it flakes — around one run in ten with
     /// a second instrumented build alongside.
-    const UNHURRIED: Duration = Duration::from_secs(120);
+    const UNHURRIED: Duration = Duration::from_mins(2);
 
     /// Shared body for the yes/no cases, so each stays one line and still gets
     /// its own name and `cargo test` filter.
@@ -466,14 +467,14 @@ mod tests {
     async fn a_missing_terminal_is_unavailable_for_either_question() {
         let transport =
             TtyTransport::with_tty(PathBuf::from("/nonexistent/tty"), Duration::from_secs(1));
-        assert!(matches!(
+        assert_matches!(
             transport.ask_to_confirm("question").await,
             Err(Failure::Unavailable(_))
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             transport.ask_for_secret("question").await,
             Err(Failure::Unavailable(_))
-        ));
+        );
     }
 
     #[tokio::test]
@@ -744,10 +745,10 @@ mod tests {
         let path = dir.path().join("not-a-tty");
         std::fs::write(&path, b"").unwrap();
         let transport = TtyTransport::with_tty(path, Duration::from_secs(1));
-        assert!(matches!(
+        assert_matches!(
             transport.ask_for_secret("key").await,
             Err(Failure::Unavailable(_))
-        ));
+        );
     }
 
     #[tokio::test]
@@ -764,14 +765,14 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
         let transport = TtyTransport::with_tty(path, Duration::from_secs(1));
-        assert!(matches!(
+        assert_matches!(
             transport.ask_for_secret("key").await,
             Err(Failure::Unavailable(_))
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             transport.ask_to_confirm("question").await,
             Err(Failure::Unavailable(_))
-        ));
+        );
     }
 
     #[tokio::test]

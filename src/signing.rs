@@ -259,6 +259,7 @@ fn positive_bytes(mpint: &ssh_key::Mpint) -> Result<&[u8], SignError> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// A userauth request as `ssh` builds one, field by field.
     fn userauth(fields: &[&[u8]], message: u8, flag: u8) -> Vec<u8> {
@@ -424,7 +425,7 @@ mod tests {
     fn rsa_without_flags_is_refused() {
         let (private, _) = keypair(RSA, RSA_PUB);
         let err = sign_with_key(&private, b"data", 0).unwrap_err();
-        assert!(matches!(err, SignError::RefusedSha1));
+        assert_matches!(err, SignError::RefusedSha1);
     }
 
     #[test]

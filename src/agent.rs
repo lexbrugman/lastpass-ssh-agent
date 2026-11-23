@@ -610,6 +610,7 @@ mod tests {
     use crate::passphrase::{NoPrompt, PassphrasePrompt, PassphraseRequest, PromptError};
     use signature::Verifier;
     use ssh_agent_lib::proto::signature as sigflag;
+    use std::assert_matches;
 
     /// Types a fixed passphrase and counts how often it was asked, so a test
     /// can prove the vault took precedence.
@@ -1785,14 +1786,14 @@ mod tests {
         ];
         for request in refused {
             let response = agent.handle(request).await.unwrap();
-            assert!(matches!(response, Response::Failure), "{response:?}");
+            assert_matches!(response, Response::Failure, "{response:?}");
         }
 
         // and the two operations we do serve still answer normally
-        assert!(matches!(
+        assert_matches!(
             agent.handle(Request::RequestIdentities).await.unwrap(),
             Response::IdentitiesAnswer(_)
-        ));
+        );
     }
 
     /// A binding as OpenSSH sends it: the host signs the session id with
@@ -1853,7 +1854,7 @@ mod tests {
             .handle(certificate_bind(&host, b"cert-session", true))
             .await
             .unwrap();
-        assert!(matches!(response, Response::Success), "{response:?}");
+        assert_matches!(response, Response::Success, "{response:?}");
         assert_eq!(agent.bindings.len(), 1);
         assert_eq!(agent.bindings[0].session_id, b"cert-session");
         assert!(agent.bindings[0].is_forwarding);
@@ -1922,13 +1923,13 @@ mod tests {
         let mut agent = agent_recording(confirmer.clone()).await;
         let host = PrivateKey::from_openssh(ED25519).unwrap();
 
-        assert!(matches!(
+        assert_matches!(
             agent
                 .handle(session_bind(&host, b"session-one", false))
                 .await
                 .unwrap(),
             Response::Success
-        ));
+        );
         agent
             .handle(Request::SignRequest(sign_request(
                 ED25519_PUB,
@@ -2003,13 +2004,13 @@ mod tests {
         // the same hop repeated adds nothing; the same host under a new
         // session is a new connection to it, and is a hop of its own
         for session in [&b"same-host"[..], b"same-host", b"same-host-again"] {
-            assert!(matches!(
+            assert_matches!(
                 agent
                     .handle(session_bind(&host, session, true))
                     .await
                     .unwrap(),
                 Response::Success
-            ));
+            );
         }
         assert_eq!(agent.bindings.len(), 2);
         assert_eq!(agent.bindings[0].session_id, b"same-host");
@@ -2017,13 +2018,13 @@ mod tests {
 
         // a session already bound cannot be claimed by another host key
         let other = PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
-        assert!(matches!(
+        assert_matches!(
             agent
                 .handle(session_bind(&other, b"same-host", true))
                 .await
                 .unwrap(),
             Response::Failure
-        ));
+        );
         assert_eq!(agent.bindings.len(), 2);
 
         // distinct forwarding hops accumulate only up to our own cap
@@ -2059,13 +2060,13 @@ mod tests {
         let another =
             PrivateKey::random(&mut rand_core::OsRng, ssh_key::Algorithm::Ed25519).unwrap();
         for (key, session) in [(&another, &b"later"[..]), (&first, b"hop-one")] {
-            assert!(matches!(
+            assert_matches!(
                 agent
                     .handle(session_bind(key, session, false))
                     .await
                     .unwrap(),
                 Response::Failure
-            ));
+            );
         }
         assert_eq!(agent.bindings.len(), 2);
         assert_eq!(agent.bindings.last().unwrap().session_id, b"the-end");
@@ -2093,10 +2094,7 @@ mod tests {
             })
             .unwrap(),
         );
-        assert!(matches!(
-            agent.handle(forged).await.unwrap(),
-            Response::Failure
-        ));
+        assert_matches!(agent.handle(forged).await.unwrap(), Response::Failure);
 
         agent
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
@@ -2182,7 +2180,7 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(matches!(response, Response::Success), "{response:?}");
+        assert_matches!(response, Response::Success, "{response:?}");
     }
 
     #[tokio::test]
@@ -2205,7 +2203,7 @@ mod tests {
                 .handle(Request::SignRequest(sign_request(ED25519_PUB, &data, 0)))
                 .await
                 .unwrap();
-            assert!(matches!(response, Response::Failure));
+            assert_matches!(response, Response::Failure);
         }
         assert!(confirmer.0.lock().unwrap().is_empty(), "nothing was asked");
 
@@ -2218,7 +2216,7 @@ mod tests {
             )))
             .await
             .unwrap();
-        assert!(matches!(response, Response::SignResponse(_)));
+        assert_matches!(response, Response::SignResponse(_));
 
         // the host-bound form names the server: the bound host is signed for,
         // a host in the middle naming the one beyond it is not
@@ -2234,7 +2232,7 @@ mod tests {
             )))
             .await
             .unwrap();
-        assert!(matches!(response, Response::SignResponse(_)));
+        assert_matches!(response, Response::SignResponse(_));
         let response = agent
             .handle(Request::SignRequest(sign_request(
                 ED25519_PUB,
@@ -2243,14 +2241,14 @@ mod tests {
             )))
             .await
             .unwrap();
-        assert!(matches!(response, Response::Failure));
+        assert_matches!(response, Response::Failure);
 
         // a session id longer than any key exchange produces is refused
         let response = agent
             .handle(session_bind(&host, &[7u8; MAX_SESSION_ID_BYTES + 1], false))
             .await
             .unwrap();
-        assert!(matches!(response, Response::Failure));
+        assert_matches!(response, Response::Failure);
 
         // as is a host key larger than any host sends, before it is parsed
         let response = agent
@@ -2260,7 +2258,7 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(matches!(response, Response::Failure));
+        assert_matches!(response, Response::Failure);
 
         // an unbound connection is under no such rule
         let mut plain = agent_recording(confirmer.clone()).await;
@@ -2268,7 +2266,7 @@ mod tests {
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
             .await
             .unwrap();
-        assert!(matches!(response, Response::SignResponse(_)));
+        assert_matches!(response, Response::SignResponse(_));
     }
 
     #[tokio::test]
@@ -2307,7 +2305,7 @@ mod tests {
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
             .await
             .unwrap();
-        assert!(matches!(response, Response::Failure));
+        assert_matches!(response, Response::Failure);
     }
 
     #[tokio::test]
@@ -2318,7 +2316,7 @@ mod tests {
             .handle(Request::SignRequest(sign_request(ED25519_PUB, b"x", 0)))
             .await
             .unwrap();
-        assert!(matches!(response, Response::SignResponse(_)));
+        assert_matches!(response, Response::SignResponse(_));
     }
 
     #[tokio::test]
