@@ -56,7 +56,7 @@ core-foundation = "0.10"
 # `rt-tokio-crypto-rust` is the feature that keeps this free of C: the session
 # with the secret service is encrypted using RustCrypto's AES rather than
 # OpenSSL, and zbus runs on the tokio runtime the agent already has.
-secret-service = { version = "5", default-features = false, features = ["rt-tokio-crypto-rust"] }
+secret-service = { version = "6", default-features = false, features = ["rt-tokio-crypto-rust"] }
 # Reading one property off logind. Pinned to 5.x because secret-service
 # depends on zbus ^5: two zbus versions in one binary would each open a bus
 # connection of their own. Default features off for the same reason
