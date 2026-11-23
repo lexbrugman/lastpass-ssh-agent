@@ -1051,10 +1051,12 @@ mod tests {
             uid: 501,
         }));
         assert_eq!(session.request_identities().await.unwrap().len(), 1);
-        assert!(session
-            .sign(sign_request(ED25519_PUB, b"via peer session", 0))
-            .await
-            .is_ok());
+        assert!(
+            session
+                .sign(sign_request(ED25519_PUB, b"via peer session", 0))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1064,10 +1066,12 @@ mod tests {
                 .with_ed25519_public("1")
                 .with_field("1", "Private Key", b"");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
-        assert!(agent
-            .sign(sign_request(ED25519_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1088,10 +1092,12 @@ mod tests {
     async fn unknown_key_fails() {
         let client = MockLpass::logged_in().with_ed25519_public("1");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
-        assert!(agent
-            .sign(sign_request(RSA_PUB, b"payload", sigflag::RSA_SHA2_256))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(RSA_PUB, b"payload", sigflag::RSA_SHA2_256))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1105,10 +1111,12 @@ mod tests {
         )
         .await;
 
-        assert!(agent
-            .sign(sign_request(ED25519_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
         assert!(
             client
                 .fetch_log
@@ -1139,10 +1147,12 @@ mod tests {
             no_host_names(),
         );
 
-        assert!(agent
-            .sign(sign_request(ED25519_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
         // next request still served
         assert_eq!(agent.request_identities().await.unwrap().len(), 1);
     }
@@ -1168,10 +1178,12 @@ mod tests {
             prompt.clone(),
         )
         .await;
-        assert!(agent
-            .sign(sign_request(ED25519_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
         assert!(
             !prompt.was_asked(),
             "a key we will not sign with must not be unlocked"
@@ -1210,20 +1222,24 @@ mod tests {
 
         std::fs::write(&remembered, "[[keys]]\n").unwrap();
         let mut locked = agent(MockLpass::default());
-        assert!(locked
-            .sign(sign_request(ED25519_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            locked
+                .sign(sign_request(ED25519_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
         assert!(
             remembered.exists(),
             "a locked vault is not a verdict on the key"
         );
 
         let mut deleted = agent(MockLpass::logged_in());
-        assert!(deleted
-            .sign(sign_request(ED25519_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            deleted
+                .sign(sign_request(ED25519_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
         assert!(
             !remembered.exists(),
             "the next start must learn the item is gone"
@@ -1292,10 +1308,12 @@ mod tests {
         )
         .with_refresher(refresher);
 
-        assert!(agent
-            .sign(sign_request(ED25519_PUB, b"payload", 0))
-            .await
-            .is_ok());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PUB, b"payload", 0))
+                .await
+                .is_ok()
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while served.current().len() != 2 {
             assert!(
@@ -1323,10 +1341,12 @@ mod tests {
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"")
             .await
             .with_remembered_file(remembered.clone());
-        assert!(agent
-            .sign(sign_request(ED25519_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
         assert!(
             !remembered.exists(),
             "the next start must read the vault, not the file"
@@ -1359,10 +1379,12 @@ mod tests {
             b"this is not a PEM at all",
         );
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
-        assert!(agent
-            .sign(sign_request(ED25519_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1372,10 +1394,12 @@ mod tests {
             .with_field("1", "Private Key", ED25519_PW.as_bytes())
             .with_field("1", "Passphrase", b"not the passphrase");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
-        assert!(agent
-            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1385,10 +1409,12 @@ mod tests {
             .with_field("1", "Private Key", ED25519_PW.as_bytes())
             .with_broken_field("1", "Passphrase");
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
-        assert!(agent
-            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1397,10 +1423,12 @@ mod tests {
             .with_field("1", "Public Key", ED25519_PW_PUB.as_bytes())
             .with_field("1", "Private Key", ED25519_PW.as_bytes());
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
-        assert!(agent
-            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
     }
 
     /// An agent serving the passphrase-protected fixture, with whatever
@@ -1443,10 +1471,12 @@ mod tests {
     async fn a_wrongly_typed_passphrase_fails_the_signature() {
         let prompt = TypedPassphrase::new(b"not the passphrase");
         let mut agent = pw_agent(None, PW_KEY, &prompt).await;
-        assert!(agent
-            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
         assert!(prompt.was_asked());
     }
 
@@ -1459,10 +1489,12 @@ mod tests {
             &prompt,
         )
         .await;
-        assert!(agent
-            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
         assert!(!prompt.was_asked(), "error mode must not prompt");
     }
 
@@ -1476,10 +1508,12 @@ mod tests {
             &prompt,
         )
         .await;
-        assert!(agent
-            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
         assert!(!prompt.was_asked());
     }
 
@@ -1489,10 +1523,12 @@ mod tests {
         // nothing is asked.
         let prompt = TypedPassphrase::new(b"would be wrong");
         let mut agent = pw_agent(Some(b"fixture-passphrase"), PW_KEY, &prompt).await;
-        assert!(agent
-            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
-            .await
-            .is_ok());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+                .await
+                .is_ok()
+        );
         assert!(!prompt.was_asked(), "the vault answered; nothing to ask");
     }
 
@@ -1502,10 +1538,12 @@ mod tests {
         // able to draw a prompt could override a passphrase the vault pins.
         let prompt = TypedPassphrase::new(b"fixture-passphrase");
         let mut agent = pw_agent(Some(b"wrong but present"), PW_KEY, &prompt).await;
-        assert!(agent
-            .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
-            .await
-            .is_err());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PW_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
         assert!(
             !prompt.was_asked(),
             "a wrong vault passphrase must not open a prompt"
@@ -1738,10 +1776,12 @@ mod tests {
             prompt.clone(),
         )
         .await;
-        assert!(agent
-            .sign(sign_request(ED25519_PUB, b"payload", 0))
-            .await
-            .is_ok());
+        assert!(
+            agent
+                .sign(sign_request(ED25519_PUB, b"payload", 0))
+                .await
+                .is_ok()
+        );
         assert!(!prompt.was_asked());
         assert!(
             client
@@ -2326,21 +2366,25 @@ mod tests {
         let mut agent = agent_with(client, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
 
         let private = PrivateKey::from_openssh(ED25519).unwrap();
-        assert!(agent
-            .add_identity(AddIdentity {
-                credential: PrivateCredential::Key {
-                    privkey: private.key_data().clone(),
-                    comment: "x".into()
-                },
-            })
-            .await
-            .is_err());
-        assert!(agent
-            .remove_identity(RemoveIdentity {
-                credential: private.public_key().key_data().clone().into(),
-            })
-            .await
-            .is_err());
+        assert!(
+            agent
+                .add_identity(AddIdentity {
+                    credential: PrivateCredential::Key {
+                        privkey: private.key_data().clone(),
+                        comment: "x".into()
+                    },
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            agent
+                .remove_identity(RemoveIdentity {
+                    credential: private.public_key().key_data().clone().into(),
+                })
+                .await
+                .is_err()
+        );
         assert!(agent.lock("secret".into()).await.is_err());
     }
 }

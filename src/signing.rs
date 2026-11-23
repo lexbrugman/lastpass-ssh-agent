@@ -1,6 +1,6 @@
+use rsa::BoxedUint;
 use rsa::pkcs1v15::SigningKey;
 use rsa::sha2::{Sha256, Sha512};
-use rsa::BoxedUint;
 use signature::Signer;
 use ssh_agent_lib::proto::signature as sigflag;
 use ssh_agent_lib::ssh_encoding::{Decode as _, Reader as _};

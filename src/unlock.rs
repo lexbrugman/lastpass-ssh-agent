@@ -15,8 +15,8 @@
 //! exits. The next call that needs it asks again — the Secure Enclave first
 //! when that is configured and seeded, the prompt otherwise.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;

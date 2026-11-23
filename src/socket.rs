@@ -52,7 +52,7 @@ pub fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
                     return Err(Error::Socket(format!(
                         "another agent is already listening on {}",
                         path.display()
-                    )))
+                    )));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                     tracing::info!(path = %path.display(), "removing stale socket");
@@ -63,7 +63,7 @@ pub fn bind(path: &Path) -> Result<(UnixListener, SocketGuard)> {
                         "cannot tell whether an agent is listening on {}: {e} — \
                          refusing to remove it",
                         path.display()
-                    )))
+                    )));
                 }
             }
         }

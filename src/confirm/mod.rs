@@ -542,16 +542,20 @@ mod tests {
         // A requester that cannot be told from another has no question to
         // remember: no peer, no pid, or a pid with no readable executable.
         assert!(approval_question(&from_peer(None)).is_none());
-        assert!(approval_question(&from_peer(Some(PeerInfo {
-            pid: None,
-            uid: 501,
-        })))
-        .is_none());
-        assert!(approval_question(&from_peer(Some(PeerInfo {
-            pid: Some(0),
-            uid: 501,
-        })))
-        .is_none());
+        assert!(
+            approval_question(&from_peer(Some(PeerInfo {
+                pid: None,
+                uid: 501,
+            })))
+            .is_none()
+        );
+        assert!(
+            approval_question(&from_peer(Some(PeerInfo {
+                pid: Some(0),
+                uid: 501,
+            })))
+            .is_none()
+        );
 
         let pid = std::process::id().cast_signed();
         let mut ctx = from_peer(Some(PeerInfo {

@@ -226,9 +226,11 @@ mod tests {
         // a lock that happened elsewhere voids it too
         approvals.settle(given(1), false, true).unwrap();
         epoch.bump();
-        assert!(approvals
-            .settle(Answer::Remembered(1), false, true)
-            .is_err());
+        assert!(
+            approvals
+                .settle(Answer::Remembered(1), false, true)
+                .is_err()
+        );
 
         // an answer given while the request's own fetch asked is carried into
         // the epoch that begins with that ask
@@ -251,12 +253,14 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert!(approvals
-            .remembered
-            .lock()
-            .unwrap()
-            .values()
-            .all(|answered_in| *answered_in != 4));
+        assert!(
+            approvals
+                .remembered
+                .lock()
+                .unwrap()
+                .values()
+                .all(|answered_in| *answered_in != 4)
+        );
     }
 
     #[test]

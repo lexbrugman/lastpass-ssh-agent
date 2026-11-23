@@ -11,8 +11,8 @@ use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use zeroize::Zeroizing;
 
 use super::{Failure, Transport};

@@ -84,7 +84,7 @@ async fn seed(config: &Config, socket_path: &Path) -> Result<()> {
             return Err(Error::State(
                 "the vault is still open, so the password cannot be checked — nothing was kept"
                     .into(),
-            ))
+            ));
         }
         Err(e) => return Err(e.into()),
     }

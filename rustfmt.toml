@@ -1,3 +1,0 @@
-# Formatting stays on the 2021 style for one commit, so the edition change and
-# the reformat it brings land separately.
-style_edition = "2021"

@@ -441,12 +441,13 @@ mod discovery_tests {
         let ids: Vec<_> = found.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, ["4", "6"]);
         // items whose names don't match must never be probed at all
-        assert!(mock
-            .fetch_log
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(id, _, _)| id == "3" || id == "4" || id == "6"));
+        assert!(
+            mock.fetch_log
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(id, _, _)| id == "3" || id == "4" || id == "6")
+        );
     }
 
     #[tokio::test]
@@ -455,12 +456,13 @@ mod discovery_tests {
         discover_ssh_key_items(mock.clone(), None, Access::Asking)
             .await
             .unwrap();
-        assert!(mock
-            .fetch_log
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(_, field, _)| field == "NoteType"));
+        assert!(
+            mock.fetch_log
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, field, _)| field == "NoteType")
+        );
     }
 
     #[tokio::test]
@@ -504,9 +506,11 @@ mod discovery_tests {
                 name: "Other".into(),
             },
         ];
-        assert!(discover_ssh_key_items(Arc::new(mock), None, Access::Asking)
-            .await
-            .is_err());
+        assert!(
+            discover_ssh_key_items(Arc::new(mock), None, Access::Asking)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

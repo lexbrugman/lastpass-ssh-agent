@@ -62,7 +62,9 @@ fn secure_enclave_shim() {
         return;
     }
     if !cfg!(target_os = "macos") {
-        println!("cargo:warning=not on macOS: skipping the Swift Secure Enclave shim (this build can be type-checked but not linked)");
+        println!(
+            "cargo:warning=not on macOS: skipping the Swift Secure Enclave shim (this build can be type-checked but not linked)"
+        );
         return;
     }
 

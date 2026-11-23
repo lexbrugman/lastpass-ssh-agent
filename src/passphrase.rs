@@ -852,14 +852,16 @@ mod tests {
         // or the key would be locked behind it until someone cleared it.
         let store = FakeStore::empty();
         let unlocker = unlocker(empty_field(), FakePrompt::answering(WRONG), store.clone());
-        assert!(unlocker
-            .unlock(
-                &entry(PassphraseFallback::Keychain),
-                &encrypted(),
-                &mut gate()
-            )
-            .await
-            .is_err());
+        assert!(
+            unlocker
+                .unlock(
+                    &entry(PassphraseFallback::Keychain),
+                    &encrypted(),
+                    &mut gate()
+                )
+                .await
+                .is_err()
+        );
         assert_eq!(store.writes(), 0, "an unverified passphrase was saved");
         assert_eq!(store.contents(), None);
     }

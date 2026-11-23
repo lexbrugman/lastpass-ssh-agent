@@ -197,7 +197,7 @@ impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for AgentFactory {
 /// Installs the handlers now, and resolves on the first SIGTERM or SIGINT from
 /// then on.
 fn shutdown_signal() -> impl std::future::Future<Output = ()> {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("cannot install SIGTERM handler");
     let mut int = signal(SignalKind::interrupt()).expect("cannot install SIGINT handler");
     async move {
@@ -247,9 +247,11 @@ mod tests {
         let path = remembered(dir.path(), "");
         let config: Config = toml::from_str("").unwrap();
         assert!(remembered_store(&path, &config).unwrap().is_none());
-        assert!(remembered_store(&dir.path().join("absent"), &config)
-            .unwrap()
-            .is_none());
+        assert!(
+            remembered_store(&dir.path().join("absent"), &config)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

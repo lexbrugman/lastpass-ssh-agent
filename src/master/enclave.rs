@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 use super::MasterPasswordStore;
-use crate::enclave::{self, Outcome, Stored, MAX_BLOB, MAX_CIPHER};
+use crate::enclave::{self, MAX_BLOB, MAX_CIPHER, Outcome, Stored};
 
 unsafe extern "C" {
     safe fn lssha_se_available() -> i32;

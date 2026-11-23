@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ssh_key::public::KeyData;
 use ssh_key::PublicKey;
+use ssh_key::public::KeyData;
 
 use crate::config::{Config, KeyConfig, PassphraseFallback};
 use crate::error::{Error, Result};
@@ -572,9 +572,11 @@ mod tests {
     async fn zero_usable_keys_is_an_error() {
         let client = MockLpass::logged_in().with_broken_item("1");
         let config = config("[[keys]]\nid = \"1\"");
-        assert!(KeyStore::load(&client, &config.keys, &config)
-            .await
-            .is_err());
+        assert!(
+            KeyStore::load(&client, &config.keys, &config)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -641,17 +643,21 @@ mod tests {
             .with_ed25519_public("1")
             .with_broken_item("2");
         let both = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
-        assert!(KeyStore::load_complete(&client, &both.keys, &both)
-            .await
-            .is_none());
+        assert!(
+            KeyStore::load_complete(&client, &both.keys, &both)
+                .await
+                .is_none()
+        );
 
         let shut = MockLpass::logged_in()
             .with_ed25519_public("1")
             .with_logged_out_field("1", "Public Key");
         let one = config("[[keys]]\nid = \"1\"");
-        assert!(KeyStore::load_complete(&shut, &one.keys, &one)
-            .await
-            .is_none());
+        assert!(
+            KeyStore::load_complete(&shut, &one.keys, &one)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -660,9 +666,11 @@ mod tests {
             .with_ed25519_public("1")
             .with_ed25519_public("2");
         let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
-        assert!(KeyStore::load_complete(&client, &config.keys, &config)
-            .await
-            .is_none());
+        assert!(
+            KeyStore::load_complete(&client, &config.keys, &config)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -681,9 +689,11 @@ mod tests {
         // and a scan that serves nothing at all is not one to replace a set with
         let none = MockLpass::logged_in().with_field("1", "Public Key", b"not a key");
         let one = config("[[keys]]\nid = \"1\"");
-        assert!(KeyStore::load_complete(&none, &one.keys, &one)
-            .await
-            .is_none());
+        assert!(
+            KeyStore::load_complete(&none, &one.keys, &one)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -843,11 +853,13 @@ mod tests {
         KeyStore::load(&client, &config.keys, &config)
             .await
             .unwrap();
-        assert!(client
-            .fetch_log
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(_, field, _)| field == "Public Key"));
+        assert!(
+            client
+                .fetch_log
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, field, _)| field == "Public Key")
+        );
     }
 }

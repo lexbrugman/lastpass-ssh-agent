@@ -12,7 +12,7 @@ use ssh_agent_lib::agent::service_binding::Binding;
 use ssh_agent_lib::client::connect;
 use ssh_agent_lib::proto::extension::SessionBind;
 use ssh_agent_lib::proto::{
-    signature as sigflag, AddIdentity, Extension, PrivateCredential, SignRequest,
+    AddIdentity, Extension, PrivateCredential, SignRequest, signature as sigflag,
 };
 use ssh_key::{PrivateKey, PublicKey};
 
@@ -169,36 +169,42 @@ async fn full_agent_protocol_roundtrip() {
     rsa.key_data().verify(b"integration payload", &sig).unwrap();
 
     // rsa without SHA-2 flags (SHA-1) is refused
-    assert!(client
-        .sign(SignRequest {
-            credential: rsa.key_data().clone().into(),
-            data: b"x".to_vec(),
-            flags: 0,
-        })
-        .await
-        .is_err());
+    assert!(
+        client
+            .sign(SignRequest {
+                credential: rsa.key_data().clone().into(),
+                data: b"x".to_vec(),
+                flags: 0,
+            })
+            .await
+            .is_err()
+    );
 
     // a key the agent does not hold is refused
     let (foreign, _) = new_throwaway_key();
-    assert!(client
-        .sign(SignRequest {
-            credential: foreign.public_key().key_data().clone().into(),
-            data: b"x".to_vec(),
-            flags: 0,
-        })
-        .await
-        .is_err());
+    assert!(
+        client
+            .sign(SignRequest {
+                credential: foreign.public_key().key_data().clone().into(),
+                data: b"x".to_vec(),
+                flags: 0,
+            })
+            .await
+            .is_err()
+    );
 
     // adding identities is refused (this agent is read-only by design)
-    assert!(client
-        .add_identity(AddIdentity {
-            credential: PrivateCredential::Key {
-                privkey: foreign.key_data().clone(),
-                comment: "sneaky".into(),
-            },
-        })
-        .await
-        .is_err());
+    assert!(
+        client
+            .add_identity(AddIdentity {
+                credential: PrivateCredential::Key {
+                    privkey: foreign.key_data().clone(),
+                    comment: "sneaky".into(),
+                },
+            })
+            .await
+            .is_err()
+    );
 
     // ...and the identity list is unchanged afterwards
     assert_eq!(client.request_identities().await.unwrap().len(), 2);

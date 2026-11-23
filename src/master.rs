@@ -422,9 +422,11 @@ mod tests {
         // Handing lpass an empty password would be a wrong one, tried silently.
         let store = FakeStore::holding(Ok(None));
         let prompt = FakePrompt::refusing();
-        assert!(resolve(MasterPassword::TouchId, &store, &prompt, false)
-            .await
-            .is_err());
+        assert!(
+            resolve(MasterPassword::TouchId, &store, &prompt, false)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

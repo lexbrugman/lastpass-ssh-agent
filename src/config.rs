@@ -195,13 +195,13 @@ impl Config {
         let raw = match std::fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::ConfigMissing(path.to_path_buf()))
+                return Err(Error::ConfigMissing(path.to_path_buf()));
             }
             Err(e) => {
                 return Err(Error::ConfigRead {
                     path: path.to_path_buf(),
                     source: e,
-                })
+                });
             }
         };
         refuse_misnamed(&raw)?;
@@ -487,15 +487,19 @@ mod tests {
         assert!(parse("confirm_timeout_secs = 0").is_err());
         // an unbounded value would overflow Instant arithmetic at signing time
         assert!(parse("confirm_timeout_secs = 18446744073709551615").is_err());
-        assert!(parse(&format!(
-            "confirm_timeout_secs = {MAX_CONFIRM_TIMEOUT_SECS}"
-        ))
-        .is_ok());
-        assert!(parse(&format!(
-            "confirm_timeout_secs = {}",
-            MAX_CONFIRM_TIMEOUT_SECS + 1
-        ))
-        .is_err());
+        assert!(
+            parse(&format!(
+                "confirm_timeout_secs = {MAX_CONFIRM_TIMEOUT_SECS}"
+            ))
+            .is_ok()
+        );
+        assert!(
+            parse(&format!(
+                "confirm_timeout_secs = {}",
+                MAX_CONFIRM_TIMEOUT_SECS + 1
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -675,12 +679,14 @@ id = "1"
         assert!(parse("passphrase_fallback = \"prompt\"\n[[keys]]\nid = \"1\"").is_ok());
         // A global value every pinned key overrides is never reached, so it is
         // not grounds for refusing the config.
-        assert!(parse(
-            "passphrase_fallback = \"keychain\"\n\
+        assert!(
+            parse(
+                "passphrase_fallback = \"keychain\"\n\
              [[keys]]\nid = \"1\"\npassphrase_fallback = \"prompt\"\n\
              [[keys]]\nid = \"2\"\npassphrase_fallback = \"error\""
-        )
-        .is_ok());
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -709,12 +715,14 @@ id = "1"
             assert!(error.contains("only supported on Linux"), "{text}: {error}");
         }
         // and a global value every pinned key overrides is never reached
-        assert!(parse(
-            "passphrase_fallback = \"secretservice\"\n\
+        assert!(
+            parse(
+                "passphrase_fallback = \"secretservice\"\n\
              [[keys]]\nid = \"1\"\npassphrase_fallback = \"prompt\"\n\
              [[keys]]\nid = \"2\"\npassphrase_fallback = \"error\""
-        )
-        .is_ok());
+            )
+            .is_ok()
+        );
     }
 
     #[test]

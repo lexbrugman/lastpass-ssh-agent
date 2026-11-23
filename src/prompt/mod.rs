@@ -151,9 +151,11 @@ mod tests {
         assert!(build("confirm = \"off\"").unwrap().is_none());
         assert!(build("confirm = \"osascript\"").unwrap().is_some());
         assert!(build("confirm = \"tty\"").unwrap().is_some());
-        assert!(build("confirm = \"askpass\"\naskpass = \"/bin/true\"")
-            .unwrap()
-            .is_some());
+        assert!(
+            build("confirm = \"askpass\"\naskpass = \"/bin/true\"")
+                .unwrap()
+                .is_some()
+        );
         // config load-time validation normally rejects this; the defensive
         // branch must fail rather than default to anything
         assert!(build("confirm = \"askpass\"").is_err());
