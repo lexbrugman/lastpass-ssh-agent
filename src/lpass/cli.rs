@@ -194,10 +194,10 @@ impl LpassCli {
         let mut out = self
             .exec(args, held.as_ref().map(|held| &held[..]), max_bytes)
             .await?;
-        if out.locked() {
-            if let Some(password) = self.source.asked(access).await? {
-                out = self.exec(args, Some(&password), max_bytes).await?;
-            }
+        if out.locked()
+            && let Some(password) = self.source.asked(access).await?
+        {
+            out = self.exec(args, Some(&password), max_bytes).await?;
         }
         if out.stderr.contains("Incorrect master password") {
             self.source.rejected().await;

@@ -89,10 +89,8 @@ pub async fn run(config_path: &Path, test_confirm: bool) -> Result<()> {
         ));
     }
 
-    if test_confirm {
-        if let Some(config) = &config {
-            report(check_confirmation(config).await?);
-        }
+    if test_confirm && let Some(config) = &config {
+        report(check_confirmation(config).await?);
     }
 
     ok.ok_or(Error::DoctorFailed)

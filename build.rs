@@ -190,12 +190,11 @@ fn stamp_input_files() -> Vec<String> {
     // On a branch checkout HEAD only holds `ref: refs/heads/<branch>` and
     // never changes as you commit, so the branch's own ref file has to be
     // watched too. It is a shared ref, hence the common directory.
-    if let Ok(head) = std::fs::read_to_string(format!("{git_dir}/HEAD")) {
-        if let Some(reference) = head.trim().strip_prefix("ref: ") {
-            if let Some(common) = git_common_dir() {
-                files.push(format!("{common}/{reference}"));
-            }
-        }
+    if let Ok(head) = std::fs::read_to_string(format!("{git_dir}/HEAD"))
+        && let Some(reference) = head.trim().strip_prefix("ref: ")
+        && let Some(common) = git_common_dir()
+    {
+        files.push(format!("{common}/{reference}"));
     }
     files
 }

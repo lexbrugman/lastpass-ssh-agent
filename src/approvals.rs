@@ -122,7 +122,7 @@ impl Approvals {
                 }
             }
             Answer::Given { question, epoch } => {
-                if let (Some(question), true) = (question, signed) {
+                if signed && let Some(question) = question {
                     self.remember_in(question, if asked { epoch + 1 } else { epoch });
                 }
                 Ok(())

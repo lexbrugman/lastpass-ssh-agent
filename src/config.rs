@@ -231,13 +231,13 @@ impl Config {
         if ids.len() != self.keys.len() {
             return Err(Error::ConfigInvalid("duplicate key ids in [[keys]]".into()));
         }
-        if let Some(socket) = &self.socket {
-            if !socket.is_absolute() {
-                return Err(Error::ConfigInvalid(format!(
-                    "socket path {} must be absolute — SSH clients resolve SSH_AUTH_SOCK from their own working directory",
-                    socket.display()
-                )));
-            }
+        if let Some(socket) = &self.socket
+            && !socket.is_absolute()
+        {
+            return Err(Error::ConfigInvalid(format!(
+                "socket path {} must be absolute — SSH clients resolve SSH_AUTH_SOCK from their own working directory",
+                socket.display()
+            )));
         }
         // Resolved from a working directory nothing chooses on purpose — a
         // service's is `/` — and `doctor` and `start` could resolve them from
