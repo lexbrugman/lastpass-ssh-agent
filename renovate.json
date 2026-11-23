@@ -56,7 +56,7 @@
       "enabled": false
     },
     {
-      "description": "secret-service is built on zbus and requires one major of it, and logind.rs declares zbus directly, so a major of either alone puts two copies of zbus in one binary, each opening a bus connection of its own (see Cargo.toml). Unlike the pairs above, nothing is blocked on an upstream, so they are grouped rather than disabled: a major of both arrives as one pull request. Minors and patches stay in the non-major group.",
+      "description": "secret-service and the zbus logind.rs declares must share a major; Cargo.toml says why. Unlike the pairs above, nothing upstream blocks them, so they are grouped rather than disabled: a major of both arrives as one pull request. Minors and patches stay in the non-major group.",
       "matchManagers": [
         "cargo"
       ],
