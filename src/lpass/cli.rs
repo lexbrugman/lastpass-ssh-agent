@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -82,6 +83,14 @@ pub struct LpassCli {
     binary: PathBuf,
     timeout: Duration,
     source: MasterPasswordSource,
+    /// The environment `command` filters. A test supplies its own rather than
+    /// setting variables on this process, which its other tests read from other
+    /// threads at the same time.
+    environment: fn() -> Vec<(OsString, OsString)>,
+}
+
+fn inherited_environment() -> Vec<(OsString, OsString)> {
+    std::env::vars_os().collect()
 }
 
 impl LpassCli {
@@ -90,6 +99,7 @@ impl LpassCli {
             binary,
             timeout: DEFAULT_TIMEOUT,
             source: MasterPasswordSource::None,
+            environment: inherited_environment,
         }
     }
 
@@ -105,7 +115,15 @@ impl LpassCli {
             binary,
             timeout,
             source: MasterPasswordSource::None,
+            environment: inherited_environment,
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn inheriting(mut self, environment: fn() -> Vec<(OsString, OsString)>) -> Self {
+        self.environment = environment;
+        self
     }
 
     fn command(&self, args: &[&str], fed: bool) -> tokio::process::Command {
@@ -119,7 +137,7 @@ impl LpassCli {
         // Allowlist, not blocklist: lpass needs HOME/XDG_* to find its
         // session and LPASS_* for user tuning; nothing else from our
         // environment should leak into it.
-        for (key, value) in std::env::vars_os() {
+        for (key, value) in (self.environment)() {
             let name = key.to_string_lossy();
             // Withheld rather than forwarded, unlike every other `LPASS_`: lpass
             // consults it before `LPASS_DISABLE_PINENTRY` can rule a prompt out,
@@ -436,6 +454,13 @@ mod tests {
     /// Write a fake `lpass` shell script whose behavior is baked in.
     fn fake_lpass(dir: &Path, body: &str) -> PathBuf {
         crate::testutil::write_script(dir, "lpass", body)
+    }
+
+    /// An environment for `LpassCli::inheriting`.
+    fn environment(vars: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        vars.iter()
+            .map(|&(key, value)| (key.into(), value.into()))
+            .collect()
     }
 
     /// What real lpass says when it has no key and nothing answers its prompt.
@@ -892,15 +917,11 @@ done"#,
             dir.path(),
             r#"printf '%s|%s' "$SUPER_SECRET_TOKEN" "$HOME""#,
         );
-        // Env vars are process-global; the name is unique to this test so
-        // parallel tests cannot collide.
-        std::env::set_var("SUPER_SECRET_TOKEN", "leaked");
-        let client = LpassCli::new(bin);
+        let client = LpassCli::new(bin).inheriting(|| {
+            environment(&[("SUPER_SECRET_TOKEN", "leaked"), ("HOME", "/home/someone")])
+        });
         let value = client.show_field("42", "x", Access::Asking).await.unwrap();
-        let text = String::from_utf8_lossy(&value);
-        let (secret, home) = text.split_once('|').unwrap();
-        assert_eq!(secret, "", "parent env must not leak into lpass");
-        assert!(!home.is_empty(), "HOME must be passed through");
+        assert_eq!(&*value, b"|/home/someone");
     }
 
     #[tokio::test]
@@ -908,32 +929,29 @@ done"#,
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_lpass(
             dir.path(),
-            r#"printf '%s|%s|%s' "$LPASS_COVERAGE_PROBE" "$XDG_COVERAGE_PROBE" "$TMPDIR""#,
+            r#"printf '%s|%s|%s' "$LPASS_PROBE" "$XDG_PROBE" "$TMPDIR""#,
         );
-        // unique names: env is process-global across parallel tests
-        std::env::set_var("LPASS_COVERAGE_PROBE", "lp-ok");
-        std::env::set_var("XDG_COVERAGE_PROBE", "xdg-ok");
         let value = LpassCli::new(bin)
+            .inheriting(|| {
+                environment(&[
+                    ("LPASS_PROBE", "lp-ok"),
+                    ("XDG_PROBE", "xdg-ok"),
+                    ("TMPDIR", "/tmp/somewhere"),
+                ])
+            })
             .show_field("42", "x", Access::Asking)
             .await
             .unwrap();
-        let text = String::from_utf8_lossy(&value).to_string();
-        let mut parts = text.split('|');
-        assert_eq!(parts.next(), Some("lp-ok"));
-        assert_eq!(parts.next(), Some("xdg-ok"));
-        // TMPDIR is set on macOS test hosts; empty is fine elsewhere
+        assert_eq!(&*value, b"lp-ok|xdg-ok|/tmp/somewhere");
     }
 
     #[tokio::test]
     async fn an_inherited_password_helper_is_withheld() {
-        // Exported into this process first: with nothing set, the assertion
-        // holds on any machine and proves nothing. Safe to leave behind only
-        // because of the rule under test — no lpass call sees this variable.
-        std::env::set_var("LPASS_ASKPASS", "/nonexistent/inherited-askpass");
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_lpass(dir.path(), r#"printf '[%s]' "$LPASS_ASKPASS""#);
         assert_eq!(
             &*LpassCli::new(bin)
+                .inheriting(|| environment(&[("LPASS_ASKPASS", "/nonexistent/inherited-askpass")]))
                 .show_field("42", "x", Access::Asking)
                 .await
                 .unwrap(),
@@ -949,17 +967,18 @@ done"#,
             r#"printf '[%s]|%s' "$LPASS_AGENT_DISABLE" "$LPASS_DISABLE_PINENTRY""#,
         );
         // unfed: free to read an agent a shell left running, and with no key
-        // of its own to keep — whatever the environment inherited says. Safe
-        // to leave set: this is the rule under test.
-        std::env::set_var("LPASS_AGENT_DISABLE", "1");
+        // of its own to keep — whatever the environment inherited says.
+        let inherited = || environment(&[("LPASS_AGENT_DISABLE", "1")]);
         let value = LpassCli::new(bin.clone())
+            .inheriting(inherited)
             .show_field("42", "x", Access::Asking)
             .await
             .unwrap();
         assert_eq!(&*value, b"[]|1");
         // fed: the key it derives must not outlive the call
-        let fed =
-            LpassCli::new(bin).feeding(MasterPasswordSource::Fixed(Zeroizing::new(b"pw".to_vec())));
+        let fed = LpassCli::new(bin)
+            .inheriting(inherited)
+            .feeding(MasterPasswordSource::Fixed(Zeroizing::new(b"pw".to_vec())));
         assert_eq!(
             &*fed.show_field("42", "x", Access::Asking).await.unwrap(),
             b"[1]|1"
