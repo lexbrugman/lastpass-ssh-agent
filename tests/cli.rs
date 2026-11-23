@@ -177,9 +177,39 @@ fn list_on_a_fresh_install_creates_the_socket_directory_and_writes_the_file() {
 }
 
 #[test]
-fn list_writes_nothing_down_from_a_scan_with_a_skipped_item() {
-    // Item 2 is pinned but the vault has no such item. The listing still shows
-    // item 1; the file a start would trust is left alone.
+fn list_writes_nothing_down_from_a_scan_the_vault_did_not_answer_in_full() {
+    // Item 2 is pinned and the vault fails on it, without saying it is gone.
+    // The listing still shows item 1; the file a start would trust is left
+    // alone, since the key may well be there.
+    let keep = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    std::fs::write(keep.path().join("pub"), ED25519_PUB).unwrap();
+    let body = format!(
+        r#"case "$1" in
+  status) echo "Logged in as test@example.com.";;
+  show)
+    case "$3" in
+      1) cat "{}/pub";;
+      *) echo 'Error: something went wrong.' >&2; exit 1;;
+    esac;;
+esac"#,
+        keep.path().display()
+    );
+    let s = setup(&body, "[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"\n");
+    let output = run(&s, &["list"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("[id: 1]"));
+    assert!(
+        stderr(&output).contains("not writing the remembered identities down"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!s.dir.path().join("agent.sock.identities").exists());
+}
+
+#[test]
+fn list_writes_down_a_scan_the_vault_answered_even_when_an_item_is_gone() {
+    // Item 2 is pinned but the vault has no such item: that is an answer, and
+    // the file records the set without it.
     let keep = Box::leak(Box::new(tempfile::tempdir().unwrap()));
     std::fs::write(keep.path().join("pub"), ED25519_PUB).unwrap();
     let body = format!(
@@ -196,13 +226,9 @@ esac"#,
     let s = setup(&body, "[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"\n");
     let output = run(&s, &["list"]);
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("[id: 1]"));
-    assert!(
-        stderr(&output).contains("not writing the remembered identities down"),
-        "{}",
-        stderr(&output)
-    );
-    assert!(!s.dir.path().join("agent.sock.identities").exists());
+    let written = std::fs::read_to_string(s.dir.path().join("agent.sock.identities")).unwrap();
+    assert!(written.contains("id = \"1\""), "{written}");
+    assert!(!written.contains("id = \"2\""), "{written}");
 }
 
 #[test]

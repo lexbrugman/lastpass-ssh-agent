@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::config::{self, Config};
 use crate::error::{Error, Result};
-use crate::lpass::{self, LpassClient};
+use crate::lpass::{self, Access, LpassClient};
 use crate::{master, passphrase};
 
 /// Keep the master password in the platform's store, once it has been shown to
@@ -78,7 +78,7 @@ async fn seed(config: &Config, socket_path: &Path) -> Result<()> {
     // Seen to be locked, not assumed: an agent process titled some other way
     // survives the end above, and a vault still open would accept any
     // candidate without reading it.
-    match super::client_from(config)?.ls().await {
+    match super::client_from(config)?.ls(Access::Asking).await {
         Err(lpass::LpassError::Locked) => {}
         Ok(_) => {
             return Err(Error::State(
@@ -113,7 +113,11 @@ impl master::VaultUnlock for VaultOpens {
     /// a vault.
     #[cfg_attr(coverage_nightly, coverage(off))]
     async fn attempt(&self) -> std::result::Result<(), String> {
-        self.0.ls().await.map(|_| ()).map_err(|e| e.to_string())
+        self.0
+            .ls(Access::Asking)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 

@@ -57,12 +57,6 @@ fn deny_debuggers() -> libc::c_int {
     unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) }
 }
 
-/// Nothing to do here, which is success.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const fn deny_debuggers() -> libc::c_int {
-    0
-}
-
 /// Keep `len` bytes at `ptr` in RAM and out of any dump: never paged to swap,
 /// never written by a crash. Page-granular, so whatever else shares those
 /// pages comes along, which costs nothing.
@@ -130,7 +124,7 @@ pub fn default_socket_dir() -> Option<PathBuf> {
 /// runtime dir, so the socket lives under the home directory there.
 #[cfg_attr(
     target_os = "macos",
-    expect(clippy::missing_const_for_fn, reason = "not const on other platforms")
+    expect(clippy::missing_const_for_fn, reason = "not const on Linux")
 )]
 fn runtime_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
@@ -180,13 +174,6 @@ impl crate::vaultlock::ScreenLock for SessionScreen {
         #[cfg(target_os = "linux")]
         {
             crate::logind::locked_hint().await
-        }
-        // No way to ask here, so nothing watches. Config validation refuses
-        // `lock_on_screen_lock` on these platforms, so a running agent never
-        // reaches this.
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            None
         }
     }
 }

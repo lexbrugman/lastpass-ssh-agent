@@ -113,7 +113,7 @@ pub fn save_best_effort(path: &Path, remembered: &Remembered) {
 /// Writing beside a socket that is bound cannot fail in practice, so the edge
 /// is excluded from coverage rather than pretended testable.
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "by value is what unwrap_or_else hands a function"
 )]
@@ -124,7 +124,7 @@ fn could_not_save(e: Error) {
 /// Serialising three strings per key cannot fail for a value this code built,
 /// so the edge is excluded from coverage rather than pretended testable.
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "by value is what map_err hands a function"
 )]

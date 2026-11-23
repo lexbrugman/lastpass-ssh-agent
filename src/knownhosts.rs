@@ -94,10 +94,6 @@ impl HostNames {
 /// Excluded from coverage: provoking it needs a filesystem that stops
 /// answering mid-read, which no test can arrange without being flaky.
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "by value is what map_or_else hands a function"
-)]
 fn deadline_expired(_: tokio::time::error::Elapsed) -> Vec<Option<String>> {
     tracing::debug!("gave up reading known_hosts; showing fingerprints");
     Vec::new()
@@ -109,7 +105,7 @@ fn deadline_expired(_: tokio::time::error::Elapsed) -> Vec<Option<String>> {
 /// Excluded from coverage, and a named function rather than a closure so that
 /// costs a region and not a line: reaching it means `index_files` panicked.
 #[cfg_attr(coverage_nightly, coverage(off))]
-#[allow(
+#[expect(
     clippy::needless_pass_by_value,
     reason = "by value is what unwrap_or_else hands a function; a reference \
               would need a closure, and that closure body is the uncovered \

@@ -81,10 +81,7 @@ const fn locking_now(previous: bool, current: bool) -> bool {
 /// reading has succeeded the platform has proved it can answer, so a later `None`
 /// is a failure rather than an absence and is retried — see `MAX_UNREADABLE_IN_A_ROW`.
 /// `enabled` is the config setting rather than a caller-side `if`, so that the
-/// decision lives here with the rest of the logic. A branch in the startup path
-/// could only ever go one way on a platform that refuses the setting at load,
-/// and a branch no test can take both sides of is exactly what `#[cfg]` exists
-/// to avoid — but this is not platform-specific, it is opt-in.
+/// decision lives here with the rest of the logic.
 ///
 /// Both arguments are trait objects rather than generics: this runs once for the
 /// life of the process, so there is nothing to gain from monomorphising it, and

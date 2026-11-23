@@ -1,12 +1,7 @@
-mod askpass;
-mod osascript;
-mod tty;
-
-pub use askpass::AskpassConfirmer;
-pub use osascript::OsascriptConfirmer;
-pub use tty::TtyConfirmer;
+use std::sync::Arc;
 
 use crate::keystore::KeyEntry;
+use crate::prompt::{Failure, Transport};
 use crate::requester::Requester;
 use crate::text::{display_bounded, escape_for_display};
 
@@ -93,24 +88,56 @@ pub trait Confirmer: Send + Sync {
     async fn confirm(&self, ctx: &ConfirmContext) -> Decision;
 }
 
-/// Build the confirmer selected by the config.
-pub fn from_config(
-    config: &crate::config::Config,
-) -> crate::error::Result<std::sync::Arc<dyn Confirmer>> {
-    use crate::config::ConfirmMode;
-    use std::time::Duration;
-    let timeout = Duration::from_secs(config.confirm_timeout_secs);
-    Ok(match config.confirm {
-        ConfirmMode::Off => std::sync::Arc::new(NoConfirmer),
-        ConfirmMode::Osascript => std::sync::Arc::new(OsascriptConfirmer::new(timeout)),
-        ConfirmMode::Tty => std::sync::Arc::new(TtyConfirmer::new(timeout)),
-        ConfirmMode::Askpass => {
-            // validated at config load
-            let program = config.askpass.clone().ok_or_else(|| {
-                crate::error::Error::ConfigInvalid("askpass mode without helper".into())
-            })?;
-            std::sync::Arc::new(AskpassConfirmer::new(program, timeout))
+/// Confirmation over whichever transport reaches the user.
+///
+/// Fails closed: every way of not getting a yes is a deny. Each is logged as
+/// what it was, because a refusal and a prompt that never appeared look
+/// identical from outside — both simply stop the signature — and this is the
+/// last place that can still tell them apart.
+pub struct TransportConfirmer {
+    transport: Arc<dyn Transport>,
+}
+
+impl TransportConfirmer {
+    pub fn new(transport: Arc<dyn Transport>) -> Self {
+        Self { transport }
+    }
+}
+
+#[async_trait::async_trait]
+impl Confirmer for TransportConfirmer {
+    async fn confirm(&self, ctx: &ConfirmContext) -> Decision {
+        match self.transport.ask_to_confirm(&describe_request(ctx)).await {
+            Ok(true) => Decision::Approve,
+            Ok(false) => {
+                tracing::info!("confirmation declined, denying");
+                Decision::Deny
+            }
+            Err(Failure::TimedOut) => {
+                tracing::info!("confirmation timed out, denying");
+                Decision::Deny
+            }
+            Err(Failure::TooLong(max)) => {
+                tracing::info!(max, "the answer ran past what one can be, denying");
+                Decision::Deny
+            }
+            // Not a refusal: nobody was asked.
+            Err(Failure::Unavailable(why)) => {
+                tracing::warn!(
+                    "the confirmation prompt could not be shown, so the signature is denied — \
+                     nobody refused it: {why}"
+                );
+                Decision::Deny
+            }
         }
+    }
+}
+
+/// Build the confirmer selected by the config.
+pub fn from_config(config: &crate::config::Config) -> crate::error::Result<Arc<dyn Confirmer>> {
+    Ok(match crate::prompt::from_config(config)? {
+        None => Arc::new(NoConfirmer),
+        Some(transport) => Arc::new(TransportConfirmer::new(transport)),
     })
 }
 
@@ -301,6 +328,70 @@ mod tests {
         assert_eq!(ctx.key_name, "ctx key");
         assert_eq!(ctx.item_id, "42");
         assert!(ctx.fingerprint.starts_with("SHA256:"));
+    }
+
+    /// A transport that answers as told, and keeps what it was asked.
+    struct FakeTransport {
+        verdict: Result<bool, Failure>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for FakeTransport {
+        async fn ask_to_confirm(&self, message: &str) -> Result<bool, Failure> {
+            self.asked.lock().unwrap().push(message.to_string());
+            self.verdict.clone()
+        }
+        async fn ask_for_secret(
+            &self,
+            _message: &str,
+        ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, Failure> {
+            unreachable!("a confirmer never asks for a secret")
+        }
+    }
+
+    /// Shared body: what each thing a transport can come back with decides.
+    async fn expect_decision(verdict: Result<bool, Failure>, expected: Decision) {
+        let transport = Arc::new(FakeTransport {
+            verdict: verdict.clone(),
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let confirmer = TransportConfirmer::new(transport.clone());
+        let ctx = ConfirmContext::new(&entry(), None, Vec::new());
+        assert_eq!(confirmer.confirm(&ctx).await, expected, "{verdict:?}");
+        // the question put is the request's description
+        let asked = transport.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0], describe_request(&ctx));
+    }
+
+    #[tokio::test]
+    async fn a_yes_approves() {
+        expect_decision(Ok(true), Decision::Approve).await;
+    }
+
+    #[tokio::test]
+    async fn a_no_denies() {
+        expect_decision(Ok(false), Decision::Deny).await;
+    }
+
+    #[tokio::test]
+    async fn a_timeout_denies() {
+        expect_decision(Err(Failure::TimedOut), Decision::Deny).await;
+    }
+
+    #[tokio::test]
+    async fn an_overlong_answer_denies() {
+        expect_decision(Err(Failure::TooLong(64)), Decision::Deny).await;
+    }
+
+    #[tokio::test]
+    async fn a_prompt_that_could_not_be_shown_denies() {
+        expect_decision(
+            Err(Failure::Unavailable("no screen".into())),
+            Decision::Deny,
+        )
+        .await;
     }
 
     #[test]

@@ -805,13 +805,12 @@ an advisory nobody has looked at. Accepted advisories live in
 `.cargo/audit.toml`, each with the reasoning for accepting it; anything not
 listed there fails.
 
-One is accepted today: **RUSTSEC-2023-0071**, a timing sidechannel in `rsa`
-that has no patched release in any version line. Every RSA signature uses
-fresh OS randomness to enable the crate's RSA blinding mitigation, and by
-default only runs after you approve the request. Blinding is not the same as
-a constant-time implementation, so the advisory remains explicitly accepted;
-the residual risk matters most with `confirm = "off"` on a forwarded RSA
-key. Ed25519 and ECDSA keys do not involve that crate at all.
+One of them is **RUSTSEC-2023-0071**, a timing sidechannel in the private-key
+operation of `rsa` before 0.10. Signatures are made with `rsa` 0.10, which
+fixes it. The older release is still in the dependency tree, because `ssh-key`
+builds on it, and is reached only to verify an RSA host key's signature — a
+public-key operation with no secret for timing to reveal — so the advisory is
+accepted for as long as that dependency carries it.
 
 ## Development
 

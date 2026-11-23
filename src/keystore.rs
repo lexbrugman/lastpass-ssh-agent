@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use ssh_key::public::KeyData;
@@ -6,7 +7,7 @@ use ssh_key::PublicKey;
 use crate::config::{Config, KeyConfig, PassphraseFallback};
 use crate::error::{Error, Result};
 use crate::identities::{Remembered, RememberedKey};
-use crate::lpass::{LpassClient, LpassError};
+use crate::lpass::{Access, LpassClient, LpassError};
 
 /// Why a configured/discovered item cannot be served. Shared by startup and
 /// `doctor` so the diagnostic command cannot drift from the real policy.
@@ -74,6 +75,11 @@ impl KeyEntry {
 #[derive(Debug)]
 pub struct KeyStore {
     entries: Vec<KeyEntry>,
+    /// Whether the vault answered for every item it was asked about. Its
+    /// verdicts — nothing there, nothing this agent can serve — are answers;
+    /// an item it could not be asked about is not, and a set missing one is
+    /// served but never written down, see `remember_if_complete`.
+    complete: bool,
 }
 
 /// Fetch and validate every public key, including cross-item duplicate
@@ -83,13 +89,14 @@ pub async fn inspect_keys(
     client: &dyn LpassClient,
     keys: &[KeyConfig],
     config: &Config,
+    access: Access,
 ) -> Vec<KeyInspection> {
     let mut inspected = Vec::with_capacity(keys.len());
     let mut seen: Vec<(KeyData, String)> = Vec::new();
 
     for key in keys {
         let name = crate::text::escape_for_display(key.display_name());
-        let public = match client.show_field(&key.id, "Public Key").await {
+        let public = match client.show_field(&key.id, "Public Key", access).await {
             Ok(raw) => accept(&raw),
             Err(e) => Err(e.into()),
         }
@@ -119,12 +126,13 @@ pub async fn inspect_keys(
 pub async fn effective_keys(
     client: &Arc<dyn LpassClient>,
     config: &Config,
+    access: Access,
 ) -> Result<Vec<KeyConfig>> {
     if !config.keys.is_empty() {
         return Ok(config.keys.clone());
     }
     tracing::info!("no [[keys]] configured — discovering SSH Key items in the vault");
-    let found = crate::lpass::discover_ssh_key_items(client.clone(), None).await?;
+    let found = crate::lpass::discover_ssh_key_items(client.clone(), None, access).await?;
     if found.is_empty() {
         return Err(Error::ConfigInvalid(
             "no SSH Key items found in the vault (create one in LastPass, or pin items with [[keys]] in the config)"
@@ -210,8 +218,10 @@ fn unique(
 
 /// Whether an issue is the vault's verdict on a key — there is nothing there, or
 /// nothing this agent can serve — as opposed to the vault being unavailable to
-/// ask. Startup skips both; a refresh may skip only a verdict, since a set that
-/// lost a key because the vault was shut halfway is a loss, not an update.
+/// ask. A verdict is skipped wherever it turns up; an item left unanswered
+/// makes the set incomplete, which a start serves anyway (better some keys
+/// than none), a refresh refuses to replace a whole set with, and neither
+/// writes down.
 ///
 /// Listed positively so that a failure this does not know is treated as the
 /// vault being unavailable, which is the side to err on.
@@ -223,6 +233,66 @@ const fn is_verdict(issue: &KeyIssue) -> bool {
             | KeyIssue::Unsupported(_)
             | KeyIssue::Fetch(LpassError::ItemNotFound(_) | LpassError::FieldNotFound { .. })
     )
+}
+
+/// The usable entries of a scan, and whether the vault answered for every
+/// item. Two outcomes end the scan instead: two items with the same public key,
+/// which would make signing ambiguous, and a vault found shut partway — not a
+/// fact about one item, and carrying on past it would serve a set quietly
+/// missing a key that a later fetch, reopening the vault, would have had.
+fn gather(inspections: Vec<KeyInspection>) -> Result<(Vec<KeyEntry>, bool)> {
+    let mut entries = Vec::new();
+    let mut complete = true;
+    for inspection in inspections {
+        match inspection {
+            KeyInspection::Usable(entry) => entries.push(entry),
+            KeyInspection::Unusable {
+                item_id,
+                name,
+                issue: issue @ KeyIssue::Duplicate { .. },
+            } => {
+                return Err(Error::ConfigInvalid(format!(
+                    "item {item_id} ({name}): {issue}"
+                )));
+            }
+            KeyInspection::Unusable {
+                issue:
+                    KeyIssue::Fetch(
+                        shut @ (crate::lpass::LpassError::NotLoggedIn
+                        | crate::lpass::LpassError::Locked
+                        | crate::lpass::LpassError::WrongMasterPassword
+                        | crate::lpass::LpassError::NoMasterPassword(_)),
+                    ),
+                ..
+            } => return Err(shut.into()),
+            KeyInspection::Unusable {
+                item_id,
+                name,
+                issue,
+            } => {
+                if !is_verdict(&issue) {
+                    complete = false;
+                }
+                tracing::warn!(item = %item_id, name = %name, "skipping: {issue}");
+            }
+        }
+    }
+    Ok((entries, complete))
+}
+
+/// Write a set down for the next start — but only one the vault answered in
+/// full. A set missing a key the vault could not be asked about would be
+/// trusted until something refreshed it; one missing a key the vault has no
+/// answer for is missing nothing.
+pub fn remember_if_complete(path: &Path, store: &KeyStore) {
+    if store.complete {
+        crate::identities::save_best_effort(path, &store.remember());
+    } else {
+        tracing::warn!(
+            "not writing the remembered identities down: a set missing a key the vault \
+             did not answer for must not be what the next start trusts"
+        );
+    }
 }
 
 /// What a remembered file yields for one config: the store it can serve at
@@ -287,7 +357,11 @@ impl KeyStore {
             }
         }
         FromRemembered {
-            store: Self { entries },
+            // Nothing was asked, so nothing went unanswered.
+            store: Self {
+                entries,
+                complete: true,
+            },
             missing,
         }
     }
@@ -309,96 +383,58 @@ impl KeyStore {
     }
 
     /// Fetch the public half of every key (explicitly configured or
-    /// auto-discovered). Items that fail to load are skipped with a warning;
-    /// an empty result is an error. Two items with the same public key would
-    /// make signing ambiguous — hard error.
+    /// auto-discovered), asking for the master password if the vault is
+    /// locked: this is a start or a listing, and the first call that needs the
+    /// vault is the one to ask. Items that fail to load are skipped with a
+    /// warning — better some keys than none — and an empty result is an error.
+    /// Whether the vault answered for every item is kept, since a set it did
+    /// not is served but not written down.
     pub async fn load(
         client: &dyn LpassClient,
         keys: &[KeyConfig],
         config: &Config,
     ) -> Result<Self> {
-        let mut entries: Vec<KeyEntry> = Vec::new();
-        for inspection in inspect_keys(client, keys, config).await {
-            match inspection {
-                KeyInspection::Usable(entry) => entries.push(entry),
-                KeyInspection::Unusable {
-                    item_id,
-                    name,
-                    issue: issue @ KeyIssue::Duplicate { .. },
-                } => {
-                    return Err(Error::ConfigInvalid(format!(
-                        "item {item_id} ({name}): {issue}"
-                    )));
-                }
-                // A shut vault is not a fact about one item. Skipping it would
-                // drop that key and carry on — and if a later key's fetch
-                // reopened the vault (a master-password prompt answered on the
-                // second attempt, say), the agent would come up serving an
-                // identity set quietly missing the first. Discovery refuses the
-                // same thing for the same reason.
-                KeyInspection::Unusable {
-                    issue:
-                        KeyIssue::Fetch(
-                            shut @ (crate::lpass::LpassError::NotLoggedIn
-                            | crate::lpass::LpassError::Locked
-                            | crate::lpass::LpassError::WrongMasterPassword
-                            | crate::lpass::LpassError::NoMasterPassword(_)),
-                        ),
-                    ..
-                } => return Err(shut.into()),
-                KeyInspection::Unusable {
-                    item_id,
-                    name,
-                    issue,
-                } => {
-                    tracing::warn!(item = %item_id, name = %name, "skipping: {issue}");
-                }
-            }
-        }
-
+        let (entries, complete) = gather(inspect_keys(client, keys, config, Access::Asking).await)?;
         if entries.is_empty() {
             return Err(Error::ConfigInvalid(
                 "no usable keys: every configured item failed to load (see warnings above)".into(),
             ));
         }
-        Ok(Self { entries })
+        Ok(Self { entries, complete })
     }
 
     /// As `load`, for a refresh that will replace a set already being served.
     ///
-    /// Stricter on one point: nothing the vault *could not answer* is skipped.
-    /// `load` drops an item the vault would not serve and carries on, which is
-    /// right for a start — better some keys than none. A refresh replacing a
-    /// complete set with one missing a key because the vault shut halfway would
-    /// be a loss dressed as an update, so any such item makes the whole scan
-    /// `None`, and the caller keeps what it has. The vault's own verdicts on a
-    /// key — empty, malformed, a type this agent cannot sign with — are still
-    /// skipped, as they are at startup.
+    /// A scan, so it never asks for the master password and does not count as
+    /// using it: with the vault shut it fails fast and nothing changes. And
+    /// stricter on one point: only a set the vault answered in full replaces
+    /// one. A refresh replacing a complete set with one missing a key because
+    /// the vault shut halfway would be a loss dressed as an update, so any
+    /// such scan is `None`, and the caller keeps what it has.
     pub async fn load_complete(
         client: &dyn LpassClient,
         keys: &[KeyConfig],
         config: &Config,
     ) -> Option<Self> {
-        let mut entries = Vec::new();
-        for inspection in inspect_keys(client, keys, config).await {
-            match inspection {
-                KeyInspection::Usable(entry) => entries.push(entry),
-                KeyInspection::Unusable { item_id, issue, .. } if !is_verdict(&issue) => {
-                    tracing::debug!(item = %item_id,
-                        "keeping the served set as it is, this scan cannot replace it: {issue}");
+        let (entries, complete) =
+            match gather(inspect_keys(client, keys, config, Access::Scanning).await) {
+                Ok(gathered) => gathered,
+                Err(e) => {
+                    tracing::debug!(
+                        "keeping the served set as it is, this scan cannot replace it: {e}"
+                    );
                     return None;
                 }
-                KeyInspection::Unusable {
-                    item_id,
-                    name,
-                    issue,
-                } => {
-                    tracing::warn!(item = %item_id, name = %name, "skipping: {issue}");
-                }
-            }
+            };
+        if !complete {
+            tracing::debug!(
+                "keeping the served set as it is: an item went unanswered, so this scan cannot \
+                 replace it"
+            );
+            return None;
         }
         // A scan that found nothing to serve is not one to replace a set with.
-        (!entries.is_empty()).then_some(Self { entries })
+        (!entries.is_empty()).then_some(Self { entries, complete })
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &KeyEntry> {
@@ -473,6 +509,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.len(), 1);
+        assert!(!store.complete, "the vault never answered for item 2");
     }
 
     #[tokio::test]
@@ -485,6 +522,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.len(), 1);
+        assert!(store.complete, "an empty field is the vault's answer");
     }
 
     #[tokio::test]
@@ -563,6 +601,7 @@ mod tests {
         };
         let served = Served::new(KeyStore {
             entries: vec![entry("1", &ed)],
+            complete: true,
         });
         let snapshot = served.current();
         assert_eq!(snapshot.len(), 1);
@@ -570,6 +609,7 @@ mod tests {
         let rsa = PublicKey::from_openssh(RSA_PUB.trim()).unwrap();
         served.replace(KeyStore {
             entries: vec![entry("1", &ed), entry("2", &rsa)],
+            complete: true,
         });
         assert_eq!(
             served.current().len(),
@@ -808,6 +848,6 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .all(|(_, field)| field == "Public Key"));
+            .all(|(_, field, _)| field == "Public Key"));
     }
 }

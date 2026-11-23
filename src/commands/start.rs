@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::lpass::{self, LpassClient};
+use crate::lpass::{self, Access, LpassClient};
 use crate::{
     agent, approvals, confirm, identities, keystore, knownhosts, passphrase, platform, refresh,
     socket, unlock, vaultlock,
@@ -41,16 +41,11 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let config = Arc::new(Config::load_or_default(config_path)?);
     let socket_path = config.socket_path()?;
     let unlock = super::unlock_from(&config, &socket_path)?;
-    // Two views of one vault: `asking` reaches for the master password when
-    // the vault is locked, `quiet` is fed only what is already held and so
-    // can never put a prompt on screen. The agent fetches through `quiet`
-    // without taking the interaction gate, and reaches for `asking` only
-    // under it.
-    let asking: Arc<dyn LpassClient> = Arc::new(
+    // One vault, fed what the agent holds. Each call says what it is for —
+    // `Access` — and that is what decides whether it may ask for the master
+    // password, and whether it counts as using it.
+    let vault: Arc<dyn LpassClient> = Arc::new(
         super::client_from(&config)?.feeding(lpass::MasterPasswordSource::Unlock(unlock.clone())),
-    );
-    let quiet: Arc<dyn LpassClient> = Arc::new(
-        super::client_from(&config)?.feeding(lpass::MasterPasswordSource::HeldOnly(unlock.clone())),
     );
 
     // From what the last start wrote down, so binding costs no vault call;
@@ -62,18 +57,17 @@ pub async fn run(config_path: &Path) -> Result<()> {
     // needs it, which is the scan's — so a start the file spares never asks,
     // and one that cannot ask says what to do instead of failing bare.
     let remembered_at = identities::path_for(&socket_path);
-    // `scanned_for` is how many keys the scan set out to load, when there was
-    // one: what the file is written from has to be checked against it.
-    let (store, scanned_for) = if let Some(store) = remembered_store(&remembered_at, &config)? {
-        (store, None)
+    // Only a scan is written down: what the file supplied is already in it.
+    let (store, scanned) = if let Some(store) = remembered_store(&remembered_at, &config)? {
+        (store, false)
     } else {
-        let keys = keystore::effective_keys(&asking, &config)
+        let keys = keystore::effective_keys(&vault, &config, Access::Asking)
             .await
             .map_err(first_start_needs_the_vault)?;
-        let store = keystore::KeyStore::load(asking.as_ref(), &keys, &config)
+        let store = keystore::KeyStore::load(vault.as_ref(), &keys, &config)
             .await
             .map_err(first_start_needs_the_vault)?;
-        (store, Some(keys.len()))
+        (store, true)
     };
     let store = keystore::Served::new(store);
     for entry in store.current().entries() {
@@ -88,28 +82,21 @@ pub async fn run(config_path: &Path) -> Result<()> {
     }
 
     let confirmer = confirm::from_config(&config)?;
-    // Through `quiet` as well, so an encrypted key's passphrase fetch takes no
-    // gate either. A lock landing between that fetch and the private key's
-    // fails the signature rather than asking, and the retry asks: rarer than
-    // one encrypted-key signature queueing behind another would be common.
     let unlocker = Arc::new(passphrase::Unlocker::new(
-        quiet.clone(),
+        vault.clone(),
         passphrase::from_config(&config)?,
     ));
     let (listener, guard) = socket::bind(&socket_path)?;
     // After the bind, which is what guarantees the directory exists. Best
     // effort: a start that cannot write beside its own socket still serves.
-    if let Some(wanted) = scanned_for {
-        super::remember_if_complete(&remembered_at, &store.current(), wanted);
+    if scanned {
+        keystore::remember_if_complete(&remembered_at, &store.current());
     }
-    // Refreshes through a client fed only what is already held, so a scan can
-    // never put a prompt on screen: the vault is either open, and the scan is
-    // silent, or shut, and it fails fast.
     let refresher = Arc::new(refresh::Refresher::new(
         store.clone(),
         remembered_at.clone(),
         config.clone(),
-        quiet.clone(),
+        vault.clone(),
         refresh::REFRESH_INTERVAL,
     ));
     // So a restart with the vault open picks up a key added since, off the
@@ -142,12 +129,11 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let factory = AgentFactory {
         template: agent::LpassAgent::new(
             store,
-            quiet,
+            vault,
             confirmer,
             unlocker,
             Arc::new(knownhosts::HostNames::default()),
         )
-        .with_asking(asking)
         .with_approvals(Arc::new(approvals::Approvals::new(
             config.remember_approvals,
             lock_epoch,

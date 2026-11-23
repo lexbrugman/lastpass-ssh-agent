@@ -65,11 +65,6 @@ fn process_path(pid: i32) -> Option<String> {
             .ok()
             .map(|p| p.display().to_string())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = pid;
-        None
-    }
 }
 
 /// Parent of a pid, best effort. `None` for anything that cannot be asked.
@@ -104,11 +99,6 @@ fn parent_pid(pid: i32) -> Option<i32> {
             .lines()
             .find_map(|line| line.strip_prefix("PPid:"))
             .and_then(|rest| rest.trim().parse().ok())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = pid;
-        None
     }
 }
 
@@ -199,6 +189,9 @@ mod tests {
         assert!(Requester::of(0).is_none());
         assert_eq!(origin_chain(1), Vec::new());
         let _ = parent_pid(0); // best effort either way
+        let own = i32::try_from(std::process::id()).unwrap();
+        // SAFETY: getppid cannot fail and touches no memory.
+        assert_eq!(parent_pid(own), Some(unsafe { libc::getppid() }));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use rsa::pkcs1v15::SigningKey;
 use rsa::sha2::{Sha256, Sha512};
-use signature::{RandomizedSigner, SignatureEncoding, Signer};
+use rsa::BoxedUint;
+use signature::Signer;
 use ssh_agent_lib::proto::signature as sigflag;
 use ssh_agent_lib::ssh_encoding::{Decode as _, Reader as _};
 use ssh_key::private::KeypairData;
@@ -188,16 +189,24 @@ impl<'a> Wire<'a> {
 /// rsa-sha2-512 (ignoring the flags) and its `RsaKeypair -> rsa::RsaPrivateKey`
 /// conversion passes `p` twice. So the components are converted here and the
 /// digest comes from the request flags.
+///
+/// Every component is stored at the modulus's width: the modulus is public,
+/// so the size of a secret one never decides how much arithmetic is done.
+/// That is also why the constructor is the wide-primes one for every key —
+/// the default refuses a key whose primes differ in size, and choosing
+/// between the two per key would be choosing on a secret.
 pub fn sign_with_key(key: &PrivateKey, data: &[u8], flags: u32) -> Result<Signature, SignError> {
     match key.key_data() {
         KeypairData::Rsa(rsa_keypair) => {
-            let private = rsa::RsaPrivateKey::from_components(
-                to_biguint(&rsa_keypair.public.n)?,
-                to_biguint(&rsa_keypair.public.e)?,
-                to_biguint(&rsa_keypair.private.d)?,
+            let n = BoxedUint::from_be_slice_vartime(positive_bytes(&rsa_keypair.public.n)?);
+            let width = n.bits_precision();
+            let private = rsa::PrivateKey::from_components_with_wide_primes(
+                n,
+                to_uint(&rsa_keypair.public.e, width)?,
+                to_uint(&rsa_keypair.private.d, width)?,
                 vec![
-                    to_biguint(&rsa_keypair.private.p)?,
-                    to_biguint(&rsa_keypair.private.q)?,
+                    to_uint(&rsa_keypair.private.p, width)?,
+                    to_uint(&rsa_keypair.private.q, width)?,
                 ],
             )
             .map_err(crypto_err)?;
@@ -221,25 +230,29 @@ pub fn sign_with_key(key: &PrivateKey, data: &[u8], flags: u32) -> Result<Signat
     }
 }
 
-fn sign_rsa<D>(private: rsa::RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>, SignError>
+fn sign_rsa<D>(private: rsa::PrivateKey, data: &[u8]) -> Result<Vec<u8>, SignError>
 where
     D: rsa::sha2::Digest + rsa::pkcs8::AssociatedOid,
 {
-    // rsa 0.9 is not constant-time (RUSTSEC-2023-0071). Supplying fresh OS
-    // randomness makes its PKCS#1 v1.5 signer blind the private-key
-    // operation, making repeated timings substantially harder to correlate
-    // with the client's chosen input. This mitigates the advisory; it does
-    // not make the dependency a constant-time implementation, which is why
-    // the audit exception and its residual-risk documentation remain.
-    let mut rng = rand_core::OsRng;
+    // The un-randomized signer still blinds the private-key operation, with
+    // the system RNG — as long as rsa's `getrandom` feature is on; see
+    // Cargo.toml.
+    use rsa::signature::{SignatureEncoding as _, Signer as _};
     let signature = SigningKey::<D>::new(private)
-        .try_sign_with_rng(&mut rng, data)
+        .try_sign(data)
         .map_err(crypto_err)?;
     Ok(signature.to_vec())
 }
 
-fn to_biguint(mpint: &ssh_key::Mpint) -> Result<rsa::BigUint, SignError> {
-    rsa::BigUint::try_from(mpint).map_err(crypto_err)
+fn to_uint(mpint: &ssh_key::Mpint, width: u32) -> Result<BoxedUint, SignError> {
+    BoxedUint::from_be_slice(positive_bytes(mpint)?, width).map_err(crypto_err)
+}
+
+fn positive_bytes(mpint: &ssh_key::Mpint) -> Result<&[u8], SignError> {
+    mpint
+        .as_positive_bytes()
+        .ok_or("negative RSA key component")
+        .map_err(crypto_err)
 }
 
 #[cfg(test)]
