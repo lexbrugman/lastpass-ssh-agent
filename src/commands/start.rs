@@ -86,6 +86,10 @@ pub async fn run(config_path: &Path) -> Result<()> {
         vault.clone(),
         passphrase::from_config(&config)?,
     ));
+    // Before the bind: once the socket exists, a SIGTERM has to reach the
+    // shutdown below that unlinks it, rather than the default action that ends
+    // the process with the socket left behind.
+    let shutdown = shutdown_signal();
     let (listener, guard) = socket::bind(&socket_path)?;
     // After the bind, which is what guarantees the directory exists. Best
     // effort: a start that cannot write beside its own socket still serves.
@@ -145,7 +149,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
         result = ssh_agent_lib::agent::listen(listener, factory) => {
             result.map_err(|e| Error::Agent(e.to_string()))
         }
-        () = shutdown_signal() => {
+        () = shutdown => {
             tracing::info!("shutting down");
             Ok(())
         }
@@ -190,13 +194,17 @@ impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for AgentFactory {
     }
 }
 
-async fn shutdown_signal() {
+/// Installs the handlers now, and resolves on the first SIGTERM or SIGINT from
+/// then on.
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate()).expect("cannot install SIGTERM handler");
     let mut int = signal(SignalKind::interrupt()).expect("cannot install SIGINT handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+    async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
     }
 }
 
