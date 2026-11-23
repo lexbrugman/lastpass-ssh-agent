@@ -10,15 +10,15 @@ use clap::{Parser, Subcommand};
 /// version lives in the release that publishes it and is never committed, so
 /// the manifest holds a placeholder that would be a lie to print.
 fn version() -> &'static str {
-    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    VERSION.get_or_init(|| {
+    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         format!(
             "{} ({}, commit {})",
             env!("LASTPASS_SSH_AGENT_VERSION"),
             release_date(env!("LASTPASS_SSH_AGENT_VERSION")),
             env!("LASTPASS_SSH_AGENT_COMMIT"),
         )
-    })
+    });
+    &VERSION
 }
 
 /// Expand the calendar version back into a readable date. Anything that is

@@ -171,16 +171,14 @@ struct Wire<'a>(&'a [u8]);
 
 impl<'a> Wire<'a> {
     fn byte(&mut self) -> Option<u8> {
-        let (first, rest) = self.0.split_first()?;
-        self.0 = rest;
-        Some(*first)
+        self.0.split_off_first().copied()
     }
 
     fn string(&mut self) -> Option<&'a [u8]> {
-        let len = usize::try_from(u32::from_be_bytes(self.0.get(..4)?.try_into().ok()?)).ok()?;
-        let end = 4usize.checked_add(len)?;
-        let value = self.0.get(4..end)?;
-        self.0 = &self.0[end..];
+        let (len, rest) = self.0.split_first_chunk::<4>()?;
+        let (value, rest) =
+            rest.split_at_checked(usize::try_from(u32::from_be_bytes(*len)).ok()?)?;
+        self.0 = rest;
         Some(value)
     }
 }

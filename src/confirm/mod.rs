@@ -252,12 +252,7 @@ pub fn approval_question(ctx: &ConfirmContext) -> Option<String> {
         .map(|bind| {
             let mut hop = escape_for_display(&bind.host_fingerprint);
             hop.push(FIELD);
-            hop.push_str(
-                &bind
-                    .host_name
-                    .as_deref()
-                    .map_or_else(String::new, escape_for_display),
-            );
+            hop.push_str(&bind.host_name.as_deref().map_or_default(escape_for_display));
             hop.push(FIELD);
             if bind.is_forwarding {
                 hop.push_str("forwarding");

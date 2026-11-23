@@ -287,10 +287,9 @@ impl Stored {
 /// One length-prefixed field, bounded by what it is allowed to be.
 fn take(bytes: &[u8], max: usize) -> Result<(&[u8], &[u8])> {
     let (header, rest) = bytes
-        .split_at_checked(4)
+        .split_first_chunk::<4>()
         .ok_or_else(|| malformed("truncated length"))?;
-    let len =
-        u32::from_be_bytes(header.try_into().expect("split_at_checked gave four bytes")) as usize;
+    let len = u32::from_be_bytes(*header) as usize;
     if len > max {
         return Err(malformed("a length larger than anything this writes"));
     }

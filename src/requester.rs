@@ -57,7 +57,8 @@ fn process_path(pid: i32) -> Option<String> {
             )
         };
         let len = usize::try_from(len).ok().filter(|l| *l > 0)?;
-        Some(String::from_utf8_lossy(&buf[..len]).to_string())
+        buf.truncate(len);
+        Some(String::from_utf8_lossy_owned(buf))
     }
     #[cfg(target_os = "linux")]
     {

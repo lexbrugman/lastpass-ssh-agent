@@ -190,10 +190,9 @@ impl Unlock {
         };
         let mut held = self.held.lock().await;
         if held
-            .as_ref()
-            .is_some_and(|current| current.last_used.elapsed() >= idle)
+            .take_if(|current| current.last_used.elapsed() >= idle)
+            .is_some()
         {
-            held.take();
             drop(held);
             self.epoch.bump();
             tracing::info!(

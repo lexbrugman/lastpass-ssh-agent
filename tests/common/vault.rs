@@ -49,7 +49,7 @@ pub fn body(dir: &Path, items: &[Item]) -> String {
     let note_types = if note_types.is_empty() {
         "x".to_string()
     } else {
-        note_types.trim_end_matches('|').to_string()
+        note_types.trim_suffix('|').to_string()
     };
     format!(
         r#"case "$1" in

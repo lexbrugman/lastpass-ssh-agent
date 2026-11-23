@@ -87,7 +87,7 @@ pub fn unpin(ptr: *const u8, len: usize) {
 /// long the run is.
 const fn page_span(addr: usize, len: usize, page: usize) -> (usize, usize) {
     let start = addr - addr % page;
-    let end = (addr + len).div_ceil(page) * page;
+    let end = (addr + len).next_multiple_of(page);
     (start, end - start)
 }
 
@@ -101,11 +101,7 @@ fn page_size() -> usize {
 /// coverage, since a test cannot arrange that.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn os_check(rc: libc::c_int) -> std::io::Result<()> {
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    (rc == 0).ok_or_else(std::io::Error::last_os_error)
 }
 
 /// Default directory for the agent socket. Must be private to the user;
@@ -182,10 +178,9 @@ fn session_dictionary_says_locked() -> Option<bool> {
     use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
     use core_foundation::string::CFString;
 
-    // SAFETY: the returned dictionary is owned by us (a Copy function), or null
-    // when there is no GUI session to describe — a launchd daemon, or ssh into
-    // this machine.
-    let session: CFDictionaryRef = unsafe { CGSessionCopyCurrentDictionary() };
+    // Owned by us (a Copy function), or null when there is no GUI session to
+    // describe — a launchd daemon, or ssh into this machine.
+    let session: CFDictionaryRef = CGSessionCopyCurrentDictionary();
     if session.is_null() {
         return None;
     }
@@ -196,17 +191,17 @@ fn session_dictionary_says_locked() -> Option<bool> {
 
     // Absent while unlocked rather than present-and-false, so a missing key is
     // an answer: not locked.
-    session
-        .find(CFString::from_static_string("CGSSessionScreenIsLocked"))
-        .map_or(Some(false), |locked| {
-            Some(locked.downcast::<CFBoolean>().is_some_and(Into::into))
-        })
+    Some(
+        session
+            .find(CFString::from_static_string("CGSSessionScreenIsLocked"))
+            .is_some_and(|locked| locked.downcast::<CFBoolean>().is_some_and(Into::into)),
+    )
 }
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGSessionCopyCurrentDictionary() -> core_foundation::dictionary::CFDictionaryRef;
+unsafe extern "C" {
+    safe fn CGSessionCopyCurrentDictionary() -> core_foundation::dictionary::CFDictionaryRef;
 }
 
 #[cfg(test)]

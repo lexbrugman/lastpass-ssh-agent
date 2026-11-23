@@ -232,7 +232,7 @@ fn parse_line(line: &str) -> Option<Line> {
 /// `config::no_socket_path` is excluded.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn user_files() -> Vec<PathBuf> {
-    dirs::home_dir().map_or_else(Vec::new, |home| {
+    dirs::home_dir().map_or_default(|home| {
         vec![
             home.join(".ssh/known_hosts"),
             home.join(".ssh/known_hosts2"),

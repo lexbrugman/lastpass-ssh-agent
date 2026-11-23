@@ -95,11 +95,7 @@ pub async fn run(config_path: &Path, test_confirm: bool) -> Result<()> {
         }
     }
 
-    if ok {
-        Ok(())
-    } else {
-        Err(Error::DoctorFailed)
-    }
+    ok.ok_or(Error::DoctorFailed)
 }
 
 /// The config file, and the config every later check runs against.

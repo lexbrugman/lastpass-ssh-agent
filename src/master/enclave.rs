@@ -17,8 +17,8 @@ use zeroize::Zeroizing;
 use super::MasterPasswordStore;
 use crate::enclave::{self, Outcome, Stored, MAX_BLOB, MAX_CIPHER};
 
-extern "C" {
-    fn lssha_se_available() -> i32;
+unsafe extern "C" {
+    safe fn lssha_se_available() -> i32;
     fn lssha_se_seal(
         secret: *const u8,
         secret_len: usize,
@@ -45,7 +45,7 @@ extern "C" {
 /// Whether this Mac has a Secure Enclave, for `doctor` to say so before the
 /// user finds out at the first signature.
 pub fn available() -> bool {
-    unsafe { lssha_se_available() == 1 }
+    lssha_se_available() == 1
 }
 
 /// Make a new key and encrypt the secret to it. Does not prompt: the access
