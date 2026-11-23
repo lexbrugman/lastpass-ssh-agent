@@ -19,9 +19,6 @@ static SESSION: tokio::sync::OnceCell<Option<LoginSessionProxy<'static>>> =
     tokio::sync::OnceCell::const_new();
 
 /// One property on one object, which is the whole of what this needs.
-///
-/// `gen_blocking = false` because nothing here blocks: the blocking variant
-/// would be generated, never called, and warn about being dead.
 #[zbus::proxy(
     interface = "org.freedesktop.login1.Session",
     default_service = "org.freedesktop.login1",
@@ -29,8 +26,7 @@ static SESSION: tokio::sync::OnceCell<Option<LoginSessionProxy<'static>>> =
     // that belongs to no session, to the user's display session. Either way
     // that is the session whose screen locks, so asking for it by name saves
     // looking one up by pid.
-    default_path = "/org/freedesktop/login1/session/auto",
-    gen_blocking = false
+    default_path = "/org/freedesktop/login1/session/auto"
 )]
 trait LoginSession {
     /// Read live rather than from the proxy's property cache: a cached value is
