@@ -10,6 +10,24 @@ use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 
+/// A file of the agent's own, named after its socket: the socket path is the
+/// one thing every part of a running agent already agrees on, so nothing else
+/// has to be configured to keep them together.
+pub fn beside(socket: &Path, suffix: &str) -> PathBuf {
+    let mut name = socket.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Remove `path`. Already gone is the state this asks for, so that is success.
+pub fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+        Ok(()) => Ok(()),
+    }
+}
+
 /// Write `contents` to `path`, at `mode`, without the name ever holding a
 /// half-written file.
 ///
@@ -26,22 +44,11 @@ use crate::error::Result;
 /// world-readable even for an instant, and once afterwards, because a staging
 /// file left behind by an earlier crash is reopened rather than created and
 /// keeps whatever mode it already had.
-/// A file of the agent's own, named after its socket: the socket path is the
-/// one thing every part of a running agent already agrees on, so nothing else
-/// has to be configured to keep them together.
-pub fn beside(socket: &Path, suffix: &str) -> PathBuf {
-    let mut name = socket.as_os_str().to_os_string();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
 pub fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let mut staging = path.as_os_str().to_os_string();
-    staging.push(format!(".{}", std::process::id()));
-    let staging = PathBuf::from(staging);
+    let staging = beside(path, &format!(".{}", std::process::id()));
 
     // Never through a symlink: the staging name is predictable, and one planted
     // there would have the contents written wherever it points.
@@ -107,6 +114,26 @@ pub fn open_regular(path: &Path) -> Result<Option<std::fs::File>> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_deletes_the_file_and_is_content_with_it_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed");
+        std::fs::write(&path, b"contents").unwrap();
+        remove_if_present(&path).unwrap();
+        assert!(!path.exists());
+        remove_if_present(&path).unwrap();
+    }
+
+    #[test]
+    fn a_removal_that_cannot_happen_is_reported() {
+        // A directory in its place: the error must travel rather than read as
+        // "already gone".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed");
+        std::fs::create_dir(&path).unwrap();
+        assert!(remove_if_present(&path).is_err());
+    }
 
     #[test]
     fn a_file_beside_the_socket_takes_its_name_and_a_suffix() {

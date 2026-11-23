@@ -149,6 +149,6 @@ impl MasterPasswordStore for SecureEnclave {
     }
 
     async fn forget(&self) -> Result<(), String> {
-        enclave::remove(&self.path).map_err(|e| e.to_string())
+        crate::files::remove_if_present(&self.path).map_err(|e| e.to_string())
     }
 }

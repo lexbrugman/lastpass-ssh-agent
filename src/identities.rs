@@ -94,15 +94,6 @@ pub fn save(path: &Path, remembered: &Remembered) -> Result<()> {
     crate::files::write_private(path, text.as_bytes(), 0o600)
 }
 
-/// Discard them. Already gone is the state this asks for, so that is success.
-pub fn remove(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-        Ok(()) => Ok(()),
-    }
-}
-
 /// Write them down if that can be done, and say so if not. For the callers that
 /// must go on either way: a start that cannot write beside its own socket still
 /// serves, and a refresh that cannot is still a refresh of what is served.
@@ -274,26 +265,6 @@ mod tests {
         save(&path, &sample()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         assert!(load(&path).is_err());
-    }
-
-    #[test]
-    fn discarding_removes_the_file_and_is_content_with_it_already_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("identities");
-        save(&path, &sample()).unwrap();
-        remove(&path).unwrap();
-        assert_eq!(load(&path).unwrap(), None);
-        remove(&path).unwrap();
-    }
-
-    #[test]
-    fn a_discard_that_cannot_happen_is_reported() {
-        // A directory in its place: not something this writes, but the error
-        // must travel rather than read as "already gone".
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("identities");
-        std::fs::create_dir(&path).unwrap();
-        assert!(remove(&path).is_err());
     }
 
     #[test]

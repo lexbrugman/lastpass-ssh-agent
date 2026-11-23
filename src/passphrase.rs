@@ -95,27 +95,18 @@ impl PassphraseRequest {
 
 /// Why no passphrase was typed. Deliberately coarse: the reason is logged and
 /// shown, so it must never carry anything the user entered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PromptError {
     /// The user dismissed the prompt, or it timed out.
+    #[error("passphrase entry cancelled")]
     Cancelled,
     /// There is nowhere to ask: no terminal, no GUI session, no helper.
+    #[error("no interactive passphrase prompt is available: {0}")]
     Unavailable(String),
     /// More input arrived than a typed passphrase can be, so it was refused
     /// rather than buffered.
+    #[error("passphrase longer than {0} bytes, refused")]
     TooLong(usize),
-}
-
-impl std::fmt::Display for PromptError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Cancelled => f.write_str("passphrase entry cancelled"),
-            Self::Unavailable(why) => {
-                write!(f, "no interactive passphrase prompt is available: {why}")
-            }
-            Self::TooLong(max) => write!(f, "passphrase longer than {max} bytes, refused"),
-        }
-    }
 }
 
 /// A typed line, so 1 KiB is far past anything real. The cap is what lets every
@@ -284,7 +275,7 @@ impl Unlocker {
             .prompt
             .prompt(&PassphraseRequest::new(entry))
             .await
-            .map_err(|e| format!("{e}"))?;
+            .map_err(|e| e.to_string())?;
         if typed.is_empty() {
             // An encrypted key cannot have an empty passphrase, so this is a
             // stray return keypress rather than an answer. Saying so beats a

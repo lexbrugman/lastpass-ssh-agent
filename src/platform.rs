@@ -32,13 +32,7 @@ pub fn harden() -> Result<()> {
 /// edge is untestable and excluded from coverage.
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn harden_check(rc: libc::c_int, what: &str) -> Result<()> {
-    if rc == 0 {
-        return Ok(());
-    }
-    Err(Error::Harden(format!(
-        "{what}: {}",
-        std::io::Error::last_os_error()
-    )))
+    os_check(rc).map_err(|e| Error::Harden(format!("{what}: {e}")))
 }
 
 /// Not dumpable, which on Linux is also what closes `ptrace` and

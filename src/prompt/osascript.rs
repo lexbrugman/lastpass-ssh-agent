@@ -130,7 +130,7 @@ impl OsascriptTransport {
         let (stdout, diagnostics, status) = finished?;
         Ok(Shown {
             stdout,
-            stderr: super::diagnostics_for_display(&diagnostics),
+            stderr: crate::text::diagnostics_for_display(&diagnostics),
             status,
         })
     }
@@ -198,7 +198,7 @@ impl Transport for OsascriptTransport {
         // `return` of a string prints it with a trailing newline, and a
         // single-line dialog field cannot contain one, so exactly one is ours
         // to remove.
-        super::strip_line_ending(&mut stdout);
+        crate::text::strip_line_ending(&mut stdout);
         Ok(Some(stdout))
     }
 }

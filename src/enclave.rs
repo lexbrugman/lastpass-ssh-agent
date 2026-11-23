@@ -84,7 +84,7 @@ pub enum Outcome {
 /// to know which code that is. Anything at that stage which is not plainly a
 /// declined prompt is reported as a failure carrying its code, so the log says
 /// what actually happened rather than a guess dressed up as a diagnosis.
-pub const fn meaning(stage: i32, os_error: i32) -> Outcome {
+pub fn meaning(stage: i32, os_error: i32) -> Outcome {
     match stage {
         STAGE_OK => Outcome::Done,
         STAGE_UNAVAILABLE => Outcome::Unavailable,
@@ -94,21 +94,9 @@ pub const fn meaning(stage: i32, os_error: i32) -> Outcome {
         // yield the secret again, so all three ask for seeding rather than
         // reporting a fault the user could do nothing about.
         STAGE_RESTORE | STAGE_MALFORMED | STAGE_DECRYPT => Outcome::Reseed,
-        STAGE_AGREEMENT if is_not_authenticated(os_error) => Outcome::Refused,
+        STAGE_AGREEMENT if NOT_AUTHENTICATED.contains(&os_error) => Outcome::Refused,
         _ => Outcome::Failed(os_error),
     }
-}
-
-/// Whether a `LocalAuthentication` code means "no fingerprint happened".
-const fn is_not_authenticated(os_error: i32) -> bool {
-    let mut i = 0;
-    while i < NOT_AUTHENTICATED.len() {
-        if NOT_AUTHENTICATED[i] == os_error {
-            return true;
-        }
-        i += 1;
-    }
-    false
 }
 
 impl Outcome {
@@ -360,15 +348,6 @@ pub fn save(path: &Path, stored: &Stored) -> Result<()> {
     crate::files::write_private(path, &stored.encode()?, 0o600)
 }
 
-/// Forget it. Already gone is the state this asks for, so that is success.
-pub fn remove(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-        Ok(()) => Ok(()),
-    }
-}
-
 fn malformed(why: &str) -> Error {
     Error::State(format!(
         "the stored Secure Enclave key is unreadable ({why}) — run \
@@ -617,16 +596,6 @@ mod tests {
     }
 
     #[test]
-    fn a_removal_that_cannot_happen_is_reported() {
-        // A directory in its place: not something this writes, but the error
-        // must travel rather than be read as "already gone".
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stored");
-        std::fs::create_dir(&path).unwrap();
-        assert!(remove(&path).is_err());
-    }
-
-    #[test]
     fn the_stored_file_sits_beside_the_socket() {
         assert_eq!(
             path_for(Path::new("/run/user/1000/agent.sock")),
@@ -693,21 +662,6 @@ mod tests {
         let encoded = sample().encode().unwrap();
         expect_reads_as_empty(&encoded[..encoded.len() - 1], "truncated");
         expect_reads_as_empty(b"some other file entirely", "not ours");
-    }
-
-    #[test]
-    fn forgetting_removes_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stored");
-        save(&path, &sample()).unwrap();
-        remove(&path).unwrap();
-        assert_eq!(load(&path).unwrap(), None);
-    }
-
-    #[test]
-    fn forgetting_what_is_already_gone_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
-        remove(&dir.path().join("absent")).unwrap();
     }
 
     #[test]

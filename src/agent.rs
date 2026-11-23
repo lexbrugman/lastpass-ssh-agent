@@ -280,7 +280,7 @@ impl LpassAgent {
         let Some(path) = &self.remembered else {
             return;
         };
-        crate::identities::remove(path).unwrap_or_else(could_not_discard);
+        crate::files::remove_if_present(path).unwrap_or_else(could_not_discard);
         tracing::warn!(item = %item_id, path = %path.display(),
             "{why}, so the remembered identities were discarded — restart the agent to \
              serve what the vault holds");

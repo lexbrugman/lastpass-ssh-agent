@@ -55,6 +55,26 @@ pub fn display_bounded(text: &str) -> String {
     format!("{}… [{omitted} more]", &escaped[..cut])
 }
 
+/// Strip the single line ending a subprocess adds when printing a value. Never
+/// more than one: a secret may legitimately end in whitespace.
+pub fn strip_line_ending(bytes: &mut Vec<u8>) {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+}
+
+/// What a subprocess said on stderr, ready for a log line: untrusted text, so
+/// escaped, and cut to a length a log line can carry.
+pub fn diagnostics_for_display(diagnostics: &[u8]) -> String {
+    escape_for_display(String::from_utf8_lossy(diagnostics).trim())
+        .chars()
+        .take(300)
+        .collect()
+}
+
 /// Characters that render as nothing, as inclusive codepoint ranges.
 ///
 /// This is Unicode's own `Default_Ignorable_Code_Point` — the property the
@@ -111,6 +131,20 @@ fn is_invisible(c: char) -> bool {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exactly_one_line_ending_is_stripped() {
+        let strip = |bytes: &[u8]| {
+            let mut bytes = bytes.to_vec();
+            strip_line_ending(&mut bytes);
+            bytes
+        };
+        assert_eq!(strip(b"secret\n"), b"secret");
+        assert_eq!(strip(b"secret\r\n"), b"secret");
+        assert_eq!(strip(b"secret\n\n"), b"secret\n");
+        assert_eq!(strip(b"secret"), b"secret");
+        assert_eq!(strip(b"secret\r"), b"secret\r");
+    }
 
     #[test]
     fn long_text_is_cut_with_a_count_of_what_was_left_out() {

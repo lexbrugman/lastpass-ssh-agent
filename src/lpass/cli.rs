@@ -231,24 +231,12 @@ impl LpassCli {
             .await
             .map_err(|_| LpassError::Timeout(self.timeout))??;
 
-        // lpass terminates the value with exactly one newline. Strip that
-        // one (and a preceding CR), never more: a passphrase legitimately
-        // ending in a newline must survive intact, and `--field` gives no
-        // framing that would let us tell the two apart otherwise.
+        // lpass terminates the value with exactly one newline, and `--field`
+        // gives no other framing.
         let mut stdout = stdout;
-        if stdout.last() == Some(&b'\n') {
-            stdout.pop();
-            if stdout.last() == Some(&b'\r') {
-                stdout.pop();
-            }
-        }
-        // Untrusted text like a vault name — lpass quotes item names in some
-        // of its messages — and headed for the log, so escaped the same way.
-        let stderr: String =
-            crate::text::escape_for_display(String::from_utf8_lossy(&stderr).trim())
-                .chars()
-                .take(300)
-                .collect();
+        crate::text::strip_line_ending(&mut stdout);
+        // lpass quotes vault item names in some of its messages.
+        let stderr = crate::text::diagnostics_for_display(&stderr);
         Ok(CmdOutput {
             success: status.success(),
             code: status.code(),

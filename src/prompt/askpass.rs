@@ -119,7 +119,7 @@ impl Transport for AskpassTransport {
             tracing::info!(code = ?status.code(), "askpass helper returned no secret");
             return Ok(None);
         }
-        super::strip_line_ending(&mut secret);
+        crate::text::strip_line_ending(&mut secret);
         Ok(Some(secret))
     }
 }

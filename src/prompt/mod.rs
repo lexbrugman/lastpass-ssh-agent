@@ -136,27 +136,6 @@ async fn reap(child: &mut tokio::process::Child) -> Result<std::process::ExitSta
     child.wait().await.map_err(helper_failed)
 }
 
-/// Strip the single line ending a helper adds when printing the answer. Never
-/// more than one: a passphrase may legitimately end in whitespace.
-fn strip_line_ending(secret: &mut Zeroizing<Vec<u8>>) {
-    if secret.last() == Some(&b'\n') {
-        secret.pop();
-        if secret.last() == Some(&b'\r') {
-            secret.pop();
-        }
-    }
-}
-
-/// What a helper said on stderr, ready for a log line: untrusted text — the
-/// helper is whatever the config names — so escaped, and cut to a length a log
-/// line can carry.
-fn diagnostics_for_display(diagnostics: &[u8]) -> String {
-    crate::text::escape_for_display(String::from_utf8_lossy(diagnostics).trim())
-        .chars()
-        .take(300)
-        .collect()
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -178,19 +157,5 @@ mod tests {
         // config load-time validation normally rejects this; the defensive
         // branch must fail rather than default to anything
         assert!(build("confirm = \"askpass\"").is_err());
-    }
-
-    #[test]
-    fn exactly_one_line_ending_is_stripped() {
-        let strip = |bytes: &[u8]| {
-            let mut secret = Zeroizing::new(bytes.to_vec());
-            strip_line_ending(&mut secret);
-            secret.to_vec()
-        };
-        assert_eq!(strip(b"secret\n"), b"secret");
-        assert_eq!(strip(b"secret\r\n"), b"secret");
-        assert_eq!(strip(b"secret\n\n"), b"secret\n");
-        assert_eq!(strip(b"secret"), b"secret");
-        assert_eq!(strip(b"secret\r"), b"secret\r");
     }
 }
