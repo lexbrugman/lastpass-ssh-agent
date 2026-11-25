@@ -609,7 +609,17 @@ unlocking — do not run `lpass` yourself — and every lock is one it sees.
   refuses key addition, and its key set comes from the vault.
 - **RSA**: SHA-1 (`ssh-rsa`) signature requests are refused; every OpenSSH
   since 7.2 asks for `rsa-sha2-*`. Supported key types: ed25519, RSA,
-  ECDSA p256/p384.
+  ECDSA p256/p384. An RSA key wider than 16384 bits is not served — the
+  widest `ssh` itself uses.
+- **An encrypted key declaring more than 1024 KDF rounds** is refused when
+  it is asked to sign. The count is the vault item's to state, and deriving
+  the key holds up every other request meanwhile. `ssh-keygen -p -a 100`
+  re-encrypts one.
+- **A log file the agent is started with has its mode set to owner-only**
+  when it is the agent's own, since it names the keys and when each one
+  signs. That is the mode bits and no more: it does not close a log somebody
+  already has open, one an ACL shares, or one in a directory others can
+  replace it in. Keep it in a directory of your own.
 - The `socket` path must be absolute (SSH clients resolve `SSH_AUTH_SOCK`
   from their own working directory), and macOS limits Unix socket paths to
   ~104 bytes (`SUN_LEN`), so keep it short.
