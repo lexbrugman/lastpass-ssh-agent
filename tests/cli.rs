@@ -686,42 +686,6 @@ fn doctor_test_confirm_modes() {
 }
 
 #[test]
-fn storing_a_master_password_needs_the_touchid_source() {
-    // Nothing to store without somewhere to put it, and saying so beats
-    // prompting for a secret that would then have nowhere to go.
-    let s = setup(&healthy_vault_body_owned(), "");
-    let output = run(&s, &["store-master-password"]);
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("master_password = \"touchid\""),
-        "{}",
-        stderr(&output)
-    );
-}
-
-#[test]
-fn both_master_password_commands_are_listed_in_help() {
-    let s = setup(&healthy_vault_body_owned(), "");
-    let help = stdout(&run(&s, &["--help"]));
-    assert!(help.contains("store-master-password"), "{help}");
-    assert!(help.contains("forget-master-password"), "{help}");
-}
-
-#[test]
-fn forgetting_a_master_password_that_was_never_kept_is_fine() {
-    // Nothing stored here — and off macOS nowhere to store — is the state the
-    // command leaves behind, so it is a success either way.
-    let s = setup(&healthy_vault_body_owned(), "");
-    let output = run(&s, &["forget-master-password"]);
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("no master password is kept"),
-        "{}",
-        stderr(&output)
-    );
-}
-
-#[test]
 fn start_refuses_when_logged_out() {
     let s = asking_setup(NO_KEY, "", "echo anything");
     let output = run(&s, &["start"]);

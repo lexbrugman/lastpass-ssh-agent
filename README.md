@@ -83,12 +83,11 @@ What it **cannot** guarantee:
   [How the vault is opened](#how-the-vault-is-opened). It lives in a
   zeroizing buffer, is never logged, never written, and never placed in argv
   or the environment.
-  [`"touchid"`](#keeping-it-behind-touch-id) is the one setting that keeps it
-  at rest: it is written to disk, encrypted to a key that never leaves the
-  Secure Enclave of the Mac it was created on, and that macOS will not use
-  without your fingerprint. Copies of the file are inert anywhere else. That
-  is a deliberate trade of a stored secret for a hardware-enforced gate, and
-  worth reading that section before turning it on. (Key *passphrases* are a
+  [`"touchid"`](#keeping-it-behind-touch-id) keeps it past a lock, still in
+  memory only: encrypted to a key that never leaves the Mac's Secure Enclave
+  and that macOS will not use without your fingerprint, so a lock costs a
+  fingerprint rather than typing. It is not written to disk in any form, and
+  the first unlock after each start is typed. (Key *passphrases* are a
   separate setting with a store of their own — see
   [`passphrase_fallback`](#keeping-the-passphrase-out-of-the-vault).)
 
@@ -242,8 +241,8 @@ vault scan) or tuning behavior:
 # master_password_idle_secs = 3600
 
 # Where the master password comes from when the vault is locked. "prompt"
-# (default) asks you, any platform; "touchid" (macOS) releases it on Touch
-# ID, falling back to asking.
+# (default) asks you, any platform; "touchid" (macOS) asks once after each
+# start and releases it on Touch ID from then on, falling back to asking.
 # master_password = "prompt"
 
 # Forget the master password when the screen locks, not just the display.
@@ -393,52 +392,41 @@ would fail every signature after a screen lock, and any other value for
 master_password = "touchid"      # macOS only
 ```
 
-```sh
-lastpass-ssh-agent store-master-password
-```
+The first time the vault needs opening after the agent starts, you type the
+master password as with `"prompt"`. From then on a locked vault — the screen
+locked, the idle time passed — costs a fingerprint instead.
 
-The setup command asks once, checks that what you typed actually opens the
-vault, and keeps it only if it does — so a typo never becomes a stored
-credential, and setting it up proves the whole arrangement works rather than
-only that a password was typed. To make that check possible it first ends the
-`lpass` agent your shell may have left running, since a vault that is already
-open would answer without the password ever being read; that is the one time
-this agent locks a vault it did not open.
+What makes that possible is a copy of the password encrypted to a key
+generated inside your Mac's **Secure Enclave**, which never leaves it and which
+macOS will not use until the fingerprint sensor says so. The enforcement is the
+system's, not this agent's: something able to trigger signatures can make the
+prompt appear, but cannot answer it.
 
-After that a locked vault costs a fingerprint instead of typing your master
-password. The password is encrypted to a key generated inside your Mac's
-**Secure Enclave**, which never leaves it and which macOS will not use until
-the fingerprint sensor says so. The enforcement is the system's, not this
-agent's: something able to trigger signatures can make the prompt appear, but
-cannot answer it, and copying the files away gains nothing because the key
-cannot leave the Enclave. That is
-the difference between this and simply storing the password — without the
-constraint, anything running as you could take the key to the whole vault
-silently.
+That copy lives in the agent's memory and nowhere else. It is deliberately
+not written to disk, which is why each start begins with a typed password: a
+file holding it could be loaded by any program running as you, which could
+then put the same Touch ID sheet in front of you under a name of its choosing
+— and a signing request is enough to make a sheet expected. Held in memory it
+is out of reach of your other processes, as the password itself is, and it is
+gone when the agent stops. An `agent.sock.master` file left by a release that
+did keep it on disk is removed at the next start.
 
-The Touch ID sheet says what it is for — *unlock your LastPass vault* — rather
-than appearing unexplained, so one you were not expecting is one you can refuse.
+The Touch ID sheet says what it is for — *unlock your LastPass vault*.
 
-The key is bound to the fingerprints enrolled when you set it up. Adding or
-removing one invalidates it by design, and the agent says so and falls back to
-asking until you run `store-master-password` again. A stored password that
-`lpass` rejects — you changed it, say — is likewise not asked for again until
-then.
+The key is bound to the fingerprints enrolled when the password was typed.
+Adding or removing one invalidates it by design, and the agent says so and
+asks for the password again, as it does when `lpass` rejects the one it was
+keeping — you changed it, say. Either way the newly typed one takes its place.
 
 Two things it does not change. The confirmation dialog still runs, separately
 and unchanged, naming the key, fingerprint, requester and host — Touch ID
-authorises opening the vault, never a signature. And until you have run
-`store-master-password`, or on a Mac with no Secure Enclave, or whenever the
-fingerprint is declined, it behaves exactly like `"prompt"`.
+authorises opening the vault, never a signature. And on a Mac with no Secure
+Enclave, or whenever the fingerprint is declined, it behaves exactly like
+`"prompt"`.
 
-To stop keeping it:
-
-```sh
-lastpass-ssh-agent forget-master-password
-```
-
-Run that before switching back to `"prompt"`, so nothing stays at rest that
-the config does not name.
+A dialog asking you to *type* the master password is a different matter in
+every mode: anything running as you can draw one that looks the same, and no
+setting here changes that.
 
 ### How long the master password is held
 

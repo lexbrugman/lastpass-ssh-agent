@@ -82,8 +82,8 @@ The code already works this way, and these are the patterns to copy:
 - `enclave` is the same idea taken as far as it goes, because the thing behind
   the `cfg` there is not even Rust. The Swift shim returns the stage a call
   stopped at and the system's own error code, and nothing else; which stage
-  means "ask again", which means "seed again" and which is a fault, along with
-  the format the key blob is written in, are all decided in `enclave.rs` and
+  means "ask again", which means the sealed copy is lost and which is a fault,
+  along with when that copy is kept or dropped, are all decided in `enclave.rs` and
   tested on Linux as well as macOS. `master/enclave.rs` is three foreign calls
   and no judgement.
 

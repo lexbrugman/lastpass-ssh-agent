@@ -4,23 +4,23 @@
 pub mod doctor;
 pub mod env;
 pub mod list;
-pub mod master_password;
 pub mod start;
 
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::config::Config;
+use crate::config::{Config, MasterPassword};
 use crate::error::{Error, Result};
 use crate::lpass::{self, LpassClient};
 use crate::{master, passphrase, unlock};
 
-/// The agent's master-password holder, from the config: the platform's store
-/// beside the socket, the prompt `confirm` selects, and the idle time.
-fn unlock_from(config: &Config, socket_path: &Path) -> Result<Arc<unlock::Unlock>> {
+/// A master-password holder from the config: the platform's store, the prompt
+/// `confirm` selects, and the idle time. `source` is the caller's to say,
+/// because only a process that stays has a use for the store.
+fn unlock_from(config: &Config, source: MasterPassword) -> Result<Arc<unlock::Unlock>> {
     Ok(Arc::new(unlock::Unlock::new(
-        config.master_password,
-        master::default_store(socket_path),
+        source,
+        master::default_store(),
         passphrase::from_config(config)?,
         config.master_password_idle(),
     )))
@@ -49,9 +49,11 @@ fn one_shot_source(config: &Config, socket_path: &Path) -> Result<lpass::MasterP
         );
         return Ok(lpass::MasterPasswordSource::None);
     }
+    // Typed, whatever the config says: a sealed copy lives in the process
+    // that made it, and this one exits.
     Ok(lpass::MasterPasswordSource::Unlock(unlock_from(
         config,
-        socket_path,
+        MasterPassword::Prompt,
     )?))
 }
 

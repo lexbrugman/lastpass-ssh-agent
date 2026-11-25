@@ -93,18 +93,6 @@ pub enum Command {
         /// Substring to match against item names; omit to list all SSH Key items
         query: Option<String>,
     },
-    /// Keep your `LastPass` master password behind Touch ID
-    ///
-    /// Locks the vault, asks once, checks that the password opens it, and keeps
-    /// it only if it does — encrypted to a key held in the Secure Enclave.
-    /// Needs `master_password = "touchid"`. macOS only.
-    StoreMasterPassword,
-    /// Remove the master password kept behind Touch ID
-    ///
-    /// The next time the vault needs opening you are asked instead. Run this
-    /// before switching `master_password` back to "prompt", so nothing stays
-    /// at rest that the config does not name.
-    ForgetMasterPassword,
 }
 
 #[cfg(test)]

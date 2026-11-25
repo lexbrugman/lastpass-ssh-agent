@@ -7,8 +7,8 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::lpass::{self, Access, LpassClient};
 use crate::{
-    agent, approvals, confirm, identities, keystore, knownhosts, passphrase, platform, refresh,
-    socket, unlock, vaultlock,
+    agent, approvals, confirm, identities, keystore, knownhosts, master, passphrase, platform,
+    refresh, socket, unlock, vaultlock,
 };
 
 /// The store a remembered file can stand in for the vault with, or `None` when
@@ -43,7 +43,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     crate::platform::private_log(std::os::fd::AsFd::as_fd(&std::io::stderr()));
     let config = Arc::new(Config::load_or_default(config_path)?);
     let socket_path = config.socket_path()?;
-    let unlock = super::unlock_from(&config, &socket_path)?;
+    let unlock = super::unlock_from(&config, config.master_password)?;
     // One vault, fed what the agent holds. Each call says what it is for —
     // `Access` — and that is what decides whether it may ask for the master
     // password, and whether it counts as using it.
@@ -94,6 +94,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     // the process with the socket left behind.
     let shutdown = shutdown_signal();
     let (listener, guard) = socket::bind(&socket_path)?;
+    master::discard_at_rest(&socket_path);
     // After the bind, which is what guarantees the directory exists. Best
     // effort: a start that cannot write beside its own socket still serves.
     if scanned {

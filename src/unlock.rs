@@ -13,10 +13,9 @@
 //! It is dropped when the screen locks, when it has gone unused for the
 //! configured idle time, when `lpass` reports it wrong, and when the agent
 //! exits. The next call that needs it asks again — the Secure Enclave first
-//! when that is configured and seeded, the prompt otherwise.
+//! when that is configured and holds a sealed copy, the prompt otherwise.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -36,10 +35,6 @@ pub struct Unlock {
     prompt: Arc<dyn PassphrasePrompt>,
     /// How long it may go unused before it is dropped; `None` is never.
     idle: Option<Duration>,
-    /// Set once `lpass` has rejected what the store supplied. The store is not
-    /// asked again after that: its answer cannot change until
-    /// `store-master-password` is run, and each ask costs a fingerprint.
-    store_rejected: AtomicBool,
 }
 
 struct Held {
@@ -99,7 +94,6 @@ impl Unlock {
             store,
             prompt,
             idle,
-            store_rejected: AtomicBool::new(false),
         }
     }
 
@@ -125,14 +119,10 @@ impl Unlock {
         // lock here, because the request asking is the one to decide what its
         // own approval is worth.
         self.epoch.unlocked();
-        let (secret, from) = master::resolve(
-            self.source,
-            self.store.as_ref(),
-            self.prompt.as_ref(),
-            self.store_rejected.load(Ordering::SeqCst),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let (secret, from) =
+            master::resolve(self.source, self.store.as_ref(), self.prompt.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
         tracing::info!(
             source = from.name(),
             "holding the master password until the vault locks"
@@ -155,17 +145,24 @@ impl Unlock {
     }
 
     /// `lpass` did not accept what it was given. Dropped, so the next call asks
-    /// again — and if it came from the store, the store is not what gets asked.
+    /// again — and from the store as well, whichever of the two supplied it:
+    /// what the store keeps is this same password, typed or not, and asking it
+    /// again would cost a fingerprint for an answer already known to be wrong.
+    ///
+    /// From the store even with nothing held: a lock landing while the call
+    /// was with `lpass` has dropped the held copy already, and the sealed one
+    /// is no less wrong for it.
     pub async fn rejected(&self) {
+        self.store.forget().await;
         let Some(was) = self.held.lock().await.take() else {
             return;
         };
         self.epoch.bump();
         if was.from == Source::Store {
-            self.store_rejected.store(true, Ordering::SeqCst);
             tracing::warn!(
-                "the stored master password no longer opens the vault, so the prompt is \
-                 asked instead — run `lastpass-ssh-agent store-master-password` to replace it"
+                "the master password kept in {} no longer opens the vault, so it is asked \
+                 for again",
+                self.store.name()
             );
         } else {
             tracing::info!("the master password was not accepted; asking again next time");
@@ -289,16 +286,16 @@ mod tests {
         }
     }
 
-    /// A store holding a fixed answer, counting the asking.
+    /// A store keeping whatever it was last handed, counting the asking.
     struct FakeStore {
-        secret: Option<&'static [u8]>,
+        secret: std::sync::Mutex<Option<Vec<u8>>>,
         asked: std::sync::Mutex<usize>,
     }
 
     impl FakeStore {
-        fn holding(secret: &'static [u8]) -> Arc<Self> {
+        fn holding(secret: &[u8]) -> Arc<Self> {
             Arc::new(Self {
-                secret: Some(secret),
+                secret: std::sync::Mutex::new(Some(secret.to_vec())),
                 asked: std::sync::Mutex::new(0),
             })
         }
@@ -314,13 +311,14 @@ mod tests {
         }
         async fn get(&self) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
             *self.asked.lock().unwrap() += 1;
-            Ok(self.secret.map(|s| Zeroizing::new(s.to_vec())))
+            Ok(self.secret.lock().unwrap().clone().map(Zeroizing::new))
         }
-        async fn set(&self, _secret: &[u8]) -> Result<(), String> {
+        async fn set(&self, secret: &[u8]) -> Result<(), String> {
+            *self.secret.lock().unwrap() = Some(secret.to_vec());
             Ok(())
         }
-        async fn forget(&self) -> Result<(), String> {
-            Ok(())
+        async fn forget(&self) {
+            *self.secret.lock().unwrap() = None;
         }
     }
 
@@ -423,10 +421,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejected_stored_password_stops_the_store_being_asked() {
-        // Each ask of the store costs a fingerprint, for an answer that cannot
-        // change until it is re-seeded. So after one rejection the prompt is
-        // what gets asked.
+    async fn a_rejected_password_is_dropped_from_the_store_too() {
+        // What the store keeps is the password `lpass` just refused, so the
+        // next unlock is typed — and what is typed takes its place.
         let store = FakeStore::holding(b"stale");
         let prompt = FakePrompt::answering(b"typed");
         let unlock = Unlock::new(MasterPassword::TouchId, store.clone(), prompt.clone(), None);
@@ -434,8 +431,28 @@ mod tests {
         assert_eq!(prompt.asked(), 0);
         unlock.rejected().await;
         assert_eq!(&**unlock.password(true).await.unwrap().unwrap(), b"typed");
-        assert_eq!(store.asked(), 1, "not asked a second time");
+        assert_eq!(store.asked(), 2, "asked, and found empty");
         assert_eq!(prompt.asked(), 1);
+
+        // A lock drops what is held and leaves the store alone: the way back
+        // is the store, not the prompt.
+        unlock.forget("test").await;
+        assert_eq!(&**unlock.password(true).await.unwrap().unwrap(), b"typed");
+        assert_eq!(store.asked(), 3);
+        assert_eq!(prompt.asked(), 1, "not typed a second time");
+
+        // One refused after a lock already dropped what was held leaves the
+        // store all the same.
+        unlock.forget("test").await;
+        unlock.rejected().await;
+        assert_eq!(*store.secret.lock().unwrap(), None);
+
+        // And a typed password `lpass` refuses leaves the store as well.
+        unlock.forget("test").await;
+        *store.secret.lock().unwrap() = None;
+        assert_eq!(&**unlock.password(true).await.unwrap().unwrap(), b"typed");
+        unlock.rejected().await;
+        assert_eq!(*store.secret.lock().unwrap(), None);
     }
 
     #[tokio::test]

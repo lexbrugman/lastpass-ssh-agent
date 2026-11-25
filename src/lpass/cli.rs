@@ -28,7 +28,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum MasterPasswordSource {
     /// Nowhere. A locked vault fails fast, in `LpassError::Locked`.
     None,
-    /// This candidate, for `store-master-password` to check against the vault.
+    /// This one, so a test can say what a fed call does.
+    #[cfg(test)]
     Fixed(Zeroizing<Vec<u8>>),
     /// What the agent holds, asking for it when it holds nothing and the call
     /// may.
@@ -40,6 +41,7 @@ impl MasterPasswordSource {
     async fn held(&self) -> Option<Zeroizing<Vec<u8>>> {
         match self {
             Self::None => None,
+            #[cfg(test)]
             Self::Fixed(secret) => Some(secret.clone()),
             // Not asking, so it cannot fail.
             Self::Unlock(unlock) => unlock.password(false).await.unwrap_or_default(),
@@ -48,12 +50,13 @@ impl MasterPasswordSource {
 
     /// The password after asking for it, when this source and the call may.
     async fn asked(&self, access: Access) -> Result<Option<Zeroizing<Vec<u8>>>, LpassError> {
-        match (self, access) {
-            (Self::Unlock(unlock), Access::Asking) => unlock
+        if let (Self::Unlock(unlock), Access::Asking) = (self, access) {
+            unlock
                 .password(true)
                 .await
-                .map_err(LpassError::NoMasterPassword),
-            (Self::None | Self::Fixed(_), _) | (_, Access::Signing | Access::Scanning) => Ok(None),
+                .map_err(LpassError::NoMasterPassword)
+        } else {
+            Ok(None)
         }
     }
 

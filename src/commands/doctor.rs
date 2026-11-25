@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::config::{self, Config};
 use crate::error::{Error, Result};
 use crate::lpass::{self, Access, LpassClient};
-use crate::{confirm, enclave, identities, keystore, master, socket};
+use crate::{confirm, identities, keystore, master, socket};
 
 /// One line of the `doctor` checklist.
 struct Check {
@@ -85,7 +85,6 @@ pub async fn run(config_path: &Path, test_confirm: bool) -> Result<()> {
         report(master_password_check(
             config.master_password,
             master::store_available(),
-            master_password_seeded(config),
         ));
     }
 
@@ -332,25 +331,12 @@ fn check_plaintext_key(path: Option<&Path>) -> Check {
     }
 }
 
-/// Whether a master password is already stored, which is a question about a
-/// file and never about a fingerprint — `doctor` must not cost one.
-///
-/// A socket path that will not resolve, or a file that will not decode, both
-/// come out as "nothing stored": the first is `check_socket`'s to report and
-/// the second is answered by the same instruction as an empty store.
-fn master_password_seeded(config: &Config) -> bool {
-    config
-        .socket_path()
-        .and_then(|socket| enclave::load(&enclave::path_for(&socket)))
-        .is_ok_and(|stored| stored.is_some())
-}
-
 /// The master-password line of the checklist.
 ///
-/// Takes the two facts rather than looking them up, so every arm is exercised
-/// on both platforms — `touchid` cannot even be parsed into a config off macOS,
-/// which would otherwise leave most of this untestable there.
-fn master_password_check(source: config::MasterPassword, available: bool, seeded: bool) -> Check {
+/// Takes the fact rather than looking it up, so every arm is exercised on both
+/// platforms — `touchid` cannot even be parsed into a config off macOS, which
+/// would otherwise leave most of this untestable there.
+fn master_password_check(source: config::MasterPassword, available: bool) -> Check {
     const LABEL: &str = "master password";
     match source {
         config::MasterPassword::Prompt => Check::passed(
@@ -361,13 +347,12 @@ fn master_password_check(source: config::MasterPassword, available: bool, seeded
             LABEL,
             "no Secure Enclave on this machine — use master_password = \"prompt\"".into(),
         ),
-        config::MasterPassword::TouchId if !seeded => Check::failed(
+        config::MasterPassword::TouchId => Check::passed(
             LABEL,
-            "nothing stored yet — run `lastpass-ssh-agent store-master-password`".into(),
+            "typed once after each start, then released on Touch ID — kept in the agent's \
+             memory, never on disk"
+                .into(),
         ),
-        config::MasterPassword::TouchId => {
-            Check::passed(LABEL, "stored, and released only on Touch ID".into())
-        }
     }
 }
 
@@ -445,64 +430,24 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_stored_until_something_is() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = config_with_socket(dir.path());
-        assert!(!master_password_seeded(&config));
-
-        let stored = enclave::Stored {
-            blob: vec![1, 2, 3],
-            cipher: vec![4, 5, 6],
-        };
-        let path = dir.path().join("agent.sock.master");
-        enclave::save(&path, &stored).unwrap();
-        assert!(master_password_seeded(&config));
-    }
-
-    #[test]
-    fn a_file_that_will_not_decode_counts_as_nothing_stored() {
-        // `store-master-password` is the answer either way, and the socket
-        // check reports anything wrong with the path itself.
-        let dir = tempfile::tempdir().unwrap();
-        let config = config_with_socket(dir.path());
-        std::fs::write(dir.path().join("agent.sock.master"), b"not ours").unwrap();
-        assert!(!master_password_seeded(&config));
-    }
-
-    fn expect_check(source: config::MasterPassword, available: bool, seeded: bool) -> Check {
-        master_password_check(source, available, seeded)
-    }
-
-    #[test]
     fn the_prompt_source_passes_without_needing_anything() {
-        let check = expect_check(config::MasterPassword::Prompt, false, false);
+        let check = master_password_check(config::MasterPassword::Prompt, false);
         assert!(check.ok, "{}", check.detail);
         assert!(check.detail.contains("held only"), "{}", check.detail);
     }
 
     #[test]
     fn touchid_without_an_enclave_fails_and_names_the_alternative() {
-        let check = expect_check(config::MasterPassword::TouchId, false, false);
+        let check = master_password_check(config::MasterPassword::TouchId, false);
         assert!(!check.ok);
         assert!(check.detail.contains("\"prompt\""), "{}", check.detail);
     }
 
     #[test]
-    fn touchid_with_nothing_stored_fails_and_says_what_to_run() {
-        let check = expect_check(config::MasterPassword::TouchId, true, false);
-        assert!(!check.ok);
-        assert!(
-            check.detail.contains("store-master-password"),
-            "{}",
-            check.detail
-        );
-    }
-
-    #[test]
-    fn touchid_once_seeded_passes() {
-        let check = expect_check(config::MasterPassword::TouchId, true, true);
+    fn touchid_with_an_enclave_passes_and_says_where_it_is_kept() {
+        let check = master_password_check(config::MasterPassword::TouchId, true);
         assert!(check.ok, "{}", check.detail);
-        assert!(check.detail.contains("Touch ID"), "{}", check.detail);
+        assert!(check.detail.contains("never on disk"), "{}", check.detail);
     }
 
     #[test]

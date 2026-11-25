@@ -56,11 +56,12 @@ pub enum MasterPassword {
     /// running agent's memory.
     #[default]
     Prompt,
-    /// Kept encrypted to a key held in the Secure Enclave, which releases it
-    /// only on Touch ID — so it cannot be taken silently by anything able to
-    /// trigger a signature. Falls back to `prompt` when there is nothing stored
-    /// yet, when the fingerprint is declined, or when the key needs seeding
-    /// again. macOS only; rejected at load elsewhere.
+    /// Typed once after each start, then kept in the agent's memory encrypted
+    /// to a key held in the Secure Enclave, which releases it only on Touch ID
+    /// — so a lock costs a fingerprint rather than typing, and it cannot be
+    /// taken silently by anything able to trigger a signature. Never written
+    /// to disk. Falls back to `prompt` whenever the fingerprint is declined or
+    /// the key can no longer be used. macOS only; rejected at load elsewhere.
     #[serde(rename = "touchid")]
     TouchId,
 }

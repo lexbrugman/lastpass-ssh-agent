@@ -2,8 +2,10 @@
 //
 // Everything here would rather have been Rust. `security-framework` already
 // binds the calls that create a Secure Enclave key, attach an access control to
-// it, and run ECIES against it — but not the one that matters for a process
-// that exits. Apple documents the hole plainly: SecKeyCopyExternalRepresentation
+// it, and run ECIES against it — but not the one that turns a key back into
+// bytes, which is what lets nothing here outlive a call: the key is restored
+// from its blob for each use, under a context made for that use. Apple
+// documents the hole plainly: SecKeyCopyExternalRepresentation
 // "fails if the key is not exportable, for example if it is bound to a smart
 // card or to the Secure Enclave", so a key the keychain never took cannot be
 // written down from the Security framework at all. CryptoKit's
@@ -58,13 +60,6 @@ private let stageDecrypt: Int32 = 9
 
 /// Domain separation for the key derivation, so the bytes agreed here cannot
 /// double as a key for anything else that ever agrees the same secret.
-///
-/// Its `v1` is not `enclave::MAGIC`'s `v2` and must not be made to match. The
-/// magic versions the *file*, and was bumped when padding changed its layout;
-/// this versions the *derivation*, which has never changed. Changing this
-/// string derives a different key, so every password already stored becomes
-/// permanently unreadable — bump it only to deliberately invalidate them all,
-/// and never to tidy up the numbers.
 private let salt = Data("lastpass-ssh-agent secure enclave v1".utf8)
 
 /// An uncompressed P-256 point: `04 || X || Y`. The ciphertext carries the
@@ -117,9 +112,10 @@ public func lssha_se_available() -> Int32 {
 /// Create a key that only a fingerprint can use, and encrypt `secret` to it.
 ///
 /// Creating the key costs nothing: the access control is enforced when the key
-/// is *used*, so seeding never prompts. The blob and the ciphertext are both
-/// the caller's to store; neither is a secret, and neither is usable without
-/// this machine's Secure Enclave and a finger on the sensor.
+/// is *used*, so sealing never prompts. The blob and the ciphertext are both
+/// the caller's to keep; neither is usable without this machine's Secure
+/// Enclave and a finger on the sensor, and `enclave.rs` says why they stay in
+/// memory all the same.
 @_cdecl("lssha_se_seal")
 public func lssha_se_seal(
     _ secret: UnsafePointer<UInt8>,
@@ -138,8 +134,8 @@ public func lssha_se_seal(
     // `.biometryCurrentSet` rather than `.userPresence`: the login password is
     // not an acceptable substitute for a secret that opens the whole vault, and
     // enrolling a new finger must invalidate the key rather than inherit it.
-    // The cost is that a fingerprint change means seeding again, which the Rust
-    // side turns into a message saying so.
+    // The cost is that a fingerprint change means typing the password again,
+    // which the Rust side turns into a message saying so.
     var accessError: Unmanaged<CFError>?
     guard
         let access = SecAccessControlCreateWithFlags(
@@ -194,9 +190,9 @@ public func lssha_se_seal(
 
 /// Restore the key from its blob and decrypt — which is where Touch ID happens.
 ///
-/// The blob is inert: it is wrapped under a key that never leaves this
-/// machine's Enclave, and the access control travels inside it, so another
-/// binary loading the same file still has to ask for the same finger.
+/// The access control travels inside the blob, so a blob in other hands still
+/// has to ask for the same finger — and can: that is the reason it is never
+/// given to any.
 @_cdecl("lssha_se_open")
 public func lssha_se_open(
     _ blob: UnsafePointer<UInt8>,

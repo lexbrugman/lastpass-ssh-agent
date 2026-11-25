@@ -1,20 +1,21 @@
-//! What the Secure Enclave shim's answers mean, and how its two outputs are
-//! written down.
+//! The master password sealed to the Secure Enclave, kept in this process's
+//! memory — and what the Enclave shim's answers mean.
+//!
+//! Sealed is encrypted to a key that never leaves this machine's Enclave and
+//! that macOS will not use without a fingerprint. Neither the wrapped key nor
+//! the ciphertext is a secret, and both stay in memory all the same, never in
+//! a file: on disk, any process of the user's could load them and raise the
+//! same Touch ID sheet under a name of its choosing, and one fingerprint would
+//! hand it the vault. In here they are behind `platform::harden`, as the
+//! password itself is, and gone when the agent exits — so the first unlock
+//! after a start is typed.
 //!
 //! The shim itself is Swift behind a `cfg`, so only one CI job can reach it and
 //! nobody without a Mac can compile it. Everything that is a *decision* lives
 //! here instead: which stage of a failed call means what, what to tell the user
-//! about it, and the format of the file the blob and the ciphertext are kept
-//! in. All of it is ordinary logic over integers and bytes, so it is tested on
-//! every platform — which leaves the `cfg`-gated part with nothing in it but
-//! three calls.
-//!
-//! Neither of the two stored values is a secret. The blob is a key wrapped
-//! under a key that never leaves this machine's Enclave, and the ciphertext
-//! cannot be opened without it; both are useless on any other computer, and
-//! useless on this one without the sensor. They are still written 0600, on the
-//! principle that nothing about the arrangement should be easier to read than
-//! it has to be.
+//! about it, and when a sealed copy is kept, replaced and dropped. All of it is
+//! ordinary logic over integers and bytes, so it is tested on every platform —
+//! which leaves the `cfg`-gated part with nothing in it but three calls.
 
 // Only macOS has anything to call this, but it is compiled and tested
 // everywhere on purpose — that is what keeps the `cfg`-gated adapter down to
@@ -27,11 +28,11 @@
     )
 )]
 
-use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use zeroize::Zeroizing;
 
-use crate::error::{Error, Result};
+use crate::master::MasterPasswordStore;
 
 /// Where a shim call stopped, for the stages this tells apart. They mirror
 /// `swift/secure_enclave.swift` and must be changed together.
@@ -68,10 +69,9 @@ pub enum Outcome {
     /// Nobody proved presence — cancelled, timed out, no session to ask in.
     /// Ordinary, and never treated as a broken store.
     Refused,
-    /// The stored key cannot be used again and only seeding fixes it. A
-    /// fingerprint added or removed since it was created invalidates it by
-    /// design, and so does a truncated file.
-    Reseed,
+    /// The sealed copy cannot be opened again, by anyone. A fingerprint added
+    /// or removed since it was sealed invalidates the key by design.
+    Lost,
     /// Something else went wrong. The raw code goes in the message, because
     /// this is the case where the code is the only clue.
     Failed(i32),
@@ -88,12 +88,12 @@ pub fn meaning(stage: i32, os_error: i32) -> Outcome {
     match stage {
         STAGE_OK => Outcome::Done,
         STAGE_UNAVAILABLE => Outcome::Unavailable,
-        // Three ways for the stored state to be past saving: the blob would
-        // not load at all, the ciphertext is too short to be one, or it would
-        // not open despite a fingerprint that worked. None of them can ever
-        // yield the secret again, so all three ask for seeding rather than
-        // reporting a fault the user could do nothing about.
-        STAGE_RESTORE | STAGE_MALFORMED | STAGE_DECRYPT => Outcome::Reseed,
+        // Three ways for the sealed copy to be past saving: the blob would not
+        // load at all, the ciphertext is too short to be one, or it would not
+        // open despite a fingerprint that worked. None of them can ever yield
+        // the secret again, so all three are a copy to drop rather than a
+        // fault the user could do something about.
+        STAGE_RESTORE | STAGE_MALFORMED | STAGE_DECRYPT => Outcome::Lost,
         STAGE_AGREEMENT if NOT_AUTHENTICATED.contains(&os_error) => Outcome::Refused,
         _ => Outcome::Failed(os_error),
     }
@@ -102,331 +102,140 @@ pub fn meaning(stage: i32, os_error: i32) -> Outcome {
 impl Outcome {
     /// How this reads in the agent's log.
     ///
-    /// Every one of these ends up in the same place: an `info` line saying the
-    /// store could not answer, followed by the prompt. So they are written to
-    /// tell the user what to do, not to sound like an error.
+    /// Every one of these ends up in the same place: a line saying the store
+    /// could not answer, followed by the prompt. So they are written to tell
+    /// the user what happens next, not to sound like an error.
     pub fn describe(self) -> String {
         match self {
             Self::Done => "the Secure Enclave answered".into(),
             Self::Unavailable => "this Mac has no Secure Enclave".into(),
             Self::Refused => "Touch ID was not confirmed".into(),
-            Self::Reseed => {
-                "what is stored can no longer be opened — a fingerprint added or removed \
-                 since it was kept will do that, and so will a damaged file — so run \
-                 `lastpass-ssh-agent store-master-password` again"
-                    .into()
-            }
+            Self::Lost => "what was kept behind Touch ID can no longer be opened — a \
+                           fingerprint added or removed since will do that — so the master \
+                           password is asked for, and kept afresh"
+                .into(),
             Self::Failed(code) => format!("the Secure Enclave refused the request (code {code})"),
         }
     }
 }
 
-/// The size every secret is sealed at, whatever its own length.
+/// The room the shim is given to write a blob and a ciphertext into.
 ///
-/// AES-GCM does not pad, so without this the ciphertext would be exactly the
-/// master password plus a fixed 93 bytes — and `stat` on the stored file would
-/// disclose how long the password is to anyone who can read the directory.
-/// That is a small leak, since reading it at all means already being this user,
-/// but it narrows a guess for nothing gained. Padding to a constant costs a
-/// kilobyte on disk and removes it: every stored file is now the same size.
-///
-/// Two bytes of length in front, then the secret, then zeros. The cap fits in
-/// those two bytes with room to spare.
-pub const PADDED_LEN: usize = 2 + crate::passphrase::MAX_PASSPHRASE_BYTES;
-
-/// Put a secret into a fixed-size block.
-///
-/// One allocation, at its final size — the rule for every buffer holding a
-/// secret here.
-pub fn pad(secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-    if secret.len() > crate::passphrase::MAX_PASSPHRASE_BYTES {
-        return Err(Error::State(format!(
-            "a master password longer than {} bytes cannot be stored",
-            crate::passphrase::MAX_PASSPHRASE_BYTES
-        )));
-    }
-    let mut block = Zeroizing::new(vec![0u8; PADDED_LEN]);
-    let len = u16::try_from(secret.len()).expect("the cap just checked is far below u16::MAX");
-    block[..2].copy_from_slice(&len.to_be_bytes());
-    block[2..2 + secret.len()].copy_from_slice(secret);
-    Ok(block)
-}
-
-/// Take one back out again.
-///
-/// Consumes the block and shortens it in place rather than copying the secret
-/// into a buffer of its own, for the same one-allocation reason as `pad`.
-/// Truncating is safe to do to a secret: zeroizing a `Vec` wipes its whole
-/// capacity, not just the part still in view.
-pub fn unpad(padded: Zeroizing<Vec<u8>>) -> Result<Zeroizing<Vec<u8>>> {
-    let mut padded = padded;
-    if padded.len() != PADDED_LEN {
-        return Err(malformed("not a block this wrote"));
-    }
-    let len = usize::from(u16::from_be_bytes([padded[0], padded[1]]));
-    if len > crate::passphrase::MAX_PASSPHRASE_BYTES {
-        return Err(malformed("a length larger than anything this stores"));
-    }
-    padded.copy_within(2..2 + len, 0);
-    padded.truncate(len);
-    Ok(padded)
-}
-
-/// What a finished unwrap means to a `MasterPasswordStore`.
-///
-/// `master::resolve` asks for the password either way — a store that will not
-/// answer never refuses a signature — so the distinction this draws is what
-/// the log tells the user to do about it. *Empty* is reported as nothing
-/// stored yet, with `store-master-password` named as the fix; an error is
-/// reported as a store that could not be read this time. So exactly one
-/// failure must read as empty:
-///
-/// - `Reseed` — the key cannot be used again, by anyone, ever: the
-///   fingerprints it was bound to have changed. Nothing is recoverable behind
-///   it, and running `store-master-password` again is the only way out, so
-///   that is what has to be named.
-/// - everything else — a declined fingerprint above all — may well be sitting
-///   on a working secret. Calling that "nothing stored" would send someone to
-///   store it again when all it wanted was a fingerprint.
-pub fn unwrapped(
-    result: std::result::Result<Zeroizing<Vec<u8>>, Outcome>,
-) -> std::result::Result<Option<Zeroizing<Vec<u8>>>, String> {
-    match result {
-        // Whatever the Enclave handed back still has to be a block this wrote.
-        // If it is not, the fingerprint was given and the decryption worked and
-        // the contents are still not ours — which is as past saving as a key
-        // that will not load, and reads as empty for the same reason.
-        Ok(padded) => Ok(unpad(padded).map_or_else(|_| past_saving(), Some)),
-        Err(Outcome::Reseed) => Ok(past_saving()),
-        Err(other) => Err(other.describe()),
-    }
-}
-
-/// Stored state that can never produce the secret again, reported as an empty
-/// store so that seeding may replace it.
-///
-/// Said here rather than left to the caller's "nothing stored yet", which would
-/// be true but would not explain why it stopped working.
-fn past_saving() -> Option<Zeroizing<Vec<u8>>> {
-    tracing::warn!("{}", Outcome::Reseed.describe());
-    None
-}
-
-/// Longest blob and ciphertext this will read back.
-///
-/// A wrapped P-256 key runs to a few hundred bytes and the ciphertext is one
-/// padded block plus a fixed 93, so both of these are far above anything this
-/// code writes. They are here because the file is on disk where anything
-/// could rewrite it: a length field is not a promise, and a header claiming
-/// four gigabytes must be refused rather than allocated.
+/// A wrapped P-256 key runs to a few hundred bytes, and the ciphertext is the
+/// secret plus a fixed 93, so both are far above anything it produces. Past
+/// either it refuses rather than truncates.
 pub const MAX_BLOB: usize = 4096;
 pub const MAX_CIPHER: usize = 4096;
 
-/// Says whose file this is and which arrangement it belongs to. A later format
-/// gets a later magic, so an old file is refused rather than misread.
-///
-/// Bumping it makes every stored file foreign, so every user is asked to seed
-/// again — which costs one command and no secret, since the master password was
-/// never only here. Do that rather than teach this to read an older layout: a
-/// block that is not one this wrote must stay detectable, because that is what
-/// catches a corrupted ciphertext. The salt in `swift/secure_enclave.swift`
-/// also looks like a version and is not this one.
-const MAGIC: &[u8] = b"lastpass-ssh-agent secure enclave v2\n";
-
-/// The blob and the ciphertext, as they sit on disk.
+/// A sealed secret: the Enclave key's wrapped blob, and the ciphertext only
+/// that key opens.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Stored {
+pub struct Sealed {
     pub blob: Vec<u8>,
     pub cipher: Vec<u8>,
 }
 
-impl Stored {
-    /// One allocation, sized before anything is written into it.
-    ///
-    /// Refuses the same sizes `decode` refuses, so the two cannot disagree
-    /// about what this format can hold — writing a file that will not read back
-    /// would strand a working key.
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(MAGIC.len() + 8 + self.blob.len() + self.cipher.len());
-        out.extend_from_slice(MAGIC);
-        for (part, max) in [(&self.blob, MAX_BLOB), (&self.cipher, MAX_CIPHER)] {
-            if part.len() > max {
-                return Err(malformed("a value larger than this format holds"));
-            }
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "the cap checked immediately above is far below u32::MAX"
-            )]
-            out.extend_from_slice(&(part.len() as u32).to_be_bytes());
-            out.extend_from_slice(part);
-        }
-        Ok(out)
-    }
-
-    /// Read one back, refusing anything that is not exactly what was written.
-    ///
-    /// Trailing bytes are an error rather than something to ignore: this file
-    /// is written whole every time, so extra bytes mean it is not the file this
-    /// code thinks it is.
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let rest = bytes
-            .strip_prefix(MAGIC)
-            .ok_or_else(|| malformed("not this agent's Secure Enclave file"))?;
-        let (blob, rest) = take(rest, MAX_BLOB)?;
-        let (cipher, rest) = take(rest, MAX_CIPHER)?;
-        if !rest.is_empty() {
-            return Err(malformed("trailing bytes"));
-        }
-        Ok(Self {
-            blob: blob.to_vec(),
-            cipher: cipher.to_vec(),
-        })
-    }
-}
-
-/// One length-prefixed field, bounded by what it is allowed to be.
-fn take(bytes: &[u8], max: usize) -> Result<(&[u8], &[u8])> {
-    let (header, rest) = bytes
-        .split_first_chunk::<4>()
-        .ok_or_else(|| malformed("truncated length"))?;
-    let len = u32::from_be_bytes(*header) as usize;
-    if len > max {
-        return Err(malformed("a length larger than anything this writes"));
-    }
-    rest.split_at_checked(len)
-        .ok_or_else(|| malformed("truncated value"))
-}
-
-/// Where the blob and ciphertext live: beside the socket, for the reason
-/// `identities::path_for` gives.
-pub fn path_for(socket: &Path) -> PathBuf {
-    socket.with_added_extension("master")
-}
-
-/// Read it back, or `None` when there is nothing stored yet.
+/// The Enclave's two operations, as the shim performs them.
 ///
-/// Bounded, because a file on disk is not necessarily the file this wrote. One
-/// byte past the largest thing `save` can produce is read deliberately: an
-/// oversized file then fails to decode, rather than being cut down to a length
-/// that happens to parse.
-pub fn load(path: &Path) -> Result<Option<Stored>> {
-    use std::io::Read as _;
+/// Blocking, both: opening waits on the fingerprint sensor for as long as the
+/// person takes. A trait so that everything `Kept` decides around them is
+/// tested without a Mac.
+pub trait Enclave: Send + Sync + 'static {
+    /// Make a new key and encrypt the secret to it. Never prompts: the access
+    /// control is enforced when a key is used, not when it is made.
+    fn seal(&self, secret: &[u8]) -> Result<Sealed, Outcome>;
+    /// Decrypt, which is where the fingerprint is asked for.
+    fn open(&self, sealed: &Sealed) -> Result<Zeroizing<Vec<u8>>, Outcome>;
+}
 
-    // This name is derived from a path the user chooses, so something else can
-    // be sitting on it — and a FIFO would make this read wait for a writer
-    // that never comes, on the one thread the agent serves every connection
-    // from. `open_regular` settles that on the open file rather than on the
-    // path, so nothing can be swapped in between the two.
-    let Some(file) = crate::files::open_regular(path)? else {
-        return Ok(None);
-    };
+/// The master-password store `touchid` uses: one sealed copy, held here.
+pub struct Kept {
+    enclave: Arc<dyn Enclave>,
+    sealed: Mutex<Option<Arc<Sealed>>>,
+}
 
-    let limit = MAGIC.len() + 8 + MAX_BLOB + MAX_CIPHER + 1;
-    let mut bytes = Vec::with_capacity(limit);
-    file.take(limit as u64).read_to_end(&mut bytes)?;
-
-    match Stored::decode(&bytes) {
-        Ok(stored) => Ok(Some(stored)),
-        // Bytes that will not decode hold nothing recoverable, exactly like a
-        // key that will not load, and are treated the same way: an empty store
-        // rather than an unreadable one. Reported as an error they would make
-        // `store-master-password` refuse to replace them — the one command that
-        // repairs this — and the file would have to be deleted by hand.
-        //
-        // Not the same as a read that *failed*: there the contents are unknown,
-        // something usable may be there, and seeding must not overwrite it.
-        Err(e) => {
-            tracing::warn!("{e}");
-            Ok(None)
+impl Kept {
+    pub fn new(enclave: Arc<dyn Enclave>) -> Self {
+        Self {
+            enclave,
+            sealed: Mutex::new(None),
         }
+    }
+
+    fn sealed(&self) -> MutexGuard<'_, Option<Arc<Sealed>>> {
+        self.sealed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// Write it, replacing whatever was there. 0600 because it is the agent's own
-/// state; `files::write_private` explains why the write is staged and renamed.
-pub fn save(path: &Path, stored: &Stored) -> Result<()> {
-    crate::files::write_private(path, &stored.encode()?, 0o600)
+#[async_trait::async_trait]
+impl MasterPasswordStore for Kept {
+    fn name(&self) -> &'static str {
+        "the Secure Enclave"
+    }
+
+    async fn get(&self) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+        let Some(sealed) = self.sealed().clone() else {
+            return Ok(None);
+        };
+        let enclave = self.enclave.clone();
+        match blocking(move || enclave.open(&sealed)).await? {
+            Ok(secret) => Ok(Some(secret)),
+            // Dropped, and reported as nothing kept: asking the Enclave again
+            // would cost a fingerprint for an answer that cannot change.
+            Err(Outcome::Lost) => {
+                *self.sealed() = None;
+                tracing::warn!("{}", Outcome::Lost.describe());
+                Ok(None)
+            }
+            // A declined fingerprint above all: the copy is still good, and
+            // the next unlock may ask for it again.
+            Err(other) => Err(other.describe()),
+        }
+    }
+
+    async fn set(&self, secret: &[u8]) -> Result<(), String> {
+        // The copy that crosses to the blocking thread: one allocation, wiped
+        // there when the call ends.
+        let secret = Zeroizing::new(secret.to_vec());
+        let enclave = self.enclave.clone();
+        let sealed = blocking(move || enclave.seal(&secret))
+            .await?
+            .map_err(Outcome::describe)?;
+        *self.sealed() = Some(Arc::new(sealed));
+        Ok(())
+    }
+
+    async fn forget(&self) {
+        *self.sealed() = None;
+    }
 }
 
-fn malformed(why: &str) -> Error {
-    Error::State(format!(
-        "the stored Secure Enclave key is unreadable ({why}) — run \
-         `lastpass-ssh-agent store-master-password` again"
-    ))
+/// Run one Enclave call off the runtime thread: the agent runs on one, and a
+/// Touch ID sheet inline would freeze every other connection until somebody
+/// noticed it.
+async fn blocking<T: Send + 'static>(
+    call: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(call)
+        .await
+        .map_err(did_not_finish)
+}
+
+/// The call panicked, which is reported rather than propagated: the same
+/// secret is still reachable by asking for it.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "by value is what map_err hands a function"
+)]
+fn did_not_finish(e: tokio::task::JoinError) -> String {
+    format!("the Secure Enclave call did not finish: {e}")
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-
-    fn sample() -> Stored {
-        Stored {
-            blob: vec![1, 2, 3, 4, 5],
-            cipher: vec![9, 8, 7],
-        }
-    }
-
-    #[test]
-    fn a_written_file_reads_back_identical() {
-        assert_eq!(
-            Stored::decode(&sample().encode().unwrap()).unwrap(),
-            sample()
-        );
-    }
-
-    #[test]
-    fn empty_parts_survive_the_round_trip() {
-        let empty = Stored {
-            blob: Vec::new(),
-            cipher: Vec::new(),
-        };
-        assert_eq!(Stored::decode(&empty.encode().unwrap()).unwrap(), empty);
-    }
-
-    fn expect_rejected(bytes: &[u8], case: &str) {
-        let error = Stored::decode(bytes).unwrap_err().to_string();
-        assert!(error.contains("store-master-password"), "{case}: {error}");
-    }
-
-    #[test]
-    fn a_file_from_something_else_is_refused() {
-        expect_rejected(b"some other file entirely", "wrong magic");
-    }
-
-    #[test]
-    fn a_file_cut_short_in_its_header_is_refused() {
-        let encoded = sample().encode().unwrap();
-        expect_rejected(&encoded[..MAGIC.len() + 2], "truncated length");
-    }
-
-    #[test]
-    fn a_file_cut_short_in_its_value_is_refused() {
-        let encoded = sample().encode().unwrap();
-        expect_rejected(&encoded[..encoded.len() - 1], "truncated value");
-    }
-
-    #[test]
-    fn a_length_beyond_the_cap_is_refused_without_allocating() {
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
-        expect_rejected(&bytes, "huge length");
-    }
-
-    #[test]
-    fn a_second_length_beyond_the_cap_is_refused() {
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend_from_slice(&0u32.to_be_bytes());
-        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
-        expect_rejected(&bytes, "huge second length");
-    }
-
-    #[test]
-    fn anything_after_the_last_value_is_refused() {
-        let mut encoded = sample().encode().unwrap();
-        encoded.push(0);
-        expect_rejected(&encoded, "trailing bytes");
-    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn expect_meaning(stage: i32, os_error: i32, expected: Outcome) {
         assert_eq!(
@@ -447,20 +256,20 @@ mod tests {
     }
 
     #[test]
-    fn a_blob_that_will_not_load_asks_for_seeding() {
-        expect_meaning(STAGE_RESTORE, -25293, Outcome::Reseed);
+    fn a_blob_that_will_not_load_is_lost() {
+        expect_meaning(STAGE_RESTORE, -25293, Outcome::Lost);
     }
 
     #[test]
-    fn a_ciphertext_that_is_too_short_asks_for_seeding() {
-        expect_meaning(STAGE_MALFORMED, 0, Outcome::Reseed);
+    fn a_ciphertext_that_is_too_short_is_lost() {
+        expect_meaning(STAGE_MALFORMED, 0, Outcome::Lost);
     }
 
     #[test]
-    fn a_ciphertext_that_will_not_open_asks_for_seeding() {
+    fn a_ciphertext_that_will_not_open_is_lost() {
         // The fingerprint was given and the agreement worked, so this is not a
-        // fault anyone can retry past — the stored bytes are simply gone.
-        expect_meaning(STAGE_DECRYPT, -1, Outcome::Reseed);
+        // fault anyone can retry past.
+        expect_meaning(STAGE_DECRYPT, -1, Outcome::Lost);
     }
 
     #[test]
@@ -477,191 +286,12 @@ mod tests {
 
     /// The stages this deliberately does not name: a buffer too small, an
     /// access control that would not build, a key that would not create, a box
-    /// that would not open — and a stage from some later shim.
+    /// that would not seal — and a stage from some later shim.
     #[test]
     fn every_other_stage_is_a_failure_carrying_its_code() {
         for stage in [1, 3, 4, 7, 99] {
             expect_meaning(stage, -5, Outcome::Failed(-5));
         }
-    }
-
-    fn expect_round_trip(secret: &[u8], case: &str) {
-        let block = pad(secret).unwrap();
-        assert_eq!(block.len(), PADDED_LEN, "{case}: padded to a constant");
-        assert_eq!(&*unpad(block).unwrap(), secret, "{case}");
-    }
-
-    #[test]
-    fn a_padded_secret_comes_back_unchanged() {
-        expect_round_trip(b"", "empty");
-        expect_round_trip(b"x", "one byte");
-        expect_round_trip(b"correct horse battery staple", "ordinary");
-        expect_round_trip(
-            &vec![b'z'; crate::passphrase::MAX_PASSPHRASE_BYTES],
-            "exactly at the cap",
-        );
-    }
-
-    #[test]
-    fn the_padded_size_says_nothing_about_the_secret() {
-        // The whole point: two secrets of very different lengths must be
-        // indistinguishable by size, or the stored file discloses how long the
-        // master password is to anyone who can stat it.
-        assert_eq!(pad(b"a").unwrap().len(), pad(&[b'a'; 900]).unwrap().len());
-    }
-
-    #[test]
-    fn a_secret_beyond_the_cap_is_refused() {
-        let error = pad(&vec![0; crate::passphrase::MAX_PASSPHRASE_BYTES + 1])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("cannot be stored"), "{error}");
-    }
-
-    #[test]
-    fn a_block_of_the_wrong_size_is_refused() {
-        // What an older format, or anything else that happened to decrypt,
-        // would look like.
-        assert!(unpad(Zeroizing::new(vec![0; PADDED_LEN - 1])).is_err());
-        assert!(unpad(Zeroizing::new(vec![0; PADDED_LEN + 1])).is_err());
-    }
-
-    #[test]
-    fn a_block_claiming_more_than_it_holds_is_refused() {
-        let mut block = vec![0; PADDED_LEN];
-        block[..2].copy_from_slice(&u16::MAX.to_be_bytes());
-        assert!(unpad(Zeroizing::new(block)).is_err());
-    }
-
-    #[test]
-    fn a_block_that_will_not_unpad_reads_as_an_empty_store() {
-        // Decryption succeeded and the contents are still not ours: as past
-        // saving as a key that will not load, and treated the same way.
-        assert_eq!(unwrapped(Ok(Zeroizing::new(vec![0; 3]))).unwrap(), None);
-    }
-
-    #[test]
-    fn an_unwrapped_secret_comes_back() {
-        let block = pad(b"master").unwrap();
-        assert_eq!(unwrapped(Ok(block)).unwrap().unwrap().as_slice(), b"master");
-    }
-
-    #[test]
-    fn a_key_that_can_never_work_again_reads_as_an_empty_store() {
-        // The one failure that must not look like "could not ask": seeding
-        // refuses to overwrite a store it cannot read, so reporting this as an
-        // error would make `store-master-password` refuse to repair it.
-        assert_eq!(unwrapped(Err(Outcome::Reseed)).unwrap(), None);
-    }
-
-    #[test]
-    fn every_other_failure_stays_a_failure() {
-        // Especially a declined prompt: something usable may be stored, and
-        // calling that "empty" would let the next seed overwrite it.
-        for outcome in [Outcome::Refused, Outcome::Unavailable, Outcome::Failed(-1)] {
-            let error = unwrapped(Err(outcome)).unwrap_err();
-            assert_eq!(error, outcome.describe(), "{outcome:?}");
-        }
-    }
-
-    #[test]
-    fn writing_more_than_the_format_holds_is_refused() {
-        // Both fields, because a cap enforced on only one of them would let a
-        // file be written that `decode` then refuses to read back.
-        for stored in [
-            Stored {
-                blob: vec![0; MAX_BLOB + 1],
-                cipher: Vec::new(),
-            },
-            Stored {
-                blob: Vec::new(),
-                cipher: vec![0; MAX_CIPHER + 1],
-            },
-        ] {
-            let error = stored.encode().unwrap_err().to_string();
-            assert!(error.contains("store-master-password"), "{error}");
-        }
-    }
-
-    #[test]
-    fn a_file_that_cannot_be_read_is_an_error_not_an_absence() {
-        // "Nothing stored" and "something is there but unreadable" must not
-        // look alike: the second would silently seed over a working key.
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stored");
-        save(&path, &sample()).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(load(&path).is_err());
-    }
-
-    #[test]
-    fn the_stored_file_sits_beside_the_socket() {
-        assert_eq!(
-            path_for(Path::new("/run/user/1000/agent.sock")),
-            Path::new("/run/user/1000/agent.sock.master")
-        );
-    }
-
-    #[test]
-    fn nothing_stored_yet_is_not_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load(&dir.path().join("absent")).unwrap(), None);
-    }
-
-    #[test]
-    fn what_was_saved_is_what_loads() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stored");
-        save(&path, &sample()).unwrap();
-        assert_eq!(load(&path).unwrap().unwrap(), sample());
-    }
-
-    #[test]
-    fn saving_twice_replaces_rather_than_appends() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stored");
-        save(&path, &sample()).unwrap();
-        let second = Stored {
-            blob: vec![7; 40],
-            cipher: vec![6; 20],
-        };
-        save(&path, &second).unwrap();
-        assert_eq!(load(&path).unwrap().unwrap(), second);
-    }
-
-    #[test]
-    fn the_stored_file_is_readable_only_by_its_owner() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stored");
-        save(&path, &sample()).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
-    }
-
-    /// Bytes that will not decode read as an empty store rather than a broken
-    /// one, so `store-master-password` can replace them. An error here would
-    /// make the documented repair refuse to run.
-    fn expect_reads_as_empty(bytes: &[u8], case: &str) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stored");
-        std::fs::write(&path, bytes).unwrap();
-        assert_eq!(load(&path).unwrap(), None, "{case}");
-    }
-
-    #[test]
-    fn a_file_larger_than_anything_this_writes_reads_as_empty() {
-        let mut bytes = sample().encode().unwrap();
-        bytes.resize(MAGIC.len() + 8 + MAX_BLOB + MAX_CIPHER + 64, 0);
-        expect_reads_as_empty(&bytes, "oversized");
-    }
-
-    #[test]
-    fn a_truncated_or_foreign_file_reads_as_empty() {
-        let encoded = sample().encode().unwrap();
-        expect_reads_as_empty(&encoded[..encoded.len() - 1], "truncated");
-        expect_reads_as_empty(b"some other file entirely", "not ours");
     }
 
     #[test]
@@ -670,11 +300,128 @@ mod tests {
             (Outcome::Done, "answered"),
             (Outcome::Unavailable, "no Secure Enclave"),
             (Outcome::Refused, "Touch ID"),
-            (Outcome::Reseed, "store-master-password"),
+            (Outcome::Lost, "kept afresh"),
             (Outcome::Failed(-7), "code -7"),
         ] {
             let described = outcome.describe();
             assert!(described.contains(expected), "{outcome:?}: {described}");
         }
+    }
+
+    /// An Enclave that "seals" by keeping the secret as the blob, and opens
+    /// with whatever the case says the sensor did.
+    #[derive(Default)]
+    struct FakeEnclave {
+        seal_fails: Option<Outcome>,
+        open_fails: Mutex<Option<Outcome>>,
+        opened: AtomicUsize,
+    }
+
+    impl FakeEnclave {
+        fn opening_fails_with(&self, outcome: Option<Outcome>) {
+            *self.open_fails.lock().unwrap() = outcome;
+        }
+        fn opened(&self) -> usize {
+            self.opened.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Enclave for FakeEnclave {
+        fn seal(&self, secret: &[u8]) -> Result<Sealed, Outcome> {
+            self.seal_fails.map_or_else(
+                || {
+                    Ok(Sealed {
+                        blob: secret.to_vec(),
+                        cipher: Vec::new(),
+                    })
+                },
+                Err,
+            )
+        }
+        fn open(&self, sealed: &Sealed) -> Result<Zeroizing<Vec<u8>>, Outcome> {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            let fails = *self.open_fails.lock().unwrap();
+            fails.map_or_else(|| Ok(Zeroizing::new(sealed.blob.clone())), Err)
+        }
+    }
+
+    fn kept() -> (Kept, Arc<FakeEnclave>) {
+        let enclave = Arc::new(FakeEnclave::default());
+        (Kept::new(enclave.clone()), enclave)
+    }
+
+    #[tokio::test]
+    async fn nothing_kept_is_nothing_to_ask_the_enclave_for() {
+        let (store, enclave) = kept();
+        assert_eq!(store.get().await.unwrap(), None);
+        assert_eq!(enclave.opened(), 0, "no fingerprint asked for");
+        assert_eq!(store.name(), "the Secure Enclave");
+    }
+
+    #[tokio::test]
+    async fn what_was_sealed_is_what_opens() {
+        let (store, _enclave) = kept();
+        store.set(b"master").await.unwrap();
+        assert_eq!(store.get().await.unwrap().unwrap().as_slice(), b"master");
+    }
+
+    #[tokio::test]
+    async fn sealing_again_replaces_what_was_kept() {
+        let (store, _enclave) = kept();
+        store.set(b"first").await.unwrap();
+        store.set(b"second").await.unwrap();
+        assert_eq!(store.get().await.unwrap().unwrap().as_slice(), b"second");
+    }
+
+    #[tokio::test]
+    async fn a_declined_fingerprint_is_an_error_and_the_copy_survives_it() {
+        // Calling this "nothing kept" would cost a typed password for what
+        // only wanted a fingerprint.
+        let (store, enclave) = kept();
+        store.set(b"master").await.unwrap();
+        enclave.opening_fails_with(Some(Outcome::Refused));
+        assert_eq!(store.get().await.unwrap_err(), "Touch ID was not confirmed");
+        enclave.opening_fails_with(None);
+        assert_eq!(store.get().await.unwrap().unwrap().as_slice(), b"master");
+    }
+
+    #[tokio::test]
+    async fn a_copy_that_can_never_open_again_is_dropped() {
+        let (store, enclave) = kept();
+        store.set(b"master").await.unwrap();
+        enclave.opening_fails_with(Some(Outcome::Lost));
+        assert_eq!(store.get().await.unwrap(), None);
+        assert_eq!(store.get().await.unwrap(), None);
+        assert_eq!(enclave.opened(), 1, "not asked a second fingerprint for it");
+    }
+
+    #[tokio::test]
+    async fn a_call_that_panics_is_an_error_not_a_crash() {
+        let error = blocking::<()>(|| panic!("the enclave fell over"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("did not finish"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn forgetting_drops_the_copy() {
+        let (store, enclave) = kept();
+        store.set(b"master").await.unwrap();
+        store.forget().await;
+        assert_eq!(store.get().await.unwrap(), None);
+        assert_eq!(enclave.opened(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_enclave_that_will_not_seal_keeps_nothing() {
+        let store = Kept::new(Arc::new(FakeEnclave {
+            seal_fails: Some(Outcome::Unavailable),
+            ..FakeEnclave::default()
+        }));
+        assert_eq!(
+            store.set(b"master").await.unwrap_err(),
+            "this Mac has no Secure Enclave"
+        );
+        assert_eq!(store.get().await.unwrap(), None);
     }
 }

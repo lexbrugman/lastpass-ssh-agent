@@ -216,55 +216,6 @@ pub async fn discover_ssh_key_items(
     Ok(found)
 }
 
-/// End the `lpass` agent process a shell may have left holding the vault's
-/// derived key, so that the next call has to be given the master password.
-///
-/// Only `store-master-password` wants this: it is the one way to learn whether
-/// a candidate password opens the vault, because `lpass` reads that agent
-/// before it reads stdin. The running agent never does it — a vault the user
-/// opened themselves is theirs to leave open.
-///
-/// `true` once no such process is holding a key, whether one was ended or none
-/// was running.
-///
-/// Identified by command line rather than by name: the agent rewrites its argv
-/// to `lpass [agent]`, and on macOS the rewritten title runs into the
-/// environment that followed it, so only the prefix is dependable.
-///
-/// Excluded from coverage, and deliberately: exercising the path that actually
-/// matches something would mean killing a process, and the only pattern worth
-/// testing is the real one — which on a developer's own machine is their live
-/// vault session.
-#[cfg_attr(coverage_nightly, coverage(off))]
-pub async fn drop_shell_unlock() -> bool {
-    // `pkill` rather than walking the process table ourselves: finding a
-    // process by command line is /proc on Linux and sysctl on macOS, which is
-    // exactly the per-platform logic this design keeps out of the way for
-    // something the system already exposes as one command.
-    let killed = tokio::process::Command::new("pkill")
-        .arg("-f")
-        .arg(r"^lpass \[a")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .status()
-        .await;
-    // pkill's codes: 0 signalled something, 1 matched nothing, and 2 or 3 are
-    // its own failures. Only the first two mean no key is held now.
-    match killed.as_ref().map(std::process::ExitStatus::code) {
-        Ok(Some(0)) => {
-            tracing::info!("the shell's LastPass agent has been ended, so the vault is locked");
-            true
-        }
-        Ok(Some(1)) => true,
-        other => {
-            tracing::warn!("could not end the shell's LastPass agent ({other:?})");
-            false
-        }
-    }
-}
-
 /// Whether `text` is an item id as lpass prints them: decimal digits, at
 /// least one. Also what keeps an id from reading as an option when it is
 /// passed to lpass as an argument, so every id from outside — the config,

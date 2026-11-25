@@ -142,8 +142,6 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::List => commands::list::list(&config_path).await,
         Command::Search { query } => commands::list::search(&config_path, query.as_deref()).await,
-        Command::StoreMasterPassword => commands::master_password::store(&config_path).await,
-        Command::ForgetMasterPassword => commands::master_password::forget(&config_path).await,
     }
 }
 
