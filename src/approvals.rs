@@ -68,6 +68,9 @@ pub struct Voided;
 
 pub struct Approvals {
     enabled: bool,
+    /// Whether an approval for an unverified destination is remembered too;
+    /// `Config::remember_unverified_destinations` says what that gives up.
+    unverified: bool,
     epoch: Arc<LockEpoch>,
     /// Each remembered question, with the epoch it was answered in.
     remembered: Mutex<HashMap<String, u64>>,
@@ -77,9 +80,19 @@ impl Approvals {
     pub fn new(enabled: bool, epoch: Arc<LockEpoch>) -> Self {
         Self {
             enabled,
+            unverified: false,
             epoch,
             remembered: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub const fn remembering_unverified(mut self, unverified: bool) -> Self {
+        self.unverified = unverified;
+        self
+    }
+
+    pub const fn remembers_unverified(&self) -> bool {
+        self.unverified
     }
 
     /// Remembering nothing, which is the default.

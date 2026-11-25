@@ -64,10 +64,18 @@ fn crypto_err<E: std::fmt::Display>(e: E) -> SignError {
     SignError::Crypto(e.to_string())
 }
 
-/// Produce an SSH signature honoring the agent-protocol flags.
-///
-/// The session id a userauth request is for, when `data` is one — whole,
-/// for `public_key`, and in the host-bound form for `host_key`.
+/// A userauth request, as far as the agent has a use for it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Userauth<'a> {
+    pub session_id: &'a [u8],
+    /// Whether the signed data names the server's host key. A request that
+    /// does is good at that server alone; one that does not is good wherever
+    /// its session id is, and a session id says nothing about which server.
+    pub host_bound: bool,
+}
+
+/// The userauth request `data` is, when it is one — whole, for `public_key`,
+/// and in the host-bound form for `host_key`.
 ///
 /// What `ssh` asks an agent to sign for public-key authentication (RFC 4252
 /// §7, and OpenSSH's host-bound variant): the session id, the message
@@ -77,11 +85,11 @@ fn crypto_err<E: std::fmt::Display>(e: E) -> SignError {
 /// host in the middle could sign its own session id and pass the request
 /// off as one for the host beyond it. Anything shaped otherwise is `None`:
 /// a bound connection gets nothing else signed.
-pub fn userauth_session_id<'a>(
+pub fn userauth_request<'a>(
     data: &'a [u8],
     public_key: &[u8],
     host_key: &[u8],
-) -> Option<&'a [u8]> {
+) -> Option<Userauth<'a>> {
     const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
     let mut request = Wire(data);
     let session_id = request.string()?;
@@ -97,7 +105,10 @@ pub fn userauth_session_id<'a>(
     if host_bound {
         (request.string()? == host_key).then_some(())?;
     }
-    request.0.is_empty().then_some(session_id)
+    request.0.is_empty().then_some(Userauth {
+        session_id,
+        host_bound,
+    })
 }
 
 /// A `session-bind@openssh.com` request as OpenSSH lays it out: the host's
@@ -105,7 +116,7 @@ pub fn userauth_session_id<'a>(
 /// signature over it, and whether the agent is forwarded onward from there.
 ///
 /// The host key is kept as the bytes it arrived in. A host-bound userauth
-/// request carries the same bytes, so that is what `userauth_session_id`
+/// request carries the same bytes, so that is what `userauth_request`
 /// compares against — and when the host's key is a certificate, re-encoding
 /// it from the parsed key would drop the certificate and match nothing.
 pub struct SessionBindRequest<'a> {
@@ -313,7 +324,13 @@ mod tests {
             1,
         );
         let host = b"host key";
-        assert_eq!(userauth_session_id(&ok, key, host), Some(&b"sid"[..]));
+        assert_eq!(
+            userauth_request(&ok, key, host),
+            Some(Userauth {
+                session_id: b"sid",
+                host_bound: false
+            })
+        );
         let bound = userauth(
             &[
                 b"sid",
@@ -327,10 +344,16 @@ mod tests {
             50,
             1,
         );
-        assert_eq!(userauth_session_id(&bound, key, host), Some(&b"sid"[..]));
+        assert_eq!(
+            userauth_request(&bound, key, host),
+            Some(Userauth {
+                session_id: b"sid",
+                host_bound: true
+            })
+        );
         // bound to a host, for another: a host in the middle passing a
         // request off as one for the host beyond it
-        assert_eq!(userauth_session_id(&bound, key, b"other host"), None);
+        assert_eq!(userauth_request(&bound, key, b"other host"), None);
 
         // another message, another service, another method, no signature
         // flag, another key, trailing bytes, and a host-bound request
@@ -343,18 +366,12 @@ mod tests {
             b"ssh-ed25519",
             key,
         ];
-        assert_eq!(
-            userauth_session_id(&userauth(fields, 51, 1), key, host),
-            None
-        );
-        assert_eq!(
-            userauth_session_id(&userauth(fields, 50, 0), key, host),
-            None
-        );
-        assert_eq!(userauth_session_id(&ok, b"other", host), None);
+        assert_eq!(userauth_request(&userauth(fields, 51, 1), key, host), None);
+        assert_eq!(userauth_request(&userauth(fields, 50, 0), key, host), None);
+        assert_eq!(userauth_request(&ok, b"other", host), None);
         let mut trailing = ok;
         trailing.push(0);
-        assert_eq!(userauth_session_id(&trailing, key, host), None);
+        assert_eq!(userauth_request(&trailing, key, host), None);
         let wrong_service = userauth(
             &[
                 b"sid",
@@ -367,7 +384,7 @@ mod tests {
             50,
             1,
         );
-        assert_eq!(userauth_session_id(&wrong_service, key, host), None);
+        assert_eq!(userauth_request(&wrong_service, key, host), None);
         let wrong_method = userauth(
             &[
                 b"sid",
@@ -380,15 +397,15 @@ mod tests {
             50,
             1,
         );
-        assert_eq!(userauth_session_id(&wrong_method, key, host), None);
+        assert_eq!(userauth_request(&wrong_method, key, host), None);
         let mut unbound_host = bound.clone();
         unbound_host.truncate(bound.len() - 12);
-        assert_eq!(userauth_session_id(&unbound_host, key, host), None);
+        assert_eq!(userauth_request(&unbound_host, key, host), None);
         // and shapes that are not even a request
-        assert_eq!(userauth_session_id(&[0, 0, 0, 3, b'a'], key, host), None);
-        assert_eq!(userauth_session_id(&[0, 0], key, host), None);
-        assert_eq!(userauth_session_id(&[0, 0, 0, 0], key, host), None);
-        assert_eq!(userauth_session_id(b"x", key, host), None);
+        assert_eq!(userauth_request(&[0, 0, 0, 3, b'a'], key, host), None);
+        assert_eq!(userauth_request(&[0, 0], key, host), None);
+        assert_eq!(userauth_request(&[0, 0, 0, 0], key, host), None);
+        assert_eq!(userauth_request(b"x", key, host), None);
     }
     use signature::Verifier;
 

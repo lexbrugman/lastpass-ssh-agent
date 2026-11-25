@@ -212,9 +212,10 @@ impl LpassAgent {
         // host certificate serves many hosts under one key, and `ssh -A a`
         // then `ssh a` is a chain of two. Replaying a retained
         // binding this way buys a peer nothing: what it moves the connection
-        // to is a signature good only for that session with that host, which
-        // the same peer could have by connecting to that host afresh — and
-        // the prompt names the host and warns of the forwarding either way.
+        // to is a signature for that session, which the same peer could have
+        // by connecting to that host afresh — and the prompt names the host,
+        // warns of the forwarding, and says so when the request does not
+        // hold the signature to that host.
         if self.bindings.last().is_some_and(|last| !last.is_forwarding) {
             tracing::warn!(
                 "refusing a session binding: this connection is already bound to its \
@@ -410,13 +411,27 @@ impl LpassAgent {
     async fn approval_for(
         &self,
         entry: &KeyEntry,
+        unverified_destination: bool,
         gate: &mut InteractionGate,
     ) -> Result<Answer, AgentError> {
         // The host lookup first: it can wait on the filesystem, and nothing
         // about it needs the user, so no other request should stand behind it.
         let bindings = self.named_bindings().await;
-        let mut ctx = ConfirmContext::new(entry, self.peer, bindings);
-        let mut question = crate::confirm::approval_question(&ctx);
+        let describe = |bindings| ConfirmContext {
+            unverified_destination,
+            ..ConfirmContext::new(entry, self.peer, bindings)
+        };
+        // Past the first hop, a host the request does not name is the
+        // forwarded side's claim: an approval for it is not remembered, or
+        // whoever made the claim could reuse it for a session of their
+        // choosing — unless the config says to anyway.
+        let ask = |ctx: &ConfirmContext| {
+            (!unverified_destination || self.approvals.remembers_unverified())
+                .then(|| crate::confirm::approval_question(ctx))
+                .flatten()
+        };
+        let mut ctx = describe(bindings);
+        let mut question = ask(&ctx);
         let remembered = |question: &Option<String>| {
             question
                 .as_deref()
@@ -433,8 +448,8 @@ impl LpassAgent {
         let mut answered = remembered(&question);
         if answered.is_none() {
             gate.enter().await;
-            ctx = ConfirmContext::new(entry, self.peer, ctx.bindings);
-            question = crate::confirm::approval_question(&ctx);
+            ctx = describe(ctx.bindings);
+            question = ask(&ctx);
             answered = remembered(&question);
         }
         if let Some(epoch) = answered {
@@ -562,10 +577,19 @@ impl Session for LpassAgent {
         // could wear another's binding and the prompt would name the wrong
         // host; and data that is not a userauth request at all is not what
         // `ssh` sends on a bound connection.
+        //
+        // Past the first hop the binding itself is the forwarded side's to
+        // send, with a session id of its choosing: only a request that names
+        // its server is held to the host the prompt shows. One that does not
+        // is still signed — plenty of servers offer nothing else — and the
+        // prompt says what it cannot vouch for.
+        let mut unverified_destination = false;
         if let Some(bound) = self.bindings.last() {
             let public_key = entry.public.to_bytes().unwrap_or_else(unencodable);
-            match signing::userauth_session_id(&request.data, &public_key, &bound.host_key) {
-                Some(session_id) if session_id == bound.session_id => {}
+            match signing::userauth_request(&request.data, &public_key, &bound.host_key) {
+                Some(userauth) if userauth.session_id == bound.session_id => {
+                    unverified_destination = self.bindings.len() > 1 && !userauth.host_bound;
+                }
                 Some(_) => {
                     tracing::warn!(item = %entry.item_id, key = %entry.name,
                         host = %bound.host_fingerprint,
@@ -583,7 +607,8 @@ impl Session for LpassAgent {
         }
 
         let answer = if entry.confirm {
-            self.approval_for(entry, &mut gate).await?
+            self.approval_for(entry, unverified_destination, &mut gate)
+                .await?
         } else {
             Answer::NotNeeded
         };
@@ -2084,6 +2109,106 @@ mod tests {
             prompts[0]
         );
         assert!(prompts[0].contains("WARNING"), "{}", prompts[0]);
+        // a request that names no server leaves the last hop a claim
+        assert!(
+            prompts[0].contains("UNVERIFIED DESTINATION"),
+            "{}",
+            prompts[0]
+        );
+        assert!(prompts[0].ends_with(" (unverified)"), "{}", prompts[0]);
+    }
+
+    /// How many times two identical requests for an unverified destination
+    /// prompt, with remembering on.
+    async fn prompts_for_an_unverified_destination_asked_twice(remember_unverified: bool) -> usize {
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let epoch = Arc::new(crate::approvals::LockEpoch::default());
+        let mut agent = agent_recording(confirmer.clone())
+            .await
+            .with_approvals(Arc::new(
+                Approvals::new(true, epoch).remembering_unverified(remember_unverified),
+            ))
+            .with_peer(Some(PeerInfo {
+                pid: Some(std::process::id().cast_signed()),
+                uid: 501,
+            }));
+        let first = PrivateKey::from_openssh(ED25519).unwrap();
+        let second = PrivateKey::from_openssh(ED25519_PW)
+            .unwrap()
+            .decrypt("fixture-passphrase")
+            .unwrap();
+        agent
+            .handle(session_bind(&first, b"hop-one", true))
+            .await
+            .unwrap();
+        agent
+            .handle(session_bind(&second, b"hop-two", false))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            // signed both times: a failed signature is never remembered, and
+            // would make the count say nothing about the policy
+            assert_matches!(
+                agent
+                    .handle(Request::SignRequest(sign_request(
+                        ED25519_PUB,
+                        &userauth(b"hop-two", ED25519_PUB),
+                        0,
+                    )))
+                    .await
+                    .unwrap(),
+                Response::SignResponse(_)
+            );
+        }
+        confirmer.0.lock().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn an_approval_for_an_unverified_destination_is_not_remembered() {
+        assert_eq!(
+            prompts_for_an_unverified_destination_asked_twice(false).await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_for_an_unverified_destination_is_remembered_when_configured() {
+        assert_eq!(
+            prompts_for_an_unverified_destination_asked_twice(true).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_request_naming_its_server_is_not_marked_unverified() {
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone()).await;
+        let first = PrivateKey::from_openssh(ED25519).unwrap();
+        let second = PrivateKey::from_openssh(ED25519_PW)
+            .unwrap()
+            .decrypt("fixture-passphrase")
+            .unwrap();
+        agent
+            .handle(session_bind(&first, b"hop-one", true))
+            .await
+            .unwrap();
+        agent
+            .handle(session_bind(&second, b"hop-two", false))
+            .await
+            .unwrap();
+        agent
+            .handle(Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth_to(b"hop-two", ED25519_PUB, Some(&second)),
+                0,
+            )))
+            .await
+            .unwrap();
+
+        let prompts = confirmer.0.lock().unwrap();
+        assert!(prompts[0].contains("WARNING"), "{}", prompts[0]);
+        assert!(!prompts[0].contains("UNVERIFIED"), "{}", prompts[0]);
+        assert!(!prompts[0].contains("(unverified)"), "{}", prompts[0]);
     }
 
     #[tokio::test]

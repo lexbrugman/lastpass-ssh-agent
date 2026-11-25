@@ -40,7 +40,14 @@ What this agent **guarantees**:
   signed — a binding is a host's signature over a session id and nothing else,
   replayable by anyone who has connected to that host, so what is signed has
   to say which session it is for. Nothing binds after the destination, and a
-  binding seen before changes nothing.
+  binding seen before changes nothing. Over a forward, the last host is
+  verified only when the request names its server, as `ssh` does for a
+  server offering host-bound authentication (OpenSSH 8.9 and later, GitHub).
+  For any other the prompt says **unverified destination**: the forwarded
+  side supplied that host, the session being signed for may be with a
+  different server, and such an approval is not remembered unless you ask
+  for that. With a local `ssh` older than 8.9 none of this applies: it sends
+  no binding, so a forwarded request cannot be told from a local one.
 - **Read-only agent.** `ssh-add` (add/remove/lock/unlock) is refused. The
   agent serves every usable SSH Key item the account can see, shared folders
   included — what you can use in the vault, you can use here, for the key
@@ -235,6 +242,11 @@ vault scan) or tuning behavior:
 # Once you approve a signature, approve the same key for the same requester
 # and hosts without asking, until the vault locks. Off by default.
 # remember_approvals = false
+
+# With remember_approvals: also remember an approval whose destination is
+# unverified (a forwarded request that does not name its server). Off by
+# default; see "Remembering approvals".
+# remember_unverified_destinations = false
 
 # Pin items (disables auto-discovery); `search` prints these snippets.
 [[keys]]
@@ -575,6 +587,20 @@ request "was started from" is what the kernel reports about a process running
 as you, which a process running as you can arrange. The prompt itself is
 unchanged, and a request that differs in any of the words it shows — another
 key, another host, another place it was started from — asks again.
+
+A forwarded request with an **unverified destination** — one that does not
+name its server, as for a host without host-bound authentication (GitLab.com
+and Bitbucket among them) — is asked every time regardless, because the host
+on the prompt is then only the forwarded machine's word:
+
+```toml
+remember_approvals = true
+remember_unverified_destinations = true
+```
+
+remembers those too. That is for forwarding to a machine you work on that
+talks to such servers, and it means that machine can reuse one approval for a
+session with any server it presents under the same host.
 
 One limit: a vault your shell keeps open is outside the agent's view. It sees
 that vault lock only when a request of its own has to ask for the master

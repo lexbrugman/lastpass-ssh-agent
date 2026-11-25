@@ -141,10 +141,10 @@ pub async fn run(config_path: &Path) -> Result<()> {
             unlocker,
             Arc::new(knownhosts::HostNames::default()),
         )
-        .with_approvals(Arc::new(approvals::Approvals::new(
-            config.remember_approvals,
-            lock_epoch,
-        )))
+        .with_approvals(Arc::new(
+            approvals::Approvals::new(config.remember_approvals, lock_epoch)
+                .remembering_unverified(config.remember_unverified_destinations),
+        ))
         .with_remembered_file(remembered_at)
         .with_refresher(refresher),
     };

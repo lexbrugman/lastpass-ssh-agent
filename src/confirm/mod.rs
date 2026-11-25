@@ -21,6 +21,10 @@ pub struct ConfirmContext {
     /// Hosts this connection is bound to, oldest hop first. Empty when the
     /// client sent no binding (local tools like `ssh-add`, or OpenSSH < 8.9).
     pub bindings: Vec<SessionBinding>,
+    /// The request reached the agent over a forward and does not name its
+    /// server, so the last binding is the forwarded side's word and nothing
+    /// in what gets signed holds it to that host. See `signing::Userauth`.
+    pub unverified_destination: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,6 +76,7 @@ impl ConfirmContext {
             peer,
             requester: peer.and_then(|peer| peer.pid).and_then(Requester::of),
             bindings,
+            unverified_destination: false,
         }
     }
 }
@@ -218,7 +223,18 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
                  have originated there rather than on this machine.",
             );
         }
+        // Ahead of the hops, as the warning is, and for the same reason.
+        if ctx.unverified_destination {
+            text.push_str(
+                "\n\nUNVERIFIED DESTINATION: this request does not name its server, so the \
+                 last host below is only what the forwarded side says — the session being \
+                 signed for may be with a different server.",
+            );
+        }
         let _ = write!(text, "\nSSH session: {}", chain.join(" → "));
+        if ctx.unverified_destination {
+            text.push_str(" (unverified)");
+        }
     }
     text
 }
@@ -233,6 +249,10 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
 /// socket, or a pid whose executable cannot be read. An approval for
 /// "whatever runs as this uid" would answer for every process, so such a
 /// request is asked every time.
+///
+/// An unverified destination is a different question from the same hosts
+/// verified, as it is a different prompt. Whether it is remembered at all is
+/// the caller's to decide.
 pub fn approval_question(ctx: &ConfirmContext) -> Option<String> {
     // Every piece is escaped text, which cannot contain a control character —
     // so control characters as the separators make the encoding unambiguous:
@@ -279,6 +299,12 @@ pub fn approval_question(ctx: &ConfirmContext) -> Option<String> {
             .collect::<Vec<_>>()
             .join(&SEP.to_string()),
         hosts.join(&SEP.to_string()),
+        (if ctx.unverified_destination {
+            "unverified"
+        } else {
+            ""
+        })
+        .to_string(),
     ] {
         question.push_str(&piece);
         question.push('\n');
@@ -538,6 +564,23 @@ mod tests {
     }
 
     #[test]
+    fn an_unverified_destination_is_a_question_of_its_own() {
+        // an approval given for hosts the request named must not answer for
+        // the same hosts as a claim, nor the other way round
+        let known = from_peer(Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        }));
+        let verified = approval_question(&known).unwrap();
+        let unverified = approval_question(&ConfirmContext {
+            unverified_destination: true,
+            ..known
+        })
+        .unwrap();
+        assert_ne!(verified, unverified);
+    }
+
+    #[test]
     fn the_approval_question_is_the_prompt_without_the_pid() {
         // A requester that cannot be told from another has no question to
         // remember: no peer, no pid, or a pid with no readable executable.
@@ -611,7 +654,8 @@ mod tests {
         ];
         let bound = approval_question(&ctx).unwrap();
         assert!(
-            bound.ends_with("\nSHA256:aaa\x1ea\x1eforwarding\x1fSHA256:bbb\x1e\x1e\n"),
+            // the last line is whether the destination is unverified
+            bound.ends_with("\nSHA256:aaa\x1ea\x1eforwarding\x1fSHA256:bbb\x1e\x1e\n\n"),
             "{bound:?}"
         );
         assert_ne!(bound, question);

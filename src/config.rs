@@ -144,6 +144,16 @@ pub struct Config {
     #[serde(default)]
     pub remember_approvals: bool,
 
+    /// Remember an approval even when its destination is unverified: a
+    /// request that came over a forward without naming its server, where the
+    /// host on the prompt is the forwarded side's word.
+    ///
+    /// Opt-in on top of `remember_approvals`, for forwarding to a machine
+    /// that talks to servers offering nothing else. It lets that machine
+    /// reuse one approval for a session with any server it names the same.
+    #[serde(default)]
+    pub remember_unverified_destinations: bool,
+
     #[serde(default)]
     pub keys: Vec<KeyConfig>,
 }
@@ -253,6 +263,11 @@ impl Config {
         if self.confirm == ConfirmMode::Askpass && self.askpass.is_none() {
             return Err(Error::ConfigInvalid(
                 "confirm = \"askpass\" requires `askpass` to point at a helper program".into(),
+            ));
+        }
+        if self.remember_unverified_destinations && !self.remember_approvals {
+            return Err(Error::ConfigInvalid(
+                "remember_unverified_destinations needs remember_approvals = true".into(),
             ));
         }
         if self.confirm_timeout_secs == 0 || self.confirm_timeout_secs > MAX_CONFIRM_TIMEOUT_SECS {
@@ -599,6 +614,20 @@ id = "1"
                 .unwrap()
                 .remember_approvals
         );
+    }
+
+    #[test]
+    fn unverified_destinations_are_remembered_only_on_top_of_remembering() {
+        assert!(!parse("").unwrap().remember_unverified_destinations);
+        assert!(
+            parse("remember_approvals = true\nremember_unverified_destinations = true")
+                .unwrap()
+                .remember_unverified_destinations
+        );
+        let error = parse("remember_unverified_destinations = true")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs remember_approvals"), "{error}");
     }
 
     #[test]
