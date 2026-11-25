@@ -81,5 +81,6 @@ jobs:
       # bsdtar on macOS against GNU tar on Linux, and the archive it writes is
       # what users install. Same order as scripts/check.sh runs them in.
       - run: ./packaging/test-archive.sh
+      - run: ./packaging/test-verify-dist.sh
       - run: ./packaging/homebrew/test-generate-formula.sh
       - run: ./scripts/test.sh

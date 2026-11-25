@@ -13,6 +13,8 @@ echo "== clippy for macOS (the cfg-gated half that never builds here)"
 cargo clippy --target aarch64-apple-darwin --all-targets -- -D warnings
 echo "== release archive"
 ./packaging/test-archive.sh
+echo "== release hand-off"
+./packaging/test-verify-dist.sh
 echo "== homebrew formula generator"
 ./packaging/homebrew/test-generate-formula.sh
 echo "== tests (instrumented; 100% line+branch coverage required)"

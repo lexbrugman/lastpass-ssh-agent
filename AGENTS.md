@@ -280,6 +280,11 @@ Four invariants hold it together, and each is load-bearing:
   `<hash> *<name>` checksum beside each. Both live in `packaging/archive.sh`
   with `test-archive.sh` in the gate, rather than in workflow steps that only
   ever run during a release.
+- **What is published is selected by name, never by pattern.** Any job in a
+  run can upload an artifact, so `packaging/verify-dist.sh` accepts exactly
+  one artifact per built target, each holding its archive and a checksum that
+  names it, and only what it lays out is attested and released. It is in the
+  gate (`test-verify-dist.sh`) for the same reason the archive is.
 
 The one credential is `TAP_DEPLOY_KEY`, and only because the tap is a different
 repository — `GITHUB_TOKEN` cannot write to one. Without it a release still

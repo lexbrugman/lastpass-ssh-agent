@@ -26,27 +26,30 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
-      # There is no checkout in this job — nothing here reads the tree. gh
-      # works out which repository to act on from the git remote, though, and
-      # without one it fails before it makes a single API call, so name the
-      # repository outright rather than cloning to satisfy it.
+      # Named outright rather than left for gh to work out from the checkout's
+      # remote: the release goes to the repository this run belongs to.
       GH_REPO: ${{ github.repository }}
       VERSION: ${{ inputs.version }}
     steps:
+      # For packaging/verify-dist.sh alone. The token is not kept in the
+      # checkout: nothing here pushes, and what is released is build output.
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # One directory per artifact, not merged: any job in the run can upload
+      # an artifact, and merged together one named like a release would land
+      # among the real ones — or over one of them.
       - uses: actions/download-artifact@v8.0.2
         with:
           pattern: release-*
-          path: dist/
-          merge-multiple: true
+          path: artifacts/
 
-      - name: Verify the archives against their checksums
-        working-directory: dist
-        run: |
-          ls -l
-          # The checksums were computed on the build runners; these are the
-          # files users download. Checking them here is what makes the two the
-          # same bytes, rather than assuming the artifact round-trip was clean.
-          sha256sum -c ./*.sha256
+      # The checksums were computed on the build runners; these are the files
+      # users download. packaging/verify-dist.sh owns what is checked, and
+      # leaves in dist/ exactly the eight files that passed.
+      - name: Verify what the build jobs handed over
+        run: ./packaging/verify-dist.sh artifacts dist
 
       # A signed statement, kept by GitHub against each archive's digest, that
       # this workflow built it from this commit. It is what `gh attestation
