@@ -72,7 +72,7 @@ What it **cannot** guarantee:
   `umask 077`, socket directory forced to `0700`/owner-only with symlink
   refusal, socket `0600`, lpass environment allowlisted, `ssh_agent_lib` debug
   logging capped (its request dumps could contain a private key a client tried
-  to add). Key material itself is not pinned: it lives milliseconds per
+  to add), requests bounded in length and clients in number. Key material itself is not pinned: it lives milliseconds per
   signature.
 - **Your master password** is handled by this agent: asked for when the
   vault is locked, held in memory while it is unlocked, and forgotten when
@@ -649,6 +649,12 @@ unlocking — do not run `lpass` yourself — and every lock is one it sees.
 - The `socket` path must be absolute (SSH clients resolve `SSH_AUTH_SOCK`
   from their own working directory), and macOS limits Unix socket paths to
   ~104 bytes (`SUN_LEN`), so keep it short.
+- **At most 64 clients are served at once, and a request is at most
+  256 KiB** — the length OpenSSH's agent stops at. A client past the 64th
+  waits its turn rather than being refused, and a longer request ends its
+  connection. Running out of file descriptors makes the agent wait for some
+  to be freed, not stop: it holds the master password, and stopping would be
+  something whoever opened the connections could do to it.
 - `ssh-agent-lib`'s own logging is capped at INFO even under
   `RUST_LOG=debug`: its debug output Debug-formats whole requests, and an
   `AddIdentity` request carries the client's private key. Routine refusals do

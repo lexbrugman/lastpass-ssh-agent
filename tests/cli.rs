@@ -751,16 +751,13 @@ fn start_refuses_with_no_ssh_keys_in_vault() {
 }
 
 #[test]
-#[expect(
-    clippy::collection_is_never_read,
-    reason = "the Vec exists to hold fds open"
-)]
-fn start_exits_with_error_when_accept_fails() {
+fn start_outlives_a_socket_it_cannot_accept_from() {
     // Exhaust the agent's file-descriptor table: the accept loop then hits
-    // EMFILE and `start` must exit nonzero rather than spin forever.
-    // Connections are held open so their fds stay occupied.
+    // EMFILE. Whoever holds those connections must not be able to end the
+    // agent that way — it waits, and serves again once they let go.
     let s = setup(&healthy_vault_body_owned(), "confirm = \"off\"\n");
     let socket = s.dir.path().join("agent.sock");
+    let log_path = s.dir.path().join("stderr.log");
     let mut child = Command::new("/bin/sh")
         .arg("-c")
         .arg(format!(
@@ -769,8 +766,10 @@ fn start_exits_with_error_when_accept_fails() {
             s.config.display()
         ))
         .env("HOME", s.dir.path())
+        // debug, for the line that says a second attempt failed as well
+        .env("RUST_LOG", "debug")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log_path).unwrap())
         .spawn()
         .unwrap();
 
@@ -783,26 +782,42 @@ fn start_exits_with_error_when_accept_fails() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    // Keep opening connections until the agent dies. Machine load only
-    // changes how many attempts that takes, never the outcome, so the loop
-    // is bounded by a generous wall-clock deadline instead of a fixed count.
-    let mut held = Vec::new();
-    let mut status = None;
-    while std::time::Instant::now() < deadline {
-        if let Some(exited) = child.try_wait().unwrap() {
-            status = Some(exited);
-            break;
-        }
-        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket) {
-            held.push(stream);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    // More connections than the agent has descriptors for. Connecting
+    // succeeds regardless — the kernel queues what is not accepted — so the
+    // agent's own word is what says it has met the shortage, and met it
+    // again on trying once more.
+    let held: Vec<_> = (0..40)
+        .map(|_| std::os::unix::net::UnixStream::connect(&socket).unwrap())
+        .collect();
+    while !std::fs::read_to_string(&log_path)
+        .unwrap()
+        .contains("still cannot accept an agent connection")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the agent never reported running out of descriptors"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    assert_eq!(
+        child.try_wait().unwrap(),
+        None,
+        "a socket that cannot be accepted from must not end the agent"
+    );
 
-    let Some(status) = status else {
-        child.kill().unwrap();
-        child.wait().unwrap();
-        panic!("agent did not exit after fd exhaustion");
-    };
-    assert!(!status.success(), "accept failure must be fatal");
+    // ...and once they are gone, a new client is answered: SSH_AGENTC_REQUEST_
+    // IDENTITIES, and the first byte after the length is the answer's type.
+    drop(held);
+    let mut client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    std::io::Write::write_all(&mut client, &[0, 0, 0, 1, 11]).unwrap();
+    let mut answer = [0; 5];
+    std::io::Read::read_exact(&mut client, &mut answer).unwrap();
+    assert_eq!(answer[4], 12, "SSH_AGENT_IDENTITIES_ANSWER");
+
+    // SAFETY: signaling the child we spawned.
+    unsafe { libc::kill(child.id().cast_signed(), libc::SIGTERM) };
+    child.wait().unwrap();
 }

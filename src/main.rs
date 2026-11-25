@@ -42,6 +42,7 @@ mod platform;
 mod prompt;
 mod refresh;
 mod requester;
+mod serve;
 mod signing;
 mod socket;
 #[cfg(test)]
@@ -79,18 +80,27 @@ fn no_home() -> Error {
     Error::ConfigInvalid("cannot determine home directory; pass --config".into())
 }
 
+/// Whether an event may be logged whatever `RUST_LOG` asks for: everything
+/// of this crate's, and `ssh_agent_lib`'s only up to info.
+///
+/// The library's debug logging Debug-formats whole requests, and an
+/// `AddIdentity` request (which is refused, but still received) contains the
+/// client's private key. That logging sits in the library's own serving
+/// loop, which `serve` stands in for — so this is what keeps a later call
+/// into the library from bringing it back.
+fn within_the_secret_cap(target: &str, level: tracing::Level) -> bool {
+    !target.starts_with("ssh_agent_lib") || level <= tracing::Level::INFO
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Before anything else: no core dumps, owner-only file creation.
     platform::harden().unwrap_or_else(hardening_failed);
-    // Hard-cap ssh_agent_lib at info even under RUST_LOG=debug: its debug
-    // logging Debug-formats whole requests, and an AddIdentity request (which
-    // we refuse, but still receive) contains the client's private key. The
-    // cap is a separate unconditional layer so that a more-specific RUST_LOG
-    // directive (e.g. ssh_agent_lib::agent=debug) cannot override it.
+    // The cap is a separate unconditional layer so that a more-specific
+    // RUST_LOG directive (e.g. ssh_agent_lib::agent=debug) cannot override it.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let secret_cap = tracing_subscriber::filter::filter_fn(|meta| {
-        !meta.target().starts_with("ssh_agent_lib") || *meta.level() <= tracing::Level::INFO
+        within_the_secret_cap(meta.target(), *meta.level())
     });
     tracing_subscriber::registry()
         .with(
@@ -134,5 +144,24 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Search { query } => commands::list::search(&config_path, query.as_deref()).await,
         Command::StoreMasterPassword => commands::master_password::store(&config_path).await,
         Command::ForgetMasterPassword => commands::master_password::forget(&config_path).await,
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    use tracing::Level;
+
+    #[test]
+    fn the_library_is_capped_at_info_and_nothing_else_is() {
+        assert!(within_the_secret_cap("ssh_agent_lib::agent", Level::INFO));
+        assert!(within_the_secret_cap("ssh_agent_lib::agent", Level::ERROR));
+        assert!(!within_the_secret_cap("ssh_agent_lib::agent", Level::DEBUG));
+        assert!(!within_the_secret_cap("ssh_agent_lib", Level::TRACE));
+        assert!(within_the_secret_cap(
+            "lastpass_ssh_agent::agent",
+            Level::TRACE
+        ));
     }
 }

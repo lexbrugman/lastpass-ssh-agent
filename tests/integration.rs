@@ -367,6 +367,68 @@ async fn an_extension_name_reaches_the_debug_log_escaped() {
     );
 }
 
+#[test]
+#[expect(
+    clippy::collection_is_never_read,
+    reason = "the Vec exists to hold connections open"
+)]
+fn a_client_past_the_connection_limit_waits_for_one_to_leave() {
+    // A connection costs the agent a descriptor for as long as its client
+    // keeps it, so only so many are served at once; the next is not turned
+    // away, only left in the queue until there is room.
+    let agent = start_agent();
+    let connect = || std::os::unix::net::UnixStream::connect(&agent.socket).unwrap();
+    let mut held: Vec<_> = (0..64).map(|_| connect()).collect();
+
+    // SSH_AGENTC_REQUEST_IDENTITIES
+    let mut waiting = connect();
+    std::io::Write::write_all(&mut waiting, &[0, 0, 0, 1, 11]).unwrap();
+    waiting
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut answer = [0; 5];
+    assert!(
+        std::io::Read::read_exact(&mut waiting, &mut answer).is_err(),
+        "the 65th client was served while 64 were connected"
+    );
+
+    held.pop();
+    waiting
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    std::io::Read::read_exact(&mut waiting, &mut answer).unwrap();
+    assert_eq!(answer[4], 12, "SSH_AGENT_IDENTITIES_ANSWER");
+}
+
+#[test]
+fn a_request_too_long_to_read_ends_that_connection_and_no_other() {
+    let agent = start_agent();
+    let connect = || std::os::unix::net::UnixStream::connect(&agent.socket).unwrap();
+
+    // a length one past the limit, and none of the body it announces
+    let mut hostile = connect();
+    std::io::Write::write_all(&mut hostile, &[0, 4, 0, 1]).unwrap();
+    hostile
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut rest = Vec::new();
+    // closed without an answer, rather than left waiting for the body
+    assert_eq!(
+        std::io::Read::read_to_end(&mut hostile, &mut rest).unwrap(),
+        0
+    );
+
+    // SSH_AGENTC_REQUEST_IDENTITIES, answered as ever
+    let mut client = connect();
+    std::io::Write::write_all(&mut client, &[0, 0, 0, 1, 11]).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut answer = [0; 5];
+    std::io::Read::read_exact(&mut client, &mut answer).unwrap();
+    assert_eq!(answer[4], 12, "SSH_AGENT_IDENTITIES_ANSWER");
+}
+
 #[tokio::test]
 async fn routine_traffic_is_not_logged_as_errors() {
     // The refusals a normal session produces — OpenSSH's per-connection

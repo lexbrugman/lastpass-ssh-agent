@@ -38,9 +38,6 @@ pub enum Error {
     #[error("socket error: {0}")]
     Socket(String),
 
-    #[error("agent terminated: {0}")]
-    Agent(String),
-
     #[error(transparent)]
     Lpass(#[from] crate::lpass::LpassError),
 

@@ -512,12 +512,11 @@ fn could_not_discard(e: crate::error::Error) {
 impl Session for LpassAgent {
     /// Dispatch every request ourselves.
     ///
-    /// The default dispatcher signals a refusal by returning `Err`, and
-    /// ssh-agent-lib logs every `Err` at ERROR — but an extension probe and a
-    /// user pressing Deny are protocol answers, not faults, so they are
-    /// returned as such. The bytes on the wire are unchanged
-    /// (`SSH_AGENT_FAILURE` either way), and the library's own logging stays
-    /// on for faults that really are faults.
+    /// The default dispatcher signals a refusal by returning `Err`, the way it
+    /// reports a fault — but an extension probe and a user pressing Deny are
+    /// protocol answers, not faults, so they are returned as such and `Err`
+    /// is left meaning what it says. The bytes on the wire are the same
+    /// (`SSH_AGENT_FAILURE` either way).
     async fn handle(&mut self, message: Request) -> Result<Response, AgentError> {
         Ok(match message {
             Request::RequestIdentities => {
@@ -1872,9 +1871,10 @@ mod tests {
 
     #[tokio::test]
     async fn refusals_are_protocol_answers_not_errors() {
-        // Anything ssh-agent-lib would log at ERROR must instead come back
-        // as an Ok(Response::Failure): identical on the wire, silent in the
-        // log. Extension probes arrive on every OpenSSH connection.
+        // A refusal must come back as an Ok(Response::Failure) rather than
+        // the Err the trait's own dispatcher returns: identical on the wire,
+        // and not a fault. Extension probes arrive on every OpenSSH
+        // connection.
         use ssh_agent_lib::proto::{AddIdentity, Extension, PrivateCredential, RemoveIdentity};
 
         let client = MockLpass::logged_in().with_ed25519_public("1");

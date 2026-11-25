@@ -133,32 +133,33 @@ pub async fn run(config_path: &Path) -> Result<()> {
     let lock_epoch = unlock.lock_epoch();
     tokio::task::spawn(unlock::expire_when_idle(unlock, vaultlock::POLL_INTERVAL));
 
-    let factory = AgentFactory {
-        template: agent::LpassAgent::new(
-            store,
-            vault,
-            confirmer,
-            unlocker,
-            Arc::new(knownhosts::HostNames::default()),
-        )
-        .with_approvals(Arc::new(
-            approvals::Approvals::new(config.remember_approvals, lock_epoch)
-                .remembering_unverified(config.remember_unverified_destinations),
-        ))
-        .with_remembered_file(remembered_at)
-        .with_refresher(refresher),
-    };
-    let result = tokio::select! {
-        result = ssh_agent_lib::agent::listen(listener, factory) => {
-            result.map_err(|e| Error::Agent(e.to_string()))
-        }
-        () = shutdown => {
-            tracing::info!("shutting down");
-            Ok(())
-        }
-    };
+    let template = agent::LpassAgent::new(
+        store,
+        vault,
+        confirmer,
+        unlocker,
+        Arc::new(knownhosts::HostNames::default()),
+    )
+    .with_approvals(Arc::new(
+        approvals::Approvals::new(config.remember_approvals, lock_epoch)
+            .remembering_unverified(config.remember_unverified_destinations),
+    ))
+    .with_remembered_file(remembered_at)
+    .with_refresher(refresher);
+    // Each connection a session of its own, told who is at the other end.
+    let serving = crate::serve::listen(listener, move |socket| {
+        let peer = socket.peer_cred().ok().map(|cred| confirm::PeerInfo {
+            pid: cred.pid(),
+            uid: cred.uid(),
+        });
+        template.with_peer(peer)
+    });
+    tokio::select! {
+        never = serving => match never {},
+        () = shutdown => tracing::info!("shutting down"),
+    }
     drop(guard); // unlink the socket
-    result
+    Ok(())
 }
 
 /// A start with nothing written down has to read the vault, and one that
@@ -177,23 +178,6 @@ fn first_start_needs_the_vault(e: Error) -> Error {
              later starts need no vault"
         )),
         other => other,
-    }
-}
-
-struct AgentFactory {
-    template: agent::LpassAgent,
-}
-
-impl ssh_agent_lib::agent::Agent<tokio::net::UnixListener> for AgentFactory {
-    fn new_session(
-        &mut self,
-        socket: &tokio::net::UnixStream,
-    ) -> impl ssh_agent_lib::agent::Session {
-        let peer = socket.peer_cred().ok().map(|cred| confirm::PeerInfo {
-            pid: cred.pid(),
-            uid: cred.uid(),
-        });
-        self.template.with_peer(peer)
     }
 }
 
