@@ -25,6 +25,12 @@ pub enum KeyIssue {
     #[error("this agent cannot sign with {0} keys")]
     Unsupported(String),
 
+    #[error(
+        "RSA key of {bits} bits — wider than the {} this agent signs with",
+        crate::signing::MAX_RSA_BITS
+    )]
+    TooWide { bits: usize },
+
     // Rendered by `start` as its own fatal error and by `doctor` as a
     // finding, so it states the problem and the remedy without predicting
     // what either command will do. The remedy has to fit both modes: with
@@ -190,10 +196,15 @@ fn accept(raw: &[u8]) -> Result<PublicKey, KeyIssue> {
     let text = String::from_utf8_lossy(raw);
     let public =
         PublicKey::from_openssh(text.trim()).map_err(|e| KeyIssue::Malformed(e.to_string()))?;
-    if crate::signing::can_sign(&public.algorithm()) {
-        Ok(public)
-    } else {
-        Err(KeyIssue::Unsupported(public.algorithm().to_string()))
+    if !crate::signing::can_sign(&public.algorithm()) {
+        return Err(KeyIssue::Unsupported(public.algorithm().to_string()));
+    }
+    match crate::signing::rsa_bits(public.key_data()) {
+        Some(0) => Err(KeyIssue::Malformed(
+            "the RSA modulus is not a positive number".into(),
+        )),
+        Some(bits) if bits > crate::signing::MAX_RSA_BITS => Err(KeyIssue::TooWide { bits }),
+        _ => Ok(public),
     }
 }
 
@@ -231,6 +242,7 @@ const fn is_verdict(issue: &KeyIssue) -> bool {
         KeyIssue::Empty
             | KeyIssue::Malformed(_)
             | KeyIssue::Unsupported(_)
+            | KeyIssue::TooWide { .. }
             | KeyIssue::Fetch(LpassError::ItemNotFound(_) | LpassError::FieldNotFound { .. })
     )
 }
@@ -538,6 +550,70 @@ mod tests {
             .unwrap();
         assert_eq!(store.len(), 1);
         assert_eq!(store.entries().next().unwrap().item_id, "2");
+    }
+
+    /// An RSA public key whose modulus is `top` followed by 2048 bytes, as a
+    /// vault field: 16384 bits plus however many `top` has.
+    fn rsa_public_over_the_cap_by(top: &[u8]) -> String {
+        let modulus = [top, &[0xff; 2048]].concat();
+        let key = ssh_key::public::RsaPublicKey {
+            e: ssh_key::Mpint::from_positive_bytes(&[1, 0, 1]).unwrap(),
+            n: ssh_key::Mpint::from_positive_bytes(&modulus).unwrap(),
+        };
+        PublicKey::from(KeyData::Rsa(key)).to_openssh().unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_rsa_key_wider_than_the_cap_is_not_advertised() {
+        // one bit past 16384: signing with it would hold every other request
+        // for as long as whoever wrote the item chose
+        let client = MockLpass::logged_in()
+            .with_field(
+                "1",
+                "Public Key",
+                rsa_public_over_the_cap_by(&[1]).as_bytes(),
+            )
+            .with_ed25519_public("2");
+        let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
+        let store = KeyStore::load(&client, &config.keys, &config)
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.entries().next().unwrap().item_id, "2");
+    }
+
+    #[tokio::test]
+    async fn an_rsa_key_with_a_negative_modulus_is_not_advertised() {
+        // An mpint whose top bit is set is negative. Such a key parses, and
+        // signing would only refuse it after it had been offered and fetched.
+        let key = ssh_key::public::RsaPublicKey {
+            e: ssh_key::Mpint::from_positive_bytes(&[1, 0, 1]).unwrap(),
+            n: ssh_key::Mpint::from_bytes(&[0x80; 256]).unwrap(),
+        };
+        let negative = PublicKey::from(KeyData::Rsa(key)).to_openssh().unwrap();
+        let client = MockLpass::logged_in()
+            .with_field("1", "Public Key", negative.as_bytes())
+            .with_ed25519_public("2");
+        let config = config("[[keys]]\nid = \"1\"\n[[keys]]\nid = \"2\"");
+        let store = KeyStore::load(&client, &config.keys, &config)
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.entries().next().unwrap().item_id, "2");
+    }
+
+    #[tokio::test]
+    async fn an_rsa_key_exactly_at_the_cap_is_served() {
+        let client = MockLpass::logged_in().with_field(
+            "1",
+            "Public Key",
+            rsa_public_over_the_cap_by(&[]).as_bytes(),
+        );
+        let config = config("[[keys]]\nid = \"1\"");
+        let store = KeyStore::load(&client, &config.keys, &config)
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 1);
     }
 
     #[tokio::test]

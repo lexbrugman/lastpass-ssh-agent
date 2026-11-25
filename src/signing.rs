@@ -37,6 +37,25 @@ pub const fn can_sign(algorithm: &Algorithm) -> bool {
     )
 }
 
+/// The widest RSA modulus served. A signature costs roughly the cube of the
+/// width, on the thread every other request waits on, and the key is the
+/// vault item's to choose; this is the widest `ssh` itself will use.
+pub const MAX_RSA_BITS: usize = 16_384;
+
+/// The bits in an RSA key's modulus, and `None` for every other key. Zero for
+/// a modulus that is not a positive number, which no RSA key has. Asked where
+/// a key is accepted to be served: signing only ever uses a private key whose
+/// public half is the served one.
+pub fn rsa_bits(key: &KeyData) -> Option<usize> {
+    let KeyData::Rsa(rsa) = key else {
+        return None;
+    };
+    let modulus = rsa.n.as_positive_bytes().unwrap_or_default();
+    // the bits the modulus has, not the bytes it is stored in
+    let unused = modulus.first().map_or(0, |top| top.leading_zeros());
+    Some(modulus.len() * 8 - unused as usize)
+}
+
 /// Crypto-layer failures (RSA component conversion, signature encoding,
 /// the actual signing operation) are not constructible from a key that
 /// parsed correctly, so these error edges are excluded from coverage.
@@ -395,6 +414,20 @@ mod tests {
         let (private, public) = keypair(ECDSA, ECDSA_PUB);
         let sig = sign_with_key(&private, b"data to sign", 0).unwrap();
         public.key_data().verify(b"data to sign", &sig).unwrap();
+    }
+
+    #[test]
+    fn an_rsa_key_is_measured_in_bits_not_in_the_bytes_that_hold_them() {
+        let rsa = |top: &[u8]| {
+            KeyData::Rsa(ssh_key::public::RsaPublicKey {
+                e: ssh_key::Mpint::from_positive_bytes(&[1, 0, 1]).unwrap(),
+                n: ssh_key::Mpint::from_positive_bytes(&[top, &[0xff; 2048]].concat()).unwrap(),
+            })
+        };
+        assert_eq!(rsa_bits(&rsa(&[])), Some(16_384));
+        assert_eq!(rsa_bits(&rsa(&[1])), Some(16_385));
+        let (_, ed25519) = keypair(ED25519, ED25519_PUB);
+        assert_eq!(rsa_bits(ed25519.key_data()), None);
     }
 
     #[test]
