@@ -55,6 +55,22 @@ if [ "$(grep -c 'depends_on "rust"' "$formula")" != 1 ]; then
     failed=1
 fi
 
+# The service log names what is signed with, so it must sit in the directory
+# post_install makes owner-only — not beside every other formula's log, where
+# the service manager creates it readable by all.
+if ! grep -q 'log_dir.chmod 0700' "$formula"; then
+    echo "post_install does not make the log directory owner-only" >&2
+    failed=1
+fi
+if ! grep -q 'shared.chmod 0600 if shared.file? && !shared.symlink?' "$formula"; then
+    echo "post_install leaves an existing shared log readable by everyone" >&2
+    failed=1
+fi
+if [ "$(grep -c 'log_path var/"log/lastpass-ssh-agent/agent.log"' "$formula")" != 2 ]; then
+    echo "the service does not log into the owner-only directory" >&2
+    failed=1
+fi
+
 # `brew reinstall` has no --HEAD option and fails outright with "invalid
 # option", so switching tracks is always uninstall-then-install.
 if grep -q 'reinstall .*--HEAD' "$formula"; then
@@ -68,6 +84,27 @@ fi
 # a missing checksum must abort rather than emit an empty sha256
 if ./generate-formula.sh 2026.810.0 owner/repo "${work}/nowhere" >/dev/null 2>&1; then
     echo "a missing checksum should have failed the build" >&2
+    exit 1
+fi
+
+# A checksum file is release content, and its hash ends up inside a sed
+# program: one that is not a bare sha256 must abort, not be substituted. The
+# second line is what keeps `sha256sum -c` passing on such a file.
+bad="${work}/bad"
+cp -R "$work" "${work}.copy" && mv "${work}.copy" "$bad"
+name="lastpass-ssh-agent-aarch64-apple-darwin.tar.xz"
+printf '0|;1s|.*|injected|;#\n%s *%s\n' "$hash" "$name" > "${bad}/${name}.sha256"
+if ./generate-formula.sh 2026.810.0 owner/repo "$bad" >/dev/null 2>&1; then
+    echo "a checksum that is not a sha256 should have failed the build" >&2
+    exit 1
+fi
+
+# ...and so must one that is a valid line about a different archive, which is
+# what two targets' checksum files swapped look like.
+other="lastpass-ssh-agent-x86_64-apple-darwin.tar.xz"
+printf '%s *%s\n' "$hash" "$other" > "${bad}/${name}.sha256"
+if ./generate-formula.sh 2026.810.0 owner/repo "$bad" >/dev/null 2>&1; then
+    echo "a checksum naming another archive should have failed the build" >&2
     exit 1
 fi
 

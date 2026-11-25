@@ -24,7 +24,23 @@ sha() {
         exit 1
     fi
     # the file holds "<hash> *<name>" — take only the hash
-    awk '{print $1; exit}' "$file"
+    hash="$(awk '{print $1; exit}' "$file")"
+    # The hash is spliced into the sed program below, and the file is whatever
+    # the release holds: anything but a bare sha256 could end the substitution
+    # and add commands of its own.
+    if ! printf '%s\n' "$hash" | grep -qxE '[0-9a-f]{64}'; then
+        echo "not a sha256 for $1: $file" >&2
+        exit 1
+    fi
+    # The hash is picked by this file's name and used for that archive's URL,
+    # so the line has to be about that archive: a checksum file holding
+    # another target's line verifies fine and yields a formula whose hash
+    # does not match its download.
+    if [ "$(awk '{print $2; exit}' "$file")" != "*lastpass-ssh-agent-$1.tar.xz" ]; then
+        echo "checksum for $1 names another file: $file" >&2
+        exit 1
+    fi
+    printf '%s\n' "$hash"
 }
 
 macos_arm="$(sha aarch64-apple-darwin)"
@@ -94,11 +110,27 @@ class LastpassSshAgent < Formula
   # agent on macOS and a systemd user unit on Linux — same declaration, both
   # platforms. std_service_path_env puts Homebrew's bin on PATH so the agent
   # can find lpass, which a bare launchd/systemd environment would not.
+  # The log names the keys and when each one signs, and the service manager
+  # creates it readable by everyone: the agent's own umask never applies to a
+  # file opened before it runs. So it lives in a directory only its owner can
+  # enter, made here because `brew services` would otherwise create a missing
+  # one itself, open to all. A log beside the other formulae's, where the
+  # service wrote before it had a directory, keeps its history and loses its
+  # other readers — the file itself, not whatever a link there points at.
+  def post_install
+    log_dir = var/"log/lastpass-ssh-agent"
+    odie "#{log_dir} is a symlink; the service log needs a directory of its own" if log_dir.symlink?
+    log_dir.mkpath
+    log_dir.chmod 0700
+    shared = var/"log/lastpass-ssh-agent.log"
+    shared.chmod 0600 if shared.file? && !shared.symlink?
+  end
+
   service do
     run [opt_bin/"lastpass-ssh-agent", "start"]
     keep_alive true
-    log_path var/"log/lastpass-ssh-agent.log"
-    error_log_path var/"log/lastpass-ssh-agent.log"
+    log_path var/"log/lastpass-ssh-agent/agent.log"
+    error_log_path var/"log/lastpass-ssh-agent/agent.log"
     environment_variables PATH: std_service_path_env
   end
 
