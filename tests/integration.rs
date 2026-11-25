@@ -294,6 +294,79 @@ async fn debug_logging_never_dumps_agent_requests() {
     );
 }
 
+/// An agent whose stderr is a file a service manager would have opened for
+/// it: created before the agent runs and readable by everyone.
+fn start_agent_logging_to_a_file(rust_log: &str) -> (AgentUnderTest, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let script = write_fake_lpass(dir.path());
+    let socket = dir.path().join("agent.sock");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "socket = \"{}\"\nconfirm = \"off\"\nlpass_path = \"{}\"\n[[keys]]\nid = \"1\"\n",
+            socket.display(),
+            script.display()
+        ),
+    )
+    .unwrap();
+    let log_path = dir.path().join("stderr.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    log.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_lastpass-ssh-agent"))
+        .args(["--config", config_path.to_str().unwrap(), "start"])
+        .env("RUST_LOG", rust_log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let agent = AgentUnderTest {
+        child,
+        socket,
+        _dir: dir,
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !agent.socket.exists() {
+        assert!(Instant::now() < deadline, "agent socket never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    (agent, log_path)
+}
+
+#[test]
+fn a_log_file_opened_for_the_agent_is_made_owner_only() {
+    // The agent's umask never applied to this file, and by the time the
+    // socket exists the log already names the key being served.
+    let (_agent, log_path) = start_agent_logging_to_a_file("info");
+    let mode = std::fs::metadata(&log_path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("serving key"), "nothing was logged:\n{log}");
+}
+
+#[tokio::test]
+async fn an_extension_name_reaches_the_debug_log_escaped() {
+    // The name is the client's, and the log can share a terminal with a
+    // prompt: an escape sequence in it would redraw what the user answers.
+    let (agent, log_path) = start_agent_logging_to_a_file("debug");
+    let mut client = connect(Binding::FilePath(agent.socket.clone()).try_into().unwrap()).unwrap();
+    let _ = client
+        .extension(Extension {
+            name: "x\u{1b}[2J\nKey: forged".into(),
+            details: Vec::new().into(),
+        })
+        .await;
+    // logged before the refusal is sent, so it is there once the reply is
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("x\\x1b[2J\\x0aKey: forged"),
+        "the name is not in the log as escaped text:\n{log}"
+    );
+}
+
 #[tokio::test]
 async fn routine_traffic_is_not_logged_as_errors() {
     // The refusals a normal session produces — OpenSSH's per-connection

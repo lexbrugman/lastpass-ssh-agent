@@ -38,6 +38,9 @@ fn remembered_store(path: &Path, config: &Config) -> Result<Option<keystore::Key
 }
 
 pub async fn run(config_path: &Path) -> Result<()> {
+    // Before a line names a key. Here rather than for every command: a
+    // one-shot's stderr is whatever its caller pointed it at.
+    crate::platform::private_log(std::os::fd::AsFd::as_fd(&std::io::stderr()));
     let config = Arc::new(Config::load_or_default(config_path)?);
     let socket_path = config.socket_path()?;
     let unlock = super::unlock_from(&config, &socket_path)?;

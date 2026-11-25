@@ -27,6 +27,31 @@ pub fn harden() -> Result<()> {
     Ok(())
 }
 
+/// Make the log file this process was started with owner-only, when it is a
+/// file and it is ours.
+///
+/// A service manager opens the log before the agent runs, under its own mask:
+/// `umask` above never applied to it, and the log names the keys and when
+/// each one signs. Anything else is left as it is — a terminal or a pipe has
+/// no mode to fix, and somebody else's file is not ours to change.
+///
+/// Best effort, and deliberately not a reason to refuse a start: a directory
+/// only its owner can enter is what keeps other users out of a log, and the
+/// Homebrew formula puts this one in such a directory.
+pub fn private_log(log: std::os::fd::BorrowedFd<'_>) {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: an all-zero `stat` is a valid one, and fstat writes only into
+    // it. Left zeroed by a failed call, it describes no regular file.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; the descriptor is open for as long as it is borrowed.
+    unsafe { libc::fstat(log.as_raw_fd(), &raw mut stat) };
+    // SAFETY: geteuid cannot fail and touches no memory.
+    if stat.st_mode & libc::S_IFMT == libc::S_IFREG && stat.st_uid == unsafe { libc::geteuid() } {
+        // SAFETY: fchmod touches only the file behind a descriptor we hold.
+        unsafe { libc::fchmod(log.as_raw_fd(), 0o600) };
+    }
+}
+
 /// Lowering `RLIMIT_CORE` to 0/0 cannot fail (no EINVAL/EPERM case applies),
 /// and neither call in `deny_debuggers` can with these arguments, so the error
 /// edge is untestable and excluded from coverage.
@@ -233,6 +258,43 @@ mod tests {
         // SAFETY: umask is process-global; read it by setting and restoring.
         let current = unsafe { libc::umask(0o077) };
         assert_eq!(current, 0o077);
+    }
+
+    fn mode_of(file: &std::fs::File) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.metadata().unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_log_file_of_ours_that_others_can_read_is_made_owner_only() {
+        use std::os::fd::AsFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let log = tempfile::tempfile().unwrap();
+        log.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        private_log(log.as_fd());
+        assert_eq!(mode_of(&log), 0o600);
+    }
+
+    #[test]
+    fn a_log_that_is_not_a_file_is_left_alone() {
+        use std::os::fd::AsFd as _;
+        let (reader, _writer) = std::io::pipe().unwrap();
+        private_log(reader.as_fd());
+    }
+
+    #[test]
+    fn a_log_file_belonging_to_another_user_is_left_alone() {
+        use std::os::fd::AsFd as _;
+        // SAFETY: geteuid cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root owns the file this needs somebody else to own");
+            return;
+        }
+        let roots = std::fs::File::open("/etc/passwd").unwrap();
+        let before = mode_of(&roots);
+        private_log(roots.as_fd());
+        assert_eq!(mode_of(&roots), before);
     }
 
     #[test]

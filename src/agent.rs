@@ -169,7 +169,12 @@ impl LpassAgent {
         }
         // some other vendor extension: unsupported, as advertised
         if extension.name != SessionBind::NAME {
-            tracing::debug!(extension = %extension.name, "refusing unsupported extension");
+            // The name is the client's to choose, and this line can share a
+            // terminal with a prompt.
+            tracing::debug!(
+                extension = %crate::text::display_bounded(&extension.name),
+                "refusing unsupported extension"
+            );
             return Response::Failure;
         }
         let Some(bind) = signing::session_bind(extension.details.as_ref()) else {
