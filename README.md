@@ -110,7 +110,10 @@ Without Homebrew, take the archive for your platform straight from the
 ```sh
 target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, *-apple-darwin
 curl -fsSLO "https://github.com/lexbrugman/lastpass-ssh-agent/releases/latest/download/lastpass-ssh-agent-${target}.tar.xz"
-gh attestation verify "lastpass-ssh-agent-${target}.tar.xz" --repo lexbrugman/lastpass-ssh-agent
+gh attestation verify "lastpass-ssh-agent-${target}.tar.xz" \
+    --repo lexbrugman/lastpass-ssh-agent \
+    --source-ref refs/heads/master \
+    --signer-workflow lexbrugman/lastpass-ssh-agent/.github/workflows/publish-release.yml
 tar -xJf "lastpass-ssh-agent-${target}.tar.xz"
 install -m 755 lastpass-ssh-agent /usr/local/bin/
 ```
@@ -119,9 +122,17 @@ The `gh attestation verify` line is the check worth making. Every archive is
 attested by the workflow that built it, and verifying the attestation proves
 the file came out of this repository's release pipeline, from the commit it
 names, unmodified — something a checksum downloaded from beside the archive
-cannot, since whoever could replace the one could replace the other. (The
-`.sha256` beside each archive is there for the Homebrew formula and for
-spotting a corrupt download; it is not a defence against a substituted one.)
+cannot, since whoever could replace the one could replace the other. The
+last two flags are what make it the *release* pipeline: without them any
+workflow on any branch of the repository would do, and a branch can carry a
+workflow of its own. (The `.sha256` beside each archive is there for the
+Homebrew formula and for spotting a corrupt download; it is not a defence
+against a substituted one.)
+
+Homebrew does not check the attestation: it verifies attestations only for
+its own core bottles, and for a tap it holds a download to the `sha256` in
+the formula. What stands behind that hash is the tap itself, which only a
+release from `master` can write to.
 
 > The tap is populated by the release pipeline. If `brew install` cannot find
 > the formula, the tap does not exist yet — build from source.
