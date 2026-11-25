@@ -8,6 +8,9 @@ pub const ED25519: &str = include_str!("../fixtures/ed25519");
 pub const ED25519_PUB: &str = include_str!("../fixtures/ed25519.pub");
 pub const ED25519_PW: &str = include_str!("../fixtures/ed25519_pw");
 pub const ED25519_PW_PUB: &str = include_str!("../fixtures/ed25519_pw.pub");
+/// Encrypted with the same passphrase as `ED25519_PW`, under 1025 KDF rounds.
+pub const ED25519_SLOW_KDF: &str = include_str!("../fixtures/ed25519_slow_kdf");
+pub const ED25519_SLOW_KDF_PUB: &str = include_str!("../fixtures/ed25519_slow_kdf.pub");
 pub const RSA: &str = include_str!("../fixtures/rsa");
 pub const RSA_PUB: &str = include_str!("../fixtures/rsa.pub");
 pub const ECDSA: &str = include_str!("../fixtures/ecdsa");

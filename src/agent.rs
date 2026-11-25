@@ -77,6 +77,14 @@ const MAX_SESSION_ID_BYTES: usize = 128;
 /// binding limit would bound nothing.
 const MAX_HOST_KEY_BYTES: usize = 64 * 1024;
 
+/// The most bcrypt-pbkdf rounds an encrypted key may declare. The count sits in
+/// the key file in the clear, the vault item is whoever wrote it's to fill,
+/// and the derivation runs on the thread every other request waits on — so an
+/// unbounded one stalls the whole agent for as long as its author likes.
+/// `ssh-keygen` writes a count in the tens, and `-a 100` is the usual advice
+/// for a slow one; this allows ten times that.
+const MAX_KDF_ROUNDS: u32 = 1024;
+
 impl LpassAgent {
     pub fn new(
         store: Served,
@@ -365,6 +373,17 @@ impl LpassAgent {
                 "the vault's key no longer matches the advertised one",
             );
             return Err("private key does not match the advertised public key — vault item changed since startup?".into());
+        }
+
+        // Before a passphrase is asked for or anything is derived, for the
+        // same reason as the check above: this request is refused regardless.
+        if let ssh_key::Kdf::Bcrypt { rounds, .. } = key.kdf()
+            && *rounds > MAX_KDF_ROUNDS
+        {
+            return Err(format!(
+                "private key declares {rounds} KDF rounds, more than the {MAX_KDF_ROUNDS} \
+                 this agent derives — re-encrypt it with fewer (ssh-keygen -p -a 100)"
+            ));
         }
 
         // Only an encrypted key resolves a passphrase at all: an unencrypted
@@ -1187,6 +1206,33 @@ mod tests {
         assert!(
             !prompt.was_asked(),
             "a key we will not sign with must not be unlocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_declaring_too_many_kdf_rounds_is_refused_before_any_passphrase_is_asked_for() {
+        // The round count is the vault item's to choose and the derivation
+        // blocks every other request, so the refusal has to come before the
+        // passphrase is resolved — which is also before anything is derived.
+        let prompt = TypedPassphrase::new(b"fixture-passphrase");
+        let client = MockLpass::logged_in()
+            .with_field("1", "Public Key", ED25519_SLOW_KDF_PUB.as_bytes())
+            .with_field("1", "Private Key", ED25519_SLOW_KDF.as_bytes());
+        let mut agent = agent_prompting(
+            client,
+            "confirm = \"off\"\n[[keys]]\nid = \"1\"",
+            prompt.clone(),
+        )
+        .await;
+        assert!(
+            agent
+                .sign(sign_request(ED25519_SLOW_KDF_PUB, b"payload", 0))
+                .await
+                .is_err()
+        );
+        assert!(
+            !prompt.was_asked(),
+            "a key we will not derive for must not be unlocked"
         );
     }
 
