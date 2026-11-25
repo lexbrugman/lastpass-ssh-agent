@@ -5,7 +5,7 @@
 /// around it in a confirmation prompt, an `ssh-add -l` listing, or a log
 /// line.
 ///
-/// Two classes are escaped:
+/// Three classes are escaped:
 ///
 /// - Control characters — the Unicode `Cc` category, so C0, DEL and C1
 ///   alike. These drive the terminal.
@@ -16,11 +16,13 @@
 ///   the zero-width characters hide text outright. A dialog is exactly the
 ///   surface where that matters, since the whole point is that the user
 ///   reads it.
+/// - The line and paragraph separators (see `breaks_a_line`), which are
+///   neither of the above and still start a new line in a dialog.
 pub fn escape_for_display(text: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if !c.is_control() && !is_invisible(c) {
+        if !c.is_control() && !is_invisible(c) && !breaks_a_line(c) {
             out.push(c);
             continue;
         }
@@ -127,6 +129,14 @@ fn is_invisible(c: char) -> bool {
         .any(|&(start, end)| (start..=end).contains(&code))
 }
 
+/// LINE SEPARATOR and PARAGRAPH SEPARATOR. Not controls, and not invisible
+/// formatting either, so `INVISIBLE_RANGES` stays the standard's set — but a
+/// dialog breaks the line on them exactly as on a newline, and a name that
+/// can start a line can forge one of the prompt's own.
+const fn breaks_a_line(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -193,6 +203,15 @@ mod tests {
             let escaped = escape_for_display(&c.to_string());
             assert!(escaped.starts_with("\\u{"), "{c:?} -> {escaped}");
         }
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_cannot_forge_a_line() {
+        assert_eq!(
+            escape_for_display("key\u{2028}Requested by: ssh"),
+            "key\\u{2028}Requested by: ssh"
+        );
+        assert_eq!(escape_for_display("a\u{2029}b"), "a\\u{2029}b");
     }
 
     #[test]
