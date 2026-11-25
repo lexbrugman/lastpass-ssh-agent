@@ -595,7 +595,11 @@ per push.
 Off by default, because the trade is real: while an approval stands, anything
 able to drive that application can sign with that key unasked — and what a
 request "was started from" is what the kernel reports about a process running
-as you, which a process running as you can arrange. The prompt itself is
+as you, which a process running as you can arrange. So is the application
+itself: the agent knows a client by its process id, and a process can become
+another program without changing its id, leaving a connection it opened in
+other hands. "Requested by" is therefore a description, not a proof, in the
+prompt as much as in what is remembered. The prompt itself is
 unchanged, and a request that differs in any of the words it shows — another
 key, another host, another place it was started from — asks again.
 
