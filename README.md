@@ -29,7 +29,9 @@ What this agent **guarantees**:
 - **The host is named, and forwarding is visible.** The agent implements
   `session-bind@openssh.com`, so the prompt names the host each request is for
   — by hostname where `known_hosts` records one for that key, by fingerprint
-  otherwise — and each hop proved possession of its host key. A host whose
+  otherwise — and each hop proved possession of its host key. It names the
+  account being logged in to as well, taken from what is being signed, so a
+  request for `root` does not read like one for `deploy`. A host whose
   key is a certificate is bound like any other and shown by the fingerprint
   of the key inside it. When the request
   arrived over a connection you forwarded with `ssh -A` it says so and warns
@@ -559,7 +561,7 @@ another agent.
 
 | mode | behavior |
 |---|---|
-| `osascript` (macOS default) | Native dialog: key name, fingerprint, requesting process (pid/uid via the socket's peer credentials) and what it was started from, and the bound host. Deny is default + cancel; expiry = Deny; no GUI session = Deny. Vault-sourced strings are passed as AppleScript *arguments*, never spliced into code. |
+| `osascript` (macOS default) | Native dialog: key name, fingerprint, requesting process (pid/uid via the socket's peer credentials) and what it was started from, the bound host and the account being logged in to. Deny is default + cancel; expiry = Deny; no GUI session = Deny. Vault-sourced strings are passed as AppleScript *arguments*, never spliced into code. |
 | `tty` (Linux default) | Prompt on the agent's own `/dev/tty`; type `yes` to approve. |
 | `askpass` | Runs the program in `askpass` with the prompt as its argument; exit 0 approves. `SSH_ASKPASS_PROMPT=confirm` is set, so OpenSSH-compatible helpers show a yes/no dialog rather than their password prompt — without it, clicking OK would approve whatever was typed. |
 | `off` | No confirmation (socket permissions are then your only guard, as with stock ssh-agent). |
@@ -572,7 +574,9 @@ remember_approvals = true
 
 With this on, approving a signature answers the same question the next time
 it is asked — the same key, for the same process started from the same chain,
-bound to the same hosts — until the vault locks: the screen locks, the master
+bound to the same hosts, logging in as the same user (where the client says
+which session it is for: one that sends no binding, such as OpenSSH before
+8.9, names no hosts and no user to the agent) — until the vault locks: the screen locks, the master
 password goes unused for `master_password_idle_secs`, the agent has to ask for
 it again for any reason, or the agent stops. (A vault your shell unlocked
 expires without telling the agent; the request that finds it locked asks for

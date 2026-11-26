@@ -21,6 +21,11 @@ pub struct ConfirmContext {
     /// Hosts this connection is bound to, oldest hop first. Empty when the
     /// client sent no binding (local tools like `ssh-add`, or OpenSSH < 8.9).
     pub bindings: Vec<SessionBinding>,
+    /// The account the request logs in to, as what is being signed names it.
+    /// Known only on a bound connection, where nothing but a userauth request
+    /// is signed. The requester's to choose, so untrusted — and kept as the
+    /// bytes signed, since the server is what decides which of them differ.
+    pub user: Option<Vec<u8>>,
     /// The request reached the agent over a forward and does not name its
     /// server, so the last binding is the forwarded side's word and nothing
     /// in what gets signed holds it to that host. See `signing::Userauth`.
@@ -76,6 +81,7 @@ impl ConfirmContext {
             peer,
             requester: peer.and_then(|peer| peer.pid).and_then(Requester::of),
             bindings,
+            user: None,
             unverified_destination: false,
         }
     }
@@ -190,11 +196,22 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
     // the kernel's. The name is the vault's, and as long as whoever wrote it
     // cared to make it.
     let mut text = format!(
-        "SSH signature request\n\nKey: {}\nFingerprint: {}\nLastPass item: {}\nRequested by: {requester}",
+        "SSH signature request\n\nKey: {}\nFingerprint: {}\nLastPass item: {}",
         display_bounded(&ctx.key_name),
         escape_for_display(&ctx.fingerprint),
         escape_for_display(&ctx.item_id),
     );
+    // Approving a key for a host is approving it for this account there, and
+    // one key is often good for several: without the name, a request for
+    // `root` reads the same as one for `deploy`.
+    if let Some(user) = &ctx.user {
+        let _ = write!(
+            text,
+            "\nLog in as: {}",
+            display_bounded(&String::from_utf8_lossy(user))
+        );
+    }
+    let _ = write!(text, "\nRequested by: {requester}");
     // Without this, a request relayed from a machine you ran `ssh -A` to is
     // indistinguishable from one you made yourself: both name the local ssh
     // process. Each hop in the chain proved possession of its host key.
@@ -241,7 +258,7 @@ pub fn describe_request(ctx: &ConfirmContext) -> String {
 
 /// What a remembered approval answers for: the key, and everything the
 /// prompt says about who asked — the process and its uid, what it was started
-/// from, and the hosts the session is bound to. The same words on screen are
+/// from, the hosts the session is bound to and the account logged in to. The same words on screen are
 /// the same question; anything else asks again. The pid is left out, since a
 /// new `ssh` has a new one every time and is the point of remembering.
 ///
@@ -299,6 +316,10 @@ pub fn approval_question(ctx: &ConfirmContext) -> Option<String> {
             .collect::<Vec<_>>()
             .join(&SEP.to_string()),
         hosts.join(&SEP.to_string()),
+        // The bytes, not the words shown for them: two names the prompt
+        // renders alike — invalid UTF-8, or a control character beside its
+        // own escape — are two accounts to the server.
+        ctx.user.as_deref().map_or_default(hex),
         (if ctx.unverified_destination {
             "unverified"
         } else {
@@ -310,6 +331,15 @@ pub fn approval_question(ctx: &ConfirmContext) -> Option<String> {
         question.push('\n');
     }
     Some(question)
+}
+
+/// Bytes as lowercase hex, which no two byte strings share.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
 }
 
 /// Used when `confirm = "off"` globally. A per-key override is handled by not
@@ -564,6 +594,50 @@ mod tests {
     }
 
     #[test]
+    fn the_account_logged_in_to_is_shown_and_is_part_of_the_question() {
+        let known = from_peer(Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        }));
+        let unnamed = describe_request(&known);
+        assert!(!unnamed.contains("Log in as"), "{unnamed}");
+
+        let as_user = |user: &[u8]| ConfirmContext {
+            user: Some(user.to_vec()),
+            ..known.clone()
+        };
+        let text = describe_request(&as_user(b"deploy"));
+        assert!(
+            text.contains("LastPass item: 42\nLog in as: deploy\nRequested by: "),
+            "{text}"
+        );
+        // the requester's to choose, so it cannot forge a line of the prompt
+        let forged = describe_request(&as_user(b"deploy\nRequested by: you"));
+        assert!(
+            forged.contains("Log in as: deploy\\x0aRequested by: you\n"),
+            "{forged}"
+        );
+
+        // an approval for one account does not answer for another
+        assert_ne!(
+            approval_question(&as_user(b"deploy")).unwrap(),
+            approval_question(&as_user(b"root")).unwrap()
+        );
+        // nor for one the prompt happens to render the same way: two invalid
+        // names, and a control character beside its own escape
+        for (one, other) in [(&b"a\xff"[..], &b"a\xfe"[..]), (b"a\n", b"a\\x0a")] {
+            assert_eq!(
+                describe_request(&as_user(one)),
+                describe_request(&as_user(other))
+            );
+            assert_ne!(
+                approval_question(&as_user(one)).unwrap(),
+                approval_question(&as_user(other)).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn an_unverified_destination_is_a_question_of_its_own() {
         // an approval given for hosts the request named must not answer for
         // the same hosts as a claim, nor the other way round
@@ -652,10 +726,11 @@ mod tests {
                 host_key: Vec::new(),
             },
         ];
+        ctx.user = Some(b"git".to_vec());
         let bound = approval_question(&ctx).unwrap();
         assert!(
-            // the last line is whether the destination is unverified
-            bound.ends_with("\nSHA256:aaa\x1ea\x1eforwarding\x1fSHA256:bbb\x1e\x1e\n\n"),
+            // then the account, and last whether the destination is unverified
+            bound.ends_with("\nSHA256:aaa\x1ea\x1eforwarding\x1fSHA256:bbb\x1e\x1e\n676974\n\n"),
             "{bound:?}"
         );
         assert_ne!(bound, question);

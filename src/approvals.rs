@@ -1,7 +1,8 @@
 //! Approvals remembered until the vault locks.
 //!
 //! Opt-in. With it on, approving a signature for one key from one place — the
-//! same process started from the same chain, bound to the same hosts — answers
+//! same process started from the same chain, bound to the same hosts as the
+//! same user — answers
 //! the same question the next time, until the vault locks. The trade: one
 //! prompt per key per application per unlock, instead of one per signature,
 //! in exchange for anything that can drive that application signing unasked

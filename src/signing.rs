@@ -68,6 +68,9 @@ fn crypto_err<E: std::fmt::Display>(e: E) -> SignError {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Userauth<'a> {
     pub session_id: &'a [u8],
+    /// The account being logged in to. Part of what is signed, so a signature
+    /// for one user is no use for another — and the requester's to choose.
+    pub user: &'a [u8],
     /// Whether the signed data names the server's host key. A request that
     /// does is good at that server alone; one that does not is good wherever
     /// its session id is, and a session id says nothing about which server.
@@ -94,7 +97,7 @@ pub fn userauth_request<'a>(
     let mut request = Wire(data);
     let session_id = request.string()?;
     (request.byte()? == SSH_MSG_USERAUTH_REQUEST).then_some(())?;
-    let _user = request.string()?;
+    let user = request.string()?;
     (request.string()? == b"ssh-connection").then_some(())?;
     let method = request.string()?;
     let host_bound = method == b"publickey-hostbound-v00@openssh.com";
@@ -107,6 +110,7 @@ pub fn userauth_request<'a>(
     }
     request.0.is_empty().then_some(Userauth {
         session_id,
+        user,
         host_bound,
     })
 }
@@ -328,6 +332,7 @@ mod tests {
             userauth_request(&ok, key, host),
             Some(Userauth {
                 session_id: b"sid",
+                user: b"user",
                 host_bound: false
             })
         );
@@ -348,6 +353,7 @@ mod tests {
             userauth_request(&bound, key, host),
             Some(Userauth {
                 session_id: b"sid",
+                user: b"user",
                 host_bound: true
             })
         );

@@ -77,6 +77,12 @@ const MAX_SESSION_ID_BYTES: usize = 128;
 /// binding limit would bound nothing.
 const MAX_HOST_KEY_BYTES: usize = 64 * 1024;
 
+/// The longest account name a bound request may log in as. An account name
+/// is tens of bytes and the longest any directory allows is about this; the
+/// name is the requester's to fill, and a remembered approval keeps it until
+/// the vault locks.
+const MAX_USER_BYTES: usize = 1024;
+
 /// The most bcrypt-pbkdf rounds an encrypted key may declare. The count sits in
 /// the key file in the clear, the vault item is whoever wrote it's to fill,
 /// and the derivation runs on the thread every other request waits on — so an
@@ -411,6 +417,7 @@ impl LpassAgent {
     async fn approval_for(
         &self,
         entry: &KeyEntry,
+        user: Option<Vec<u8>>,
         unverified_destination: bool,
         gate: &mut InteractionGate,
     ) -> Result<Answer, AgentError> {
@@ -418,6 +425,7 @@ impl LpassAgent {
         // about it needs the user, so no other request should stand behind it.
         let bindings = self.named_bindings().await;
         let describe = |bindings| ConfirmContext {
+            user: user.clone(),
             unverified_destination,
             ..ConfirmContext::new(entry, self.peer, bindings)
         };
@@ -583,11 +591,20 @@ impl Session for LpassAgent {
         // is still signed — plenty of servers offer nothing else — and the
         // prompt says what it cannot vouch for.
         let mut unverified_destination = false;
+        // Whom the request logs in as, for the prompt.
+        let mut user = None;
         if let Some(bound) = self.bindings.last() {
             let public_key = entry.public.to_bytes().unwrap_or_else(unencodable);
             match signing::userauth_request(&request.data, &public_key, &bound.host_key) {
                 Some(userauth) if userauth.session_id == bound.session_id => {
+                    if userauth.user.len() > MAX_USER_BYTES {
+                        tracing::warn!(item = %entry.item_id, key = %entry.name,
+                            "refusing to sign: the request logs in as a name longer than \
+                             any account's");
+                        return Err(AgentError::Failure);
+                    }
                     unverified_destination = self.bindings.len() > 1 && !userauth.host_bound;
+                    user = Some(userauth.user.to_vec());
                 }
                 Some(_) => {
                     tracing::warn!(item = %entry.item_id, key = %entry.name,
@@ -606,7 +623,7 @@ impl Session for LpassAgent {
         }
 
         let answer = if entry.confirm {
-            self.approval_for(entry, unverified_destination, &mut gate)
+            self.approval_for(entry, user, unverified_destination, &mut gate)
                 .await?
         } else {
             Answer::NotNeeded
@@ -754,6 +771,16 @@ mod tests {
 
     /// The same in the host-bound form, naming `host` as the server.
     fn userauth_to(session_id: &[u8], public: &str, host: Option<&PrivateKey>) -> Vec<u8> {
+        userauth_as(b"user", session_id, public, host)
+    }
+
+    /// The same, logging in as `user`.
+    fn userauth_as(
+        user: &[u8],
+        session_id: &[u8],
+        public: &str,
+        host: Option<&PrivateKey>,
+    ) -> Vec<u8> {
         let string = |value: &[u8]| {
             let mut out = u32::try_from(value.len()).unwrap().to_be_bytes().to_vec();
             out.extend_from_slice(value);
@@ -762,7 +789,7 @@ mod tests {
         let key = ssh_key::PublicKey::from_openssh(public.trim()).unwrap();
         let mut data = string(session_id);
         data.push(50);
-        data.extend(string(b"user"));
+        data.extend(string(user));
         data.extend(string(b"ssh-connection"));
         data.extend(string(host.map_or(&b"publickey"[..], |_| {
             b"publickey-hostbound-v00@openssh.com"
@@ -2034,6 +2061,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_request_logging_in_as_a_name_longer_than_any_account_is_refused() {
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone()).await;
+        let host = PrivateKey::from_openssh(ED25519).unwrap();
+        agent
+            .handle(session_bind(&host, b"session-one", false))
+            .await
+            .unwrap();
+        let sign_as = |user: &[u8]| {
+            Request::SignRequest(sign_request(
+                ED25519_PUB,
+                &userauth_as(user, b"session-one", ED25519_PUB, None),
+                0,
+            ))
+        };
+
+        assert_matches!(
+            agent.handle(sign_as(&[b'a'; 1025])).await.unwrap(),
+            Response::Failure
+        );
+        assert!(
+            confirmer.0.lock().unwrap().is_empty(),
+            "refused before anyone is asked"
+        );
+        // the longest allowed is still signed
+        assert_matches!(
+            agent.handle(sign_as(&[b'a'; 1024])).await.unwrap(),
+            Response::SignResponse(_)
+        );
+    }
+
+    #[tokio::test]
     async fn a_verified_binding_tells_the_prompt_which_host_asked() {
         let confirmer = Arc::new(RecordingConfirmer::default());
         let mut agent = agent_recording(confirmer.clone()).await;
@@ -2064,6 +2123,8 @@ mod tests {
         assert!(prompts[0].contains(&host_fp), "{}", prompts[0]);
         // not forwarded: no warning
         assert!(!prompts[0].contains("WARNING"), "{}", prompts[0]);
+        // and which account there, from what is being signed
+        assert!(prompts[0].contains("\nLog in as: user\n"), "{}", prompts[0]);
     }
 
     #[tokio::test]
