@@ -40,8 +40,10 @@ pub enum Failure {
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     /// Put a yes/no question. `Ok(true)` is a yes; `Ok(false)` is anything
-    /// the user did short of one, a refusal and a dismissal alike.
-    async fn ask_to_confirm(&self, message: &str) -> Result<bool, Failure>;
+    /// the user did short of one, a refusal and a dismissal alike. `caution`
+    /// marks a question to stop and read, for a transport that can make one
+    /// look different from the rest.
+    async fn ask_to_confirm(&self, message: &str, caution: bool) -> Result<bool, Failure>;
 
     /// Ask for a secret, hidden as it is typed. `Ok(None)` is a dismissal: the
     /// user chose not to answer, which is not an empty answer.

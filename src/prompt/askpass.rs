@@ -65,7 +65,7 @@ impl AskpassTransport {
 
 #[async_trait::async_trait]
 impl Transport for AskpassTransport {
-    async fn ask_to_confirm(&self, message: &str) -> Result<bool, Failure> {
+    async fn ask_to_confirm(&self, message: &str, _caution: bool) -> Result<bool, Failure> {
         let child = self.spawn(message, Mode::Confirm)?;
         let output = tokio::time::timeout(self.timeout, child.wait_with_output())
             .await
@@ -143,7 +143,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             transport(dir.path(), "exit 0")
-                .ask_to_confirm("question")
+                .ask_to_confirm("question", false)
                 .await,
             Ok(true)
         );
@@ -154,7 +154,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             transport(dir.path(), "exit 1")
-                .ask_to_confirm("question")
+                .ask_to_confirm("question", false)
                 .await,
             Ok(false)
         );
@@ -177,7 +177,7 @@ mod tests {
                 marker.display()
             ),
         );
-        t.ask_to_confirm("question").await.unwrap();
+        t.ask_to_confirm("question", false).await.unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "[confirm]");
         t.ask_for_secret("key").await.unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "[]");
@@ -191,7 +191,7 @@ mod tests {
             dir.path(),
             &format!("printf '%s' \"$1\" > {}; echo s", marker.display()),
         );
-        t.ask_to_confirm("approve this?").await.unwrap();
+        t.ask_to_confirm("approve this?", false).await.unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "approve this?");
         t.ask_for_secret("unlock that").await.unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "unlock that");
@@ -202,7 +202,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = AskpassTransport::new(helper(dir.path(), "sleep 30"), Duration::from_millis(200));
         let start = std::time::Instant::now();
-        assert_eq!(t.ask_to_confirm("question").await, Err(Failure::TimedOut));
+        assert_eq!(
+            t.ask_to_confirm("question", false).await,
+            Err(Failure::TimedOut)
+        );
         assert_eq!(t.ask_for_secret("key").await, Err(Failure::TimedOut));
         assert!(start.elapsed() < Duration::from_secs(5));
     }
@@ -214,7 +217,7 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_matches!(
-            t.ask_to_confirm("question").await,
+            t.ask_to_confirm("question", false).await,
             Err(Failure::Unavailable(_))
         );
         assert_matches!(t.ask_for_secret("key").await, Err(Failure::Unavailable(_)));

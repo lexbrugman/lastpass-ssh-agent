@@ -92,6 +92,11 @@ impl Approvals {
         self
     }
 
+    /// Whether an approval is kept at all.
+    pub const fn remembers(&self) -> bool {
+        self.enabled
+    }
+
     pub const fn remembers_unverified(&self) -> bool {
         self.unverified
     }

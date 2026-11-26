@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::keystore::KeyEntry;
 use crate::prompt::{Failure, Transport};
 use crate::requester::Requester;
-use crate::text::{display_bounded, escape_for_display};
+use crate::text::{bounded, display_bounded, escape_for_display};
 
 /// What the user is being asked to approve. Everything here may be shown in
 /// a dialog; none of it is secret. `key_name` comes from the vault/config
@@ -26,6 +26,14 @@ pub struct ConfirmContext {
     /// is signed. The requester's to choose, so untrusted — and kept as the
     /// bytes signed, since the server is what decides which of them differ.
     pub user: Option<Vec<u8>>,
+    /// The namespace of an `ssh-keygen -Y sign` signature — `git` for a commit
+    /// or tag — when that is what is being signed rather than a login. The
+    /// requester's to choose, like `user`, and kept as bytes for the same
+    /// reason.
+    pub namespace: Option<Vec<u8>>,
+    /// Whether a yes to this is kept and answers the same question again
+    /// until the vault locks, so the prompt can say what the yes covers.
+    pub remembered: bool,
     /// The request reached the agent over a forward and does not name its
     /// server, so the last binding is the forwarded side's word and nothing
     /// in what gets signed holds it to that host. See `signing::Userauth`.
@@ -82,6 +90,8 @@ impl ConfirmContext {
             requester: peer.and_then(|peer| peer.pid).and_then(Requester::of),
             bindings,
             user: None,
+            namespace: None,
+            remembered: false,
             unverified_destination: false,
         }
     }
@@ -118,7 +128,11 @@ impl TransportConfirmer {
 #[async_trait::async_trait]
 impl Confirmer for TransportConfirmer {
     async fn confirm(&self, ctx: &ConfirmContext) -> Decision {
-        match self.transport.ask_to_confirm(&describe_request(ctx)).await {
+        match self
+            .transport
+            .ask_to_confirm(&describe_request(ctx), needs_caution(ctx))
+            .await
+        {
             Ok(true) => Decision::Approve,
             Ok(false) => {
                 tracing::info!("confirmation declined, denying");
@@ -152,113 +166,219 @@ pub fn from_config(config: &crate::config::Config) -> crate::error::Result<Arc<d
     })
 }
 
-/// Human-readable description of a signing request, shared by all confirmers.
-///
-/// The key name, the requester's path, its ancestors' names and the host name
-/// are all untrusted — the vault, whoever spawned the processes, and
-/// `known_hosts` respectively. They only ever travel as data, but control
-/// characters could still redraw a TTY prompt and a bidi override could
-/// reverse how a line renders, either of which spoofs what is being approved.
-/// So everything interpolated here is escaped.
-pub fn describe_request(ctx: &ConfirmContext) -> String {
-    use std::fmt::Write as _;
-    let requester = match (ctx.peer, &ctx.requester) {
-        (None, _) => "unknown".to_string(),
-        (Some(peer), None) => peer.pid.map_or_else(
-            || format!("uid {}", peer.uid),
-            |pid| format!("unknown process (pid {pid}, uid {})", peer.uid),
-        ),
-        (Some(peer), Some(requester)) => {
-            let mut line = format!(
-                "{} (pid {}, uid {})",
-                requester.process,
-                // A requester is only ever looked up by a pid.
-                peer.pid.unwrap_or_default(),
-                peer.uid
-            );
-            // `ssh` says nothing about whether it was you. What it was started
-            // from — a shell in a terminal, an editor, a build — is what the
-            // person reading this recognises, and what a request from
-            // somewhere unexpected stands out by.
-            if !requester.origin.is_empty() {
-                let names: Vec<&str> = requester
-                    .origin
-                    .iter()
-                    .map(|ancestor| ancestor.name.as_str())
-                    .collect();
-                let _ = write!(line, "\nStarted from: {}", names.join(" → "));
-            }
-            line
-        }
+// What a prompt gives each part that is context rather than the decision.
+// The macOS dialog shows a screenful and scrolls for the rest, so what counts
+// is what is read without scrolling: everything above the details has a
+// bound — `the_longest_prompt_there_can_be_is_bounded` holds that — and
+// whatever gives way does so marked. The host, the account and the key name
+// keep `text::MAX_DISPLAY_CHARS`: those are compared, and a short cut would
+// make two of them read alike. The details are scrolled to on purpose, and
+// are cut only where a terminal — which prints all of this above the question
+// it then asks, and scrolls nothing back — would lose the question to them.
+
+/// A process in the `From` line: longer than any application's name.
+const MAX_ORIGIN_NAME_CHARS: usize = 40;
+/// A host in the `Via` line: a fingerprint whole, and most names.
+const MAX_HOP_CHARS: usize = 64;
+/// How long a chain is shown hop by hop. A longer one shows where it starts,
+/// where it ends, and how many hosts lie between.
+const MAX_HOPS_SHOWN: usize = 4;
+/// The requester's path in the details: any path there is whole, since two
+/// that differ only at the end are two programs, and about half a terminal's
+/// screen at the most.
+const MAX_PATH_CHARS: usize = 1000;
+
+/// Whether a request is one to stop and read: it came over a forwarded agent,
+/// or names a destination nothing holds it to. A transport that can show the
+/// difference does, so that the unusual request is the one that looks unusual.
+pub fn needs_caution(ctx: &ConfirmContext) -> bool {
+    ctx.unverified_destination || ctx.bindings.iter().any(|bind| bind.is_forwarding)
+}
+
+/// The decision in one line: what saying yes does.
+fn headline(ctx: &ConfirmContext) -> String {
+    let shown = |bytes: &[u8]| display_bounded(&String::from_utf8_lossy(bytes));
+    // Named as it is and no more: the namespace is the requester's word for
+    // what it hashed, and the hash is all that arrives here — `git` says a
+    // commit or a tag is being signed, and proves neither.
+    if let Some(namespace) = &ctx.namespace {
+        return format!("Sign data for \"{}\"?", shown(namespace));
+    }
+    let Some(destination) = ctx.bindings.last() else {
+        return "Allow an SSH signature?".into();
     };
-    // The name is cut to a bound and the rest only escaped: a fingerprint and
-    // an item id are already the size they are, and the requester's paths are
-    // the kernel's. The name is the vault's, and as long as whoever wrote it
-    // cared to make it.
-    let mut text = format!(
-        "SSH signature request\n\nKey: {}\nFingerprint: {}\nLastPass item: {}",
-        display_bounded(&ctx.key_name),
-        escape_for_display(&ctx.fingerprint),
-        escape_for_display(&ctx.item_id),
+    // The name when there is one: a fingerprint identifies the host exactly
+    // and says nothing to the person reading it. The log keeps the
+    // fingerprint either way.
+    let mut line = format!(
+        "Sign in to {}",
+        display_bounded(
+            destination
+                .host_name
+                .as_ref()
+                .unwrap_or(&destination.host_fingerprint)
+        )
     );
+    if ctx.unverified_destination {
+        line.push_str(" (unverified)");
+    }
     // Approving a key for a host is approving it for this account there, and
     // one key is often good for several: without the name, a request for
     // `root` reads the same as one for `deploy`.
     if let Some(user) = &ctx.user {
-        let _ = write!(
-            text,
-            "\nLog in as: {}",
-            display_bounded(&String::from_utf8_lossy(user))
-        );
+        line.push_str(" as ");
+        line.push_str(&shown(user));
     }
-    let _ = write!(text, "\nRequested by: {requester}");
+    line.push('?');
+    line
+}
+
+/// What the request came from, outermost first and ending in the requester:
+/// "Terminal → zsh → ssh". `ssh` says nothing about whether it was you; what
+/// it was started from is what the person reading this recognises, and what a
+/// request from somewhere unexpected stands out by.
+fn origin(ctx: &ConfirmContext) -> String {
+    match (ctx.peer, &ctx.requester) {
+        (None, _) => "unknown".into(),
+        (Some(_), None) => "unknown process".into(),
+        (Some(_), Some(requester)) => {
+            let own = crate::requester::display_name(&requester.process);
+            let names: Vec<String> = requester
+                .origin
+                .iter()
+                .rev()
+                .map(|ancestor| ancestor.name.as_str())
+                .chain([own.as_str()])
+                .map(|name| bounded(name, MAX_ORIGIN_NAME_CHARS))
+                .collect();
+            names.join(" → ")
+        }
+    }
+}
+
+/// The requester exactly: its path, which a name cannot stand in for — any
+/// file can be called `ssh` — and the pid and uid the socket reported.
+fn requester_detail(ctx: &ConfirmContext) -> Option<String> {
+    let peer = ctx.peer?;
+    Some(match (&ctx.requester, peer.pid) {
+        // A requester is only ever looked up by a pid.
+        (Some(requester), pid) => format!(
+            "{} (pid {}, uid {})",
+            bounded(&requester.process, MAX_PATH_CHARS),
+            pid.unwrap_or_default(),
+            peer.uid
+        ),
+        (None, Some(pid)) => format!("pid {pid}, uid {}", peer.uid),
+        (None, None) => format!("uid {}", peer.uid),
+    })
+}
+
+/// Human-readable description of a signing request, shared by all confirmers.
+///
+/// Laid out to be read from the top and stopped at any point: what is wrong
+/// with the request if anything is, then the decision in one line, then with
+/// which key and where it came from, and last the identifiers that settle a
+/// doubt but are not read otherwise. A dialog shows the top and scrolls for
+/// the rest, which is the other reason the order is this one.
+///
+/// The key name, the requester's path, its ancestors' names, the host name,
+/// the account and the namespace are all untrusted — the vault, whoever
+/// spawned the processes, `known_hosts` and the requester respectively. They
+/// only ever travel as data, but control characters could still redraw a TTY
+/// prompt and a bidi override could reverse how a line renders, either of
+/// which spoofs what is being approved. So everything interpolated here is
+/// escaped, and what is as long as its author cared to make it is cut to a
+/// bound.
+pub fn describe_request(ctx: &ConfirmContext) -> String {
+    use std::fmt::Write as _;
+    let forwarded = ctx.bindings.iter().any(|bind| bind.is_forwarding);
+    let mut text = String::new();
     // Without this, a request relayed from a machine you ran `ssh -A` to is
     // indistinguishable from one you made yourself: both name the local ssh
     // process. Each hop in the chain proved possession of its host key.
-    if !ctx.bindings.is_empty() {
-        let chain: Vec<String> = ctx
-            .bindings
-            .iter()
-            .map(|bind| {
-                // The name when there is one: a fingerprint identifies the
-                // host exactly and says nothing to the person reading it. The
-                // log keeps the fingerprint either way.
-                let mut hop =
-                    display_bounded(bind.host_name.as_ref().unwrap_or(&bind.host_fingerprint));
-                if bind.is_forwarding {
-                    hop.push_str(" (forwarding the agent onward)");
-                }
-                hop
-            })
-            .collect();
-        // The warning ahead of the hops rather than after them: a chain is as
-        // long as a forwarded peer cares to make it, and a dialog clips at the
-        // bottom.
-        if ctx.bindings.iter().any(|bind| bind.is_forwarding) {
-            text.push_str(
-                "\n\nWARNING: the agent is forwarded to a host below — this request may \
-                 have originated there rather than on this machine.",
-            );
-        }
-        // Ahead of the hops, as the warning is, and for the same reason.
-        if ctx.unverified_destination {
-            text.push_str(
-                "\n\nUNVERIFIED DESTINATION: this request does not name its server, so the \
-                 last host below is only what the forwarded side says — the session being \
-                 signed for may be with a different server.",
-            );
-        }
-        let _ = write!(text, "\nSSH session: {}", chain.join(" → "));
+    if forwarded {
+        text.push_str(
+            "WARNING: the agent is forwarded to a host below — this request may have \
+             originated there rather than on this machine.\n\n",
+        );
+    }
+    if ctx.unverified_destination {
+        text.push_str(
+            "UNVERIFIED DESTINATION: this request does not name its server, so the last \
+             host below is only what the forwarded side says — the session being signed \
+             for may be with a different server.\n\n",
+        );
+    }
+    text.push_str(&headline(ctx));
+    // With the question, since it says what the answer to it means.
+    if ctx.remembered {
+        text.push_str("\nAllow is remembered until the vault locks.");
+    }
+    // The key straight after, ahead of the lines a process tree and a
+    // forwarded peer decide the length of.
+    let _ = write!(text, "\n\nKey: {}", display_bounded(&ctx.key_name));
+    // Said rather than left out: a client that sends no binding (a local
+    // tool, or OpenSSH before 8.9) could be signing in anywhere, and a blank
+    // reads as nothing to report.
+    if ctx.bindings.is_empty() && ctx.namespace.is_none() {
+        text.push_str("\nDestination: not stated by the client");
+    }
+    // Who is asking ahead of the way there: a forwarded peer decides how
+    // long that is, and this is the line a request from somewhere unexpected
+    // stands out by.
+    let _ = write!(text, "\nFrom: {}", origin(ctx));
+    let hops: Vec<String> = ctx
+        .bindings
+        .iter()
+        .map(|bind| {
+            let name = bind.host_name.as_ref().unwrap_or(&bind.host_fingerprint);
+            let mut hop = bounded(&escape_for_display(name), MAX_HOP_CHARS);
+            if bind.is_forwarding {
+                hop.push_str(" (forwarding the agent onward)");
+            }
+            hop
+        })
+        .collect();
+    let summarised = hops.len() > MAX_HOPS_SHOWN;
+    // The headline names the destination alone, so the way there is spelled
+    // out whenever there is more to it than that — which is whenever a hop
+    // forwards, since nothing binds after one that does not.
+    if forwarded {
+        let chain = match hops.as_slice() {
+            [first, between @ .., last] if summarised => {
+                format!("{first} → [{} more hosts] → {last}", between.len())
+            }
+            all => all.join(" → "),
+        };
+        let _ = write!(text, "\nVia: {chain}");
         if ctx.unverified_destination {
             text.push_str(" (unverified)");
         }
+    }
+    text.push_str("\n\nDetails");
+    if let Some(requester) = requester_detail(ctx) {
+        let _ = write!(text, "\nProcess: {requester}");
+    }
+    // What tells apart two keys the vault gave one name.
+    let _ = write!(
+        text,
+        "\nLastPass item: {}\nFingerprint: {}",
+        display_bounded(&ctx.item_id),
+        display_bounded(&ctx.fingerprint)
+    );
+    // Last, where its length costs nothing above it: a chain cut short for
+    // the `Via` line is still two different requests when a host in the
+    // middle differs, and this is where that can be seen.
+    if summarised {
+        let _ = write!(text, "\nEvery host on the way: {}", hops.join(" → "));
     }
     text
 }
 
 /// What a remembered approval answers for: the key, and everything the
 /// prompt says about who asked — the process and its uid, what it was started
-/// from, the hosts the session is bound to and the account logged in to. The same words on screen are
+/// from, the hosts the session is bound to, the account logged in to and the
+/// namespace signed under. The same words on screen are
 /// the same question; anything else asks again. The pid is left out, since a
 /// new `ssh` has a new one every time and is the point of remembering.
 ///
@@ -320,6 +440,7 @@ pub fn approval_question(ctx: &ConfirmContext) -> Option<String> {
         // renders alike — invalid UTF-8, or a control character beside its
         // own escape — are two accounts to the server.
         ctx.user.as_deref().map_or_default(hex),
+        ctx.namespace.as_deref().map_or_default(hex),
         (if ctx.unverified_destination {
             "unverified"
         } else {
@@ -384,13 +505,16 @@ mod tests {
     /// A transport that answers as told, and keeps what it was asked.
     struct FakeTransport {
         verdict: Result<bool, Failure>,
-        asked: std::sync::Mutex<Vec<String>>,
+        asked: std::sync::Mutex<Vec<(String, bool)>>,
     }
 
     #[async_trait::async_trait]
     impl Transport for FakeTransport {
-        async fn ask_to_confirm(&self, message: &str) -> Result<bool, Failure> {
-            self.asked.lock().unwrap().push(message.to_string());
+        async fn ask_to_confirm(&self, message: &str, caution: bool) -> Result<bool, Failure> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((message.to_string(), caution));
             self.verdict.clone()
         }
         async fn ask_for_secret(
@@ -413,7 +537,7 @@ mod tests {
         // the question put is the request's description
         let asked = transport.asked.lock().unwrap();
         assert_eq!(asked.len(), 1);
-        assert_eq!(asked[0], describe_request(&ctx));
+        assert_eq!(asked[0], (describe_request(&ctx), false));
     }
 
     #[tokio::test]
@@ -477,7 +601,7 @@ mod tests {
         // "github.com", not 43 characters of base64.
         let ctx = ConfirmContext::new(&entry(), None, bound(Some("github.com")));
         let text = describe_request(&ctx);
-        assert!(text.contains("SSH session: github.com"), "{text}");
+        assert!(text.starts_with("Sign in to github.com?\n"), "{text}");
         assert!(!text.contains("SHA256:+DiY3"), "{text}");
     }
 
@@ -487,7 +611,7 @@ mod tests {
         // stays exact rather than saying nothing about the host at all.
         let ctx = ConfirmContext::new(&entry(), None, bound(None));
         assert!(
-            describe_request(&ctx).contains("SSH session: SHA256:+DiY3"),
+            describe_request(&ctx).starts_with("Sign in to SHA256:+DiY3"),
             "the fingerprint must remain when there is no name"
         );
     }
@@ -511,13 +635,21 @@ mod tests {
     #[test]
     fn describe_request_names_the_requester() {
         let ctx = from_peer(None);
-        assert!(describe_request(&ctx).contains("Requested by: unknown"));
+        let text = describe_request(&ctx);
+        assert!(text.contains("\nFrom: unknown\n"), "{text}");
+        // nothing known of the requester, so nothing of it in the details
+        assert!(text.contains("\n\nDetails\nLastPass item: 42\n"), "{text}");
 
         let ctx = from_peer(Some(PeerInfo {
             pid: None,
             uid: 501,
         }));
-        assert!(describe_request(&ctx).contains("Requested by: uid 501"));
+        let text = describe_request(&ctx);
+        assert!(text.contains("\nFrom: unknown process\n"), "{text}");
+        assert!(
+            text.contains("\n\nDetails\nProcess: uid 501\nLastPass item: 42\n"),
+            "{text}"
+        );
 
         // our own pid resolves to a real executable path
         let ctx = from_peer(Some(PeerInfo {
@@ -579,7 +711,7 @@ mod tests {
             uid: 501,
         }));
         let text = describe_request(&ctx);
-        assert!(text.contains("\nStarted from: "), "{text}");
+        assert!(text.contains(" → "), "{text}");
         // a process with no readable ancestry is named without the line
         let rootless = ConfirmContext {
             requester: Some(Requester {
@@ -589,8 +721,11 @@ mod tests {
             ..ctx
         };
         let text = describe_request(&rootless);
-        assert!(text.contains("Requested by: /usr/bin/ssh (pid"), "{text}");
-        assert!(!text.contains("Started from"), "{text}");
+        assert!(text.contains("\nFrom: ssh\n"), "{text}");
+        assert!(
+            text.contains("\n\nDetails\nProcess: /usr/bin/ssh (pid"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -599,22 +734,20 @@ mod tests {
             pid: Some(std::process::id().cast_signed()),
             uid: 501,
         }));
-        let unnamed = describe_request(&known);
-        assert!(!unnamed.contains("Log in as"), "{unnamed}");
-
         let as_user = |user: &[u8]| ConfirmContext {
             user: Some(user.to_vec()),
+            bindings: bound(Some("github.com")),
             ..known.clone()
         };
         let text = describe_request(&as_user(b"deploy"));
         assert!(
-            text.contains("LastPass item: 42\nLog in as: deploy\nRequested by: "),
+            text.starts_with("Sign in to github.com as deploy?\n\nKey: "),
             "{text}"
         );
         // the requester's to choose, so it cannot forge a line of the prompt
-        let forged = describe_request(&as_user(b"deploy\nRequested by: you"));
+        let forged = describe_request(&as_user(b"deploy\nFrom: you"));
         assert!(
-            forged.contains("Log in as: deploy\\x0aRequested by: you\n"),
+            forged.starts_with("Sign in to github.com as deploy\\x0aFrom: you?\n"),
             "{forged}"
         );
 
@@ -635,6 +768,308 @@ mod tests {
                 approval_question(&as_user(other)).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn a_request_that_names_no_destination_says_so() {
+        // A blank would read as nothing to report, where it is the one thing
+        // this prompt cannot say.
+        let text = describe_request(&from_peer(None));
+        assert_eq!(
+            text,
+            "Allow an SSH signature?\n\nKey: ctx key\n\
+             Destination: not stated by the client\nFrom: unknown\n\nDetails\n\
+             LastPass item: 42\nFingerprint: \
+             SHA256:0WfFJFesqXKxE3C4SGTzZ/+mb3AzYvhjoxgKemT4FQw"
+        );
+        assert!(!needs_caution(&from_peer(None)));
+    }
+
+    #[test]
+    fn a_signature_that_is_no_login_says_what_it_signs() {
+        let signing = |namespace: &[u8]| ConfirmContext {
+            namespace: Some(namespace.to_vec()),
+            ..from_peer(None)
+        };
+        let git = describe_request(&signing(b"git"));
+        assert!(git.starts_with("Sign data for \"git\"?\n\nKey: "), "{git}");
+        assert!(!git.contains("Destination"), "not a login: {git}");
+        // the requester's to choose, so it cannot forge a line of the prompt
+        let other = describe_request(&signing(b"file\nFrom: you"));
+        assert!(
+            other.starts_with("Sign data for \"file\\x0aFrom: you\"?\n"),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn the_prompt_says_when_a_yes_is_remembered() {
+        let line = "?\nAllow is remembered until the vault locks.\n\nKey: ctx key\nDestination";
+        let once = from_peer(None);
+        assert!(!describe_request(&once).contains("remembered"));
+        let kept = ConfirmContext {
+            remembered: true,
+            ..once
+        };
+        let text = describe_request(&kept);
+        assert!(text.contains(line), "{text}");
+    }
+
+    #[test]
+    fn a_forwarded_request_leads_with_the_warning_and_spells_out_the_way() {
+        let hop = |name: &str, is_forwarding| SessionBinding {
+            host_fingerprint: "SHA256:fp".into(),
+            host_name: Some(name.into()),
+            is_forwarding,
+            session_id: Vec::new(),
+            host_key: Vec::new(),
+        };
+        let ctx = ConfirmContext {
+            user: Some(b"git".to_vec()),
+            ..ConfirmContext::new(
+                &entry(),
+                None,
+                vec![hop("build01", true), hop("github.com", false)],
+            )
+        };
+        let text = describe_request(&ctx);
+        assert!(
+            text.starts_with("WARNING: the agent is forwarded"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n\nSign in to github.com as git?\n\nKey: ctx key\nFrom: unknown\n\
+                 Via: build01 (forwarding the agent onward) → github.com\n\nDetails"
+            ),
+            "{text}"
+        );
+        assert!(needs_caution(&ctx));
+
+        // one that does not name its server says so three times over: ahead
+        // of everything, in the question, and on the way there
+        let unverified = ConfirmContext {
+            unverified_destination: true,
+            ..ctx
+        };
+        let text = describe_request(&unverified);
+        assert!(
+            text.contains(".\n\nUNVERIFIED DESTINATION: this request does not name"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\n\nSign in to github.com (unverified) as git?\n\nKey: ctx key\nFrom: unknown\n\
+                 Via: build01 (forwarding the agent onward) → github.com (unverified)\n\nDetails"
+            ),
+            "{text}"
+        );
+        assert!(needs_caution(&unverified));
+
+        // a direct connection is its own destination: nothing to spell out,
+        // and nothing to be cautious about
+        let direct = ConfirmContext::new(&entry(), None, vec![hop("github.com", false)]);
+        assert!(!describe_request(&direct).contains("Via:"));
+        assert!(!needs_caution(&direct));
+    }
+
+    #[test]
+    fn a_long_chain_shows_its_ends_and_counts_what_lies_between() {
+        let hop = |name: &str, is_forwarding| SessionBinding {
+            host_fingerprint: "SHA256:fp".into(),
+            host_name: Some(name.into()),
+            is_forwarding,
+            session_id: Vec::new(),
+            host_key: Vec::new(),
+        };
+        let chain = |names: &[&str]| {
+            let (last, forwarding) = names.split_last().unwrap();
+            let mut hops: Vec<SessionBinding> =
+                forwarding.iter().map(|name| hop(name, true)).collect();
+            hops.push(hop(last, false));
+            describe_request(&ConfirmContext::new(&entry(), None, hops))
+        };
+        let onward = "(forwarding the agent onward)";
+        // as many as are shown whole
+        let text = chain(&["a", "b", "c", "d"]);
+        assert!(
+            text.contains(&format!(
+                "\nVia: a {onward} → b {onward} → c {onward} → d\n"
+            )),
+            "{text}"
+        );
+        // one more than that
+        let text = chain(&["a", "b", "c", "d", "e"]);
+        assert!(
+            text.contains(&format!("\nVia: a {onward} → [3 more hosts] → e\n")),
+            "{text}"
+        );
+        // with the hosts between still there to be read, after everything else
+        assert!(
+            text.ends_with(&format!(
+                "\nEvery host on the way: a {onward} → b {onward} → c {onward} → d {onward} → e"
+            )),
+            "{text}"
+        );
+        // and a host in it named at length gives way where the cut is shown
+        let long = "h".repeat(70);
+        let text = chain(&[&long, "b"]);
+        assert!(
+            text.contains(&format!(
+                "\nVia: {}… [6 more] {onward} → b\n",
+                "h".repeat(64)
+            )),
+            "{text}"
+        );
+    }
+
+    /// A requester whose ancestors and path are as given, nearest first.
+    fn started_from(process: &str, names: &[&str]) -> ConfirmContext {
+        ConfirmContext {
+            requester: Some(Requester {
+                process: process.into(),
+                origin: names
+                    .iter()
+                    .map(|name| Ancestor {
+                        name: (*name).into(),
+                        path: format!("/bin/{name}"),
+                    })
+                    .collect(),
+            }),
+            ..from_peer(Some(PeerInfo {
+                pid: Some(7),
+                uid: 501,
+            }))
+        }
+    }
+
+    #[test]
+    fn a_process_named_at_length_gives_way_and_the_requester_is_still_named() {
+        let long = "n".repeat(45);
+        let text = describe_request(&started_from("/usr/bin/ssh", &["zsh", &long]));
+        assert!(
+            text.contains(&format!(
+                "\nFrom: {}… [5 more] → zsh → ssh\n\nDetails\nProcess: /usr/bin/ssh (pid 7, uid 501)\n",
+                "n".repeat(40)
+            )),
+            "{text}"
+        );
+        // a path is whole at any length a path has: two that differ only at
+        // the end are two programs
+        let deep = format!("/{}/ssh", "d".repeat(500));
+        let text = describe_request(&started_from(&deep, &[]));
+        assert!(
+            text.contains(&format!(
+                "\n\nDetails\nProcess: /{}/ssh (pid 7, uid 501)\n",
+                "d".repeat(500)
+            )),
+            "{text}"
+        );
+        // and gives way past that, before a terminal loses the question to it
+        let endless = format!("/{}", "e".repeat(1004));
+        let text = describe_request(&started_from(&endless, &[]));
+        assert!(
+            text.contains(&format!(
+                "\n\nDetails\nProcess: /{}… [5 more] (pid 7, uid 501)\n",
+                "e".repeat(999)
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_longest_prompt_there_can_be_is_bounded() {
+        // Every part as long as its author can make it: the vault's key name
+        // and item id, the forwarded side's hops and account, and a process
+        // tree of the requester's own choosing. What is bounded is what is
+        // read without scrolling for it — everything above the details.
+        let endless = "x".repeat(10_000);
+        let shown = format!("{}… [9800 more]", "x".repeat(200));
+        // Both sides of where a chain stops being shown hop by hop: the most
+        // hops shown whole, and the most there can be.
+        for (hop_count, most) in [(4, 2_200), (16, 2_000)] {
+            let hops: Vec<SessionBinding> = (0..hop_count)
+                .map(|at| SessionBinding {
+                    host_fingerprint: endless.clone(),
+                    host_name: Some(endless.clone()),
+                    is_forwarding: at + 1 < hop_count,
+                    session_id: Vec::new(),
+                    host_key: Vec::new(),
+                })
+                .collect();
+            let names = [endless.as_str(); 8];
+            let mut ctx = ConfirmContext {
+                bindings: hops,
+                user: Some(endless.clone().into_bytes()),
+                remembered: true,
+                unverified_destination: true,
+                ..started_from(&endless, &names)
+            };
+            ctx.key_name.clone_from(&endless);
+            ctx.item_id.clone_from(&endless);
+            ctx.fingerprint.clone_from(&endless);
+            let text = describe_request(&ctx);
+            let (above, details) = text.split_once("\n\nDetails\n").unwrap();
+            let length = above.chars().count();
+            assert!(length < most, "{hop_count} hops: {length} characters");
+            // and the details are no more than a terminal can show with it
+            let most_below = if hop_count == 4 { 1_500 } else { 3_300 };
+            let below = details.chars().count();
+            assert!(below < most_below, "{hop_count} hops: {below} below");
+            // and what is decided on is all there, ahead of what gave way
+            assert!(
+                text.contains(&format!(
+                    "\n\nSign in to {shown} (unverified) as {shown}?\n\
+                     Allow is remembered until the vault locks.\n\nKey: {shown}\n"
+                )),
+                "{hop_count} hops: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_to_be_cautious_about_is_put_as_one() {
+        let transport = Arc::new(FakeTransport {
+            verdict: Ok(true),
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let forwarded = ConfirmContext::new(
+            &entry(),
+            None,
+            vec![SessionBinding {
+                host_fingerprint: "SHA256:fp".into(),
+                host_name: None,
+                is_forwarding: true,
+                session_id: Vec::new(),
+                host_key: Vec::new(),
+            }],
+        );
+        TransportConfirmer::new(transport.clone())
+            .confirm(&forwarded)
+            .await;
+        assert!(transport.asked.lock().unwrap()[0].1);
+    }
+
+    #[test]
+    fn the_namespace_signed_under_is_part_of_the_question() {
+        let known = from_peer(Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        }));
+        let signing = |namespace: &[u8]| ConfirmContext {
+            namespace: Some(namespace.to_vec()),
+            ..known.clone()
+        };
+        // an approval to sign commits does not answer for anything else the
+        // same program is asked to sign
+        assert_ne!(
+            approval_question(&signing(b"git")).unwrap(),
+            approval_question(&signing(b"file")).unwrap()
+        );
+        assert_ne!(
+            approval_question(&signing(b"git")).unwrap(),
+            approval_question(&known).unwrap()
+        );
     }
 
     #[test]
@@ -729,8 +1164,9 @@ mod tests {
         ctx.user = Some(b"git".to_vec());
         let bound = approval_question(&ctx).unwrap();
         assert!(
-            // then the account, and last whether the destination is unverified
-            bound.ends_with("\nSHA256:aaa\x1ea\x1eforwarding\x1fSHA256:bbb\x1e\x1e\n676974\n\n"),
+            // then the account, no namespace, and last whether the
+            // destination is unverified
+            bound.ends_with("\nSHA256:aaa\x1ea\x1eforwarding\x1fSHA256:bbb\x1e\x1e\n676974\n\n\n"),
             "{bound:?}"
         );
         assert_ne!(bound, question);
@@ -745,6 +1181,11 @@ mod tests {
             pid: Some(0),
             uid: 501,
         }));
-        assert!(describe_request(&bogus).contains("unknown process (pid 0, uid 501)"));
+        let text = describe_request(&bogus);
+        assert!(text.contains("\nFrom: unknown process\n"), "{text}");
+        assert!(
+            text.contains("\n\nDetails\nProcess: pid 0, uid 501\n"),
+            "{text}"
+        );
     }
 }

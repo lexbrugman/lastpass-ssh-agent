@@ -115,6 +115,30 @@ pub fn userauth_request<'a>(
     })
 }
 
+/// The namespace `data` is signed under, when it is what `ssh-keygen -Y sign`
+/// asks an agent to sign (OpenSSH's PROTOCOL.sshsig): the magic, the
+/// namespace, a reserved field, the hash's name and the hash of the message —
+/// whole, with nothing after it, a hash of the length its name says, and
+/// under a namespace that is one: the format has no empty namespace, and
+/// reading one as a namespace would have it pass for none.
+///
+/// Never a userauth request as well: that begins with a session id's length,
+/// which the magic read as one would put far past any request this reads.
+pub fn sshsig_namespace(data: &[u8]) -> Option<&[u8]> {
+    let mut signed = Wire(data.strip_prefix(b"SSHSIG")?);
+    let namespace = signed.string()?;
+    let _reserved = signed.string()?;
+    // The two the format defines.
+    let digest_bytes = match signed.string()? {
+        b"sha256" => 32,
+        b"sha512" => 64,
+        _ => return None,
+    };
+    let hash = signed.string()?;
+    (signed.0.is_empty() && !namespace.is_empty() && hash.len() == digest_bytes)
+        .then_some(namespace)
+}
+
 /// A `session-bind@openssh.com` request as OpenSSH lays it out: the host's
 /// key as it travelled in the key exchange, the session id, the host's
 /// signature over it, and whether the agent is forwarded onward from there.
@@ -310,6 +334,54 @@ mod tests {
             data.extend(string(field));
         }
         data
+    }
+
+    #[test]
+    fn a_namespaced_signature_names_its_namespace_and_anything_else_does_not() {
+        let string = |value: &[u8]| {
+            let mut out = u32::try_from(value.len()).unwrap().to_be_bytes().to_vec();
+            out.extend_from_slice(value);
+            out
+        };
+        let signed = |fields: &[&[u8]]| {
+            let mut data = b"SSHSIG".to_vec();
+            for field in fields {
+                data.extend(string(field));
+            }
+            data
+        };
+        let (sha256, sha512) = ([1; 32], [2; 64]);
+        assert_eq!(
+            sshsig_namespace(&signed(&[b"git", b"", b"sha512", &sha512])),
+            Some(&b"git"[..])
+        );
+        assert_eq!(
+            sshsig_namespace(&signed(&[b"file", b"", b"sha256", &sha256])),
+            Some(&b"file"[..])
+        );
+        // no namespace, a hash of the wrong length, a hash this format does
+        // not have, no magic, a field short, and bytes after the last: none
+        // is one
+        assert_eq!(
+            sshsig_namespace(&signed(&[b"", b"", b"sha512", &sha512])),
+            None
+        );
+        assert_eq!(
+            sshsig_namespace(&signed(&[b"git", b"", b"sha512", &sha256])),
+            None
+        );
+        assert_eq!(
+            sshsig_namespace(&signed(&[b"git", b"", b"sha1", &[3; 20]])),
+            None
+        );
+        assert_eq!(sshsig_namespace(b"anything"), None);
+        assert_eq!(sshsig_namespace(b"SSHSIG"), None);
+        assert_eq!(sshsig_namespace(&signed(&[b"git"])), None);
+        assert_eq!(sshsig_namespace(&signed(&[b"git", b""])), None);
+        assert_eq!(sshsig_namespace(&signed(&[b"git", b"", b"sha512"])), None);
+        let mut trailing = signed(&[b"git", b"", b"sha512", &sha512]);
+        trailing.push(0);
+        assert_eq!(sshsig_namespace(&trailing), None);
     }
 
     #[test]

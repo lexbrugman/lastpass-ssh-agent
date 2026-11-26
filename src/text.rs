@@ -39,19 +39,26 @@ pub fn escape_for_display(text: &str) -> String {
     out
 }
 
-/// The most of one untrusted string a prompt shows. A dialog has a fixed
-/// height and clips at the bottom, so a key name long enough pushes the lines
-/// that say who is asking and for which host off it. Far more than any name
-/// needs; the log keeps the whole text.
+/// The most of one untrusted string a prompt shows. A dialog grows only so
+/// tall and scrolls past that, so a key name long enough pushes the lines
+/// that say who is asking and for which host out of sight until someone
+/// scrolls for them. Far more than any name needs; the log keeps the whole
+/// text.
 pub const MAX_DISPLAY_CHARS: usize = 200;
 
 /// `escape_for_display`, cut to `MAX_DISPLAY_CHARS` with a marker saying how
 /// much was left out. Measured after escaping, so the escapes themselves
 /// cannot carry the text past the bound.
 pub fn display_bounded(text: &str) -> String {
-    let escaped = escape_for_display(text);
-    let Some((cut, _)) = escaped.char_indices().nth(MAX_DISPLAY_CHARS) else {
-        return escaped;
+    bounded(&escape_for_display(text), MAX_DISPLAY_CHARS)
+}
+
+/// Text that is escaped already, cut to `max` characters with a marker saying
+/// how much was left out — so a cut is something the reader can see, where
+/// text scrolled out of a dialog's view gives no sign of being there.
+pub fn bounded(escaped: &str, max: usize) -> String {
+    let Some((cut, _)) = escaped.char_indices().nth(max) else {
+        return escaped.to_string();
     };
     let omitted = escaped[cut..].chars().count();
     format!("{}… [{omitted} more]", &escaped[..cut])

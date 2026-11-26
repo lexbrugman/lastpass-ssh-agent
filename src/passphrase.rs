@@ -1062,7 +1062,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Transport for FakeTransport {
-        async fn ask_to_confirm(&self, _message: &str) -> Result<bool, Failure> {
+        async fn ask_to_confirm(&self, _message: &str, _caution: bool) -> Result<bool, Failure> {
             unreachable!("a passphrase prompt never asks a yes/no question")
         }
         async fn ask_for_secret(

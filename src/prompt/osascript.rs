@@ -22,23 +22,51 @@ pub struct OsascriptTransport {
     /// Extra slack past the dialog's own give-up before we kill osascript.
     grace: Duration,
     program: std::path::PathBuf,
+    /// The icon an ordinary confirmation wears, when the file is there.
+    lock_icon: std::path::PathBuf,
     serialize: tokio::sync::Mutex<()>,
 }
 
 /// Fail-closed by construction: "Deny" is both the default and the cancel
 /// button, so Escape, Enter on the default and the dialog expiring all deny.
+///
+/// The caution icon is kept for the request that warrants it. Shown on every
+/// dialog it says nothing, and a forwarded request looks like any other. The
+/// rest wear the system's padlock — named by its file, since the `note` icon
+/// is the icon of the application drawing the dialog and System Events has
+/// none — or no icon at all where that file is not to be found.
+///
+/// The file reference is made outside the `tell`: inside one, `POSIX file` is
+/// the application's to interpret.
 const CONFIRM_SCRIPT: &str = r#"
 on run argv
     set message to item 1 of argv
     set giveUp to (item 2 of argv) as integer
+    set iconKind to item 3 of argv
+    if iconKind is "lock" then set lockIcon to POSIX file (item 4 of argv)
     tell application "System Events"
         activate
-        display dialog message with title "lastpass-ssh-agent" ¬
-            buttons {"Deny", "Allow"} default button "Deny" cancel button "Deny" ¬
-            with icon caution giving up after giveUp
+        if iconKind is "caution" then
+            set answer to display dialog message with title "lastpass-ssh-agent" ¬
+                buttons {"Deny", "Allow"} default button "Deny" cancel button "Deny" ¬
+                with icon caution giving up after giveUp
+        else if iconKind is "lock" then
+            set answer to display dialog message with title "lastpass-ssh-agent" ¬
+                buttons {"Deny", "Allow"} default button "Deny" cancel button "Deny" ¬
+                with icon lockIcon giving up after giveUp
+        else
+            set answer to display dialog message with title "lastpass-ssh-agent" ¬
+                buttons {"Deny", "Allow"} default button "Deny" cancel button "Deny" ¬
+                giving up after giveUp
+        end if
     end tell
+    return answer
 end run
 "#;
+
+/// The padlock macOS ships among its own icons.
+const LOCK_ICON: &str =
+    "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/LockedIcon.icns";
 
 /// `with hidden answer` masks the passphrase as it is typed. Returns only the
 /// typed text, not the whole `display dialog` record: `osascript` renders a
@@ -86,18 +114,40 @@ impl OsascriptTransport {
             timeout,
             grace,
             program,
+            lock_icon: LOCK_ICON.into(),
             serialize: tokio::sync::Mutex::new(()),
         }
     }
 
+    /// Tests say where the padlock is, or that there is none.
+    #[cfg(test)]
+    #[must_use]
+    fn with_lock_icon(mut self, lock_icon: std::path::PathBuf) -> Self {
+        self.lock_icon = lock_icon;
+        self
+    }
+
+    /// Which icon a confirmation wears; see `CONFIRM_SCRIPT`.
+    fn icon(&self, caution: bool) -> &'static str {
+        if caution {
+            "caution"
+        } else if self.lock_icon.is_file() {
+            "lock"
+        } else {
+            "plain"
+        }
+    }
+
     /// Draw one dialog and collect what osascript said about it.
-    async fn show(&self, script: &str, message: &str) -> Result<Shown, Failure> {
+    async fn show(&self, script: &str, message: &str, icon: &str) -> Result<Shown, Failure> {
         let give_up = self.timeout.as_secs().max(1).to_string();
         let child = tokio::process::Command::new(&self.program)
             .arg("-e")
             .arg(script)
             .arg(message)
             .arg(&give_up)
+            .arg(icon)
+            .arg(&self.lock_icon)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -138,10 +188,12 @@ impl OsascriptTransport {
 
 #[async_trait::async_trait]
 impl Transport for OsascriptTransport {
-    async fn ask_to_confirm(&self, message: &str) -> Result<bool, Failure> {
+    async fn ask_to_confirm(&self, message: &str, caution: bool) -> Result<bool, Failure> {
         // One dialog on screen at a time; see the type's documentation.
         let _one_at_a_time = self.serialize.lock().await;
-        let shown = self.show(CONFIRM_SCRIPT, message).await?;
+        let shown = self
+            .show(CONFIRM_SCRIPT, message, self.icon(caution))
+            .await?;
         let stdout = String::from_utf8_lossy(&shown.stdout);
         // "giving up after" returns success with `gave up:true` instead of a
         // nonzero exit — an expired dialog must not count as approval.
@@ -171,7 +223,7 @@ impl Transport for OsascriptTransport {
             mut stdout,
             stderr,
             status,
-        } = self.show(SECRET_SCRIPT, message).await?;
+        } = self.show(SECRET_SCRIPT, message, "caution").await?;
         if !status.success() {
             // -1713: no GUI session to draw on (e.g. SSH'd into this machine).
             // Reported as unavailable so the user is pointed at a transport
@@ -222,7 +274,7 @@ mod tests {
     async fn the_allow_button_is_a_yes() {
         let dir = tempfile::tempdir().unwrap();
         let t = transport(dir.path(), "echo 'button returned:Allow'");
-        assert_eq!(t.ask_to_confirm("question").await, Ok(true));
+        assert_eq!(t.ask_to_confirm("question", false).await, Ok(true));
     }
 
     #[tokio::test]
@@ -233,21 +285,24 @@ mod tests {
             dir.path(),
             "echo 'execution error: User canceled. (-128)' >&2; exit 1",
         );
-        assert_eq!(t.ask_to_confirm("question").await, Ok(false));
+        assert_eq!(t.ask_to_confirm("question", false).await, Ok(false));
     }
 
     #[tokio::test]
     async fn exit_zero_without_the_allow_button_is_a_no() {
         let dir = tempfile::tempdir().unwrap();
         let t = transport(dir.path(), "echo 'button returned:'");
-        assert_eq!(t.ask_to_confirm("question").await, Ok(false));
+        assert_eq!(t.ask_to_confirm("question", false).await, Ok(false));
     }
 
     #[tokio::test]
     async fn an_expired_dialog_is_a_timeout_despite_exit_zero() {
         let dir = tempfile::tempdir().unwrap();
         let t = transport(dir.path(), "echo 'button returned:Allow, gave up:true'");
-        assert_eq!(t.ask_to_confirm("question").await, Err(Failure::TimedOut));
+        assert_eq!(
+            t.ask_to_confirm("question", false).await,
+            Err(Failure::TimedOut)
+        );
     }
 
     #[tokio::test]
@@ -258,7 +313,7 @@ mod tests {
             "echo 'execution error: No user interaction allowed. (-1713)' >&2; exit 1",
         );
         assert_matches!(
-            t.ask_to_confirm("question").await,
+            t.ask_to_confirm("question", false).await,
             Err(Failure::Unavailable(_))
         );
         let error = t.ask_for_secret("key").await.unwrap_err();
@@ -276,7 +331,7 @@ mod tests {
             Duration::from_millis(100),
         );
         assert_matches!(
-            t.ask_to_confirm("question").await,
+            t.ask_to_confirm("question", false).await,
             Err(Failure::Unavailable(_))
         );
         assert_matches!(t.ask_for_secret("key").await, Err(Failure::Unavailable(_)));
@@ -291,7 +346,10 @@ mod tests {
             Duration::from_millis(100),
         );
         let start = std::time::Instant::now();
-        assert_eq!(t.ask_to_confirm("question").await, Err(Failure::TimedOut));
+        assert_eq!(
+            t.ask_to_confirm("question", false).await,
+            Err(Failure::TimedOut)
+        );
         assert_eq!(t.ask_for_secret("key").await, Err(Failure::TimedOut));
         assert!(start.elapsed() < Duration::from_secs(5));
     }
@@ -315,11 +373,11 @@ mod tests {
         let (a, b) = tokio::join!(
             {
                 let t = t.clone();
-                async move { t.ask_to_confirm("question").await }
+                async move { t.ask_to_confirm("question", false).await }
             },
             {
                 let t = t.clone();
-                async move { t.ask_to_confirm("question").await }
+                async move { t.ask_to_confirm("question", false).await }
             },
         );
         assert_eq!(a, Ok(true));
@@ -338,19 +396,42 @@ mod tests {
         let t = OsascriptTransport::with_program(
             crate::testutil::osascript_stub(
                 dir.path(),
-                // argv: -e SCRIPT message giveup
+                // argv: -e SCRIPT message giveup icon
                 &format!(
-                    "printf '%s|%s' \"$3\" \"$4\" > {}; echo 'button returned:Allow'",
+                    "printf '%s|%s|%s' \"$3\" \"$4\" \"$5\" > {}; echo 'button returned:Allow'",
                     marker.display()
                 ),
             ),
             Duration::from_secs(7),
             Duration::from_millis(200),
         );
-        assert_eq!(t.ask_to_confirm("approve this?").await, Ok(true));
-        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "approve this?|7");
+        // no padlock where this looks for one, so no icon
+        let t = t.with_lock_icon(dir.path().join("absent.icns"));
+        assert_eq!(t.ask_to_confirm("approve this?", false).await, Ok(true));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "approve this?|7|plain"
+        );
+        // and with one, an ordinary question wears it
+        let padlock = dir.path().join("padlock.icns");
+        std::fs::write(&padlock, b"icon").unwrap();
+        let t = t.with_lock_icon(padlock);
+        assert_eq!(t.ask_to_confirm("approve this?", false).await, Ok(true));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "approve this?|7|lock"
+        );
+        // only a question to stop at wears the caution icon
+        assert_eq!(t.ask_to_confirm("stop and read", true).await, Ok(true));
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "stop and read|7|caution"
+        );
         t.ask_for_secret("unlock that").await.unwrap();
-        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "unlock that|7");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "unlock that|7|caution"
+        );
     }
 
     /// Shared body, so each case below is one line and still named.
@@ -411,7 +492,7 @@ mod tests {
         let t = transport(dir.path(), "printf 'boom\\x1b[2J' >&2; exit 3");
         for error in [
             t.ask_for_secret("key").await.unwrap_err(),
-            t.ask_to_confirm("question").await.unwrap_err(),
+            t.ask_to_confirm("question", false).await.unwrap_err(),
         ] {
             let Failure::Unavailable(why) = error else {
                 panic!("expected unavailable, got {error:?}");

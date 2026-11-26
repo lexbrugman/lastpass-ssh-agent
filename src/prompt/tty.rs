@@ -85,7 +85,7 @@ const MAX_ANSWER_BYTES: usize = 64;
 
 #[async_trait::async_trait]
 impl Transport for TtyTransport {
-    async fn ask_to_confirm(&self, message: &str) -> Result<bool, Failure> {
+    async fn ask_to_confirm(&self, message: &str, _caution: bool) -> Result<bool, Failure> {
         // One prompt at a time; see the type's documentation.
         let _one_at_a_time = self.serialize.lock().await;
         let prompt = format!("\n{message}\nAllow? (type 'yes' to approve, anything else denies): ");
@@ -383,7 +383,7 @@ mod tests {
             answer_prompt(&mut master, CONFIRM_BANNER, &typed);
             master
         });
-        assert_eq!(transport.ask_to_confirm("question").await, expected);
+        assert_eq!(transport.ask_to_confirm("question", false).await, expected);
         drop(answer.await.unwrap());
     }
 
@@ -435,7 +435,7 @@ mod tests {
         let transport = TtyTransport::with_tty(slave_path, Duration::from_millis(200));
         let start = Instant::now();
         assert_eq!(
-            transport.ask_to_confirm("question").await,
+            transport.ask_to_confirm("question", false).await,
             Err(Failure::TimedOut)
         );
         // the deadline is honored in full: poll rounds its wait up, so an
@@ -457,7 +457,7 @@ mod tests {
 
         let transport = TtyTransport::with_tty(slave_path, Duration::from_millis(400));
         assert_eq!(
-            transport.ask_to_confirm("question").await,
+            transport.ask_to_confirm("question", false).await,
             Err(Failure::TimedOut),
             "stale input must not answer a later prompt"
         );
@@ -468,7 +468,7 @@ mod tests {
         let transport =
             TtyTransport::with_tty(PathBuf::from("/nonexistent/tty"), Duration::from_secs(1));
         assert_matches!(
-            transport.ask_to_confirm("question").await,
+            transport.ask_to_confirm("question", false).await,
             Err(Failure::Unavailable(_))
         );
         assert_matches!(
@@ -494,11 +494,11 @@ mod tests {
         let (a, b) = tokio::join!(
             {
                 let t = transport.clone();
-                async move { t.ask_to_confirm("question").await }
+                async move { t.ask_to_confirm("question", false).await }
             },
             {
                 let t = transport.clone();
-                async move { t.ask_to_confirm("question").await }
+                async move { t.ask_to_confirm("question", false).await }
             },
         );
         drop(responder.await.unwrap());
@@ -649,7 +649,7 @@ mod tests {
             answer_prompt(&mut master, CONFIRM_BANNER, b"yes\r");
             master
         });
-        assert_eq!(transport.ask_to_confirm("question").await, Ok(true));
+        assert_eq!(transport.ask_to_confirm("question", false).await, Ok(true));
         drop(typist.await.unwrap());
     }
 
@@ -770,7 +770,7 @@ mod tests {
             Err(Failure::Unavailable(_))
         );
         assert_matches!(
-            transport.ask_to_confirm("question").await,
+            transport.ask_to_confirm("question", false).await,
             Err(Failure::Unavailable(_))
         );
     }

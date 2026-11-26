@@ -157,7 +157,7 @@ fn origin_chain_from(
 /// How an ancestor is named: the app bundle when it runs from one — the
 /// outermost, so a helper process inside an editor is named for the editor —
 /// and the executable's file name otherwise. `path` is escaped text already.
-fn display_name(path: &str) -> String {
+pub fn display_name(path: &str) -> String {
     let bundle = path
         .split('/')
         .find_map(|part| part.strip_suffix(".app"))

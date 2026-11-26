@@ -25,7 +25,11 @@ What this agent **guarantees**:
   requesting process and what it was started from (its parent processes up to
   the terminal or app, so a push from your editor reads as such), with *Deny*
   as the default and cancel button. Timeouts, missing GUI sessions and helper
-  failures all fail closed to Deny.
+  failures all fail closed to Deny. The prompt leads with the decision in one
+  line — *Sign in to github.com as git?*, or *Sign data for "git"?* for a
+  signature that is no login, such as a commit signed with an SSH key — and
+  says so when the client did not state where it is signing in. A warning comes ahead of that line, and on macOS
+  only a request with one wears the caution icon.
 - **The host is named, and forwarding is visible.** The agent implements
   `session-bind@openssh.com`, so the prompt names the host each request is for
   — by hostname where `known_hosts` records one for that key, by fingerprint
@@ -561,7 +565,7 @@ another agent.
 
 | mode | behavior |
 |---|---|
-| `osascript` (macOS default) | Native dialog: key name, fingerprint, requesting process (pid/uid via the socket's peer credentials) and what it was started from, the bound host and the account being logged in to. Deny is default + cancel; expiry = Deny; no GUI session = Deny. Vault-sourced strings are passed as AppleScript *arguments*, never spliced into code. |
+| `osascript` (macOS default) | Native dialog: the bound host and the account being logged in to, the key name, what the request was started from, and under *Details* — scrolled to when the request is a long one — the requesting process (path, and pid/uid via the socket's peer credentials), the item id and the key's fingerprint. Deny is default + cancel; expiry = Deny; no GUI session = Deny. Vault-sourced strings are passed as AppleScript *arguments*, never spliced into code. |
 | `tty` (Linux default) | Prompt on the agent's own `/dev/tty`; type `yes` to approve. |
 | `askpass` | Runs the program in `askpass` with the prompt as its argument; exit 0 approves. `SSH_ASKPASS_PROMPT=confirm` is set, so OpenSSH-compatible helpers show a yes/no dialog rather than their password prompt — without it, clicking OK would approve whatever was typed. |
 | `off` | No confirmation (socket permissions are then your only guard, as with stock ssh-agent). |
@@ -582,7 +586,8 @@ it again for any reason, or the agent stops. (A vault your shell unlocked
 expires without telling the agent; the request that finds it locked asks for
 the master password, and approvals end there.) A
 `git push` from your editor then costs one prompt per unlock rather than one
-per push.
+per push. The prompt says when its answer will be kept: *Allow is remembered
+until the vault locks.*
 
 Off by default, because the trade is real: while an approval stands, anything
 able to drive that application can sign with that key unasked — and what a
@@ -590,7 +595,7 @@ request "was started from" is what the kernel reports about a process running
 as you, which a process running as you can arrange. So is the application
 itself: the agent knows a client by its process id, and a process can become
 another program without changing its id, leaving a connection it opened in
-other hands. "Requested by" is therefore a description, not a proof, in the
+other hands. The "From" line is therefore a description, not a proof, in the
 prompt as much as in what is remembered. The prompt itself is
 unchanged, and a request that differs in any of the words it shows — another
 key, another host, another place it was started from — asks again.

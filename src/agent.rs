@@ -77,11 +77,11 @@ const MAX_SESSION_ID_BYTES: usize = 128;
 /// binding limit would bound nothing.
 const MAX_HOST_KEY_BYTES: usize = 64 * 1024;
 
-/// The longest account name a bound request may log in as. An account name
-/// is tens of bytes and the longest any directory allows is about this; the
-/// name is the requester's to fill, and a remembered approval keeps it until
-/// the vault locks.
-const MAX_USER_BYTES: usize = 1024;
+/// The longest account name a request may log in as, or namespace it may sign
+/// under. Either is tens of bytes, and the longest account name any directory
+/// allows is about this; both are the requester's to fill, and a remembered
+/// approval keeps them until the vault locks.
+const MAX_NAME_BYTES: usize = 1024;
 
 /// The most bcrypt-pbkdf rounds an encrypted key may declare. The count sits in
 /// the key file in the clear, the vault item is whoever wrote it's to fill,
@@ -418,6 +418,7 @@ impl LpassAgent {
         &self,
         entry: &KeyEntry,
         user: Option<Vec<u8>>,
+        namespace: Option<Vec<u8>>,
         unverified_destination: bool,
         gate: &mut InteractionGate,
     ) -> Result<Answer, AgentError> {
@@ -426,6 +427,7 @@ impl LpassAgent {
         let bindings = self.named_bindings().await;
         let describe = |bindings| ConfirmContext {
             user: user.clone(),
+            namespace: namespace.clone(),
             unverified_destination,
             ..ConfirmContext::new(entry, self.peer, bindings)
         };
@@ -465,6 +467,10 @@ impl LpassAgent {
                 "signature approved as before, for the same requester and hosts");
             return Ok(Answer::Remembered(epoch));
         }
+        // What the yes about to be asked for covers, by the rule `settle`
+        // files it under: remembering is on, and this is a question that can
+        // be remembered at all.
+        ctx.remembered = question.is_some() && self.approvals.remembers();
         match self.confirmer.confirm(&ctx).await {
             Decision::Approve => Ok(Answer::Given {
                 question,
@@ -597,7 +603,7 @@ impl Session for LpassAgent {
             let public_key = entry.public.to_bytes().unwrap_or_else(unencodable);
             match signing::userauth_request(&request.data, &public_key, &bound.host_key) {
                 Some(userauth) if userauth.session_id == bound.session_id => {
-                    if userauth.user.len() > MAX_USER_BYTES {
+                    if userauth.user.len() > MAX_NAME_BYTES {
                         tracing::warn!(item = %entry.item_id, key = %entry.name,
                             "refusing to sign: the request logs in as a name longer than \
                              any account's");
@@ -622,8 +628,27 @@ impl Session for LpassAgent {
             }
         }
 
+        // Off a bound connection anything is signed, so the prompt says which
+        // kind of anything this is when the data says so itself. Only for a
+        // key that is confirmed: with nothing shown and nothing remembered, a
+        // namespace's length is no reason to refuse.
+        let namespace = if entry.confirm
+            && self.bindings.is_empty()
+            && let Some(signed_under) = signing::sshsig_namespace(&request.data)
+        {
+            if signed_under.len() > MAX_NAME_BYTES {
+                tracing::warn!(item = %entry.item_id, key = %entry.name,
+                    "refusing to sign: the request signs under a namespace longer than any \
+                     application's");
+                return Err(AgentError::Failure);
+            }
+            Some(signed_under.to_vec())
+        } else {
+            None
+        };
+
         let answer = if entry.confirm {
-            self.approval_for(entry, user, unverified_destination, &mut gate)
+            self.approval_for(entry, user, namespace, unverified_destination, &mut gate)
                 .await?
         } else {
             Answer::NotNeeded
@@ -2092,6 +2117,104 @@ mod tests {
         );
     }
 
+    /// What `ssh-keygen -Y sign` asks an agent to sign, under `namespace`.
+    fn sshsig(namespace: &[u8]) -> Vec<u8> {
+        let string = |value: &[u8]| {
+            let mut out = u32::try_from(value.len()).unwrap().to_be_bytes().to_vec();
+            out.extend_from_slice(value);
+            out
+        };
+        let mut data = b"SSHSIG".to_vec();
+        data.extend(string(namespace));
+        data.extend(string(b""));
+        data.extend(string(b"sha512"));
+        data.extend(string(&[7; 64]));
+        data
+    }
+
+    #[tokio::test]
+    async fn a_signature_that_is_no_login_is_asked_for_as_what_it_is() {
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone()).await;
+        let sign = |data: &[u8]| Request::SignRequest(sign_request(ED25519_PUB, data, 0));
+
+        assert_matches!(
+            agent.handle(sign(&sshsig(b"git"))).await.unwrap(),
+            Response::SignResponse(_)
+        );
+        // a namespace longer than any application's is refused unasked
+        assert_matches!(
+            agent.handle(sign(&sshsig(&[b'n'; 1025]))).await.unwrap(),
+            Response::Failure
+        );
+        // and anything else is signed as before, said to name no destination
+        assert_matches!(
+            agent.handle(sign(b"anything")).await.unwrap(),
+            Response::SignResponse(_)
+        );
+
+        // a key that is not confirmed shows and remembers no namespace, so
+        // the length of one is nothing to refuse it over
+        let unconfirmed = MockLpass::logged_in().with_ed25519("1");
+        let mut unasked = agent_with(unconfirmed, "confirm = \"off\"\n[[keys]]\nid = \"1\"").await;
+        assert_matches!(
+            unasked.handle(sign(&sshsig(&[b'n'; 1025]))).await.unwrap(),
+            Response::SignResponse(_)
+        );
+
+        let prompts = confirmer.0.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[0].starts_with("Sign data for \"git\"?\n"),
+            "{}",
+            prompts[0]
+        );
+        assert!(
+            prompts[1].starts_with("Allow an SSH signature?\n\nKey: "),
+            "{}",
+            prompts[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_prompt_says_a_yes_is_remembered_only_when_it_will_be() {
+        let said = "Allow is remembered until the vault locks.";
+        let known = Some(PeerInfo {
+            pid: Some(std::process::id().cast_signed()),
+            uid: 501,
+        });
+        let remembering = || {
+            Arc::new(Approvals::new(
+                true,
+                Arc::new(crate::approvals::LockEpoch::default()),
+            ))
+        };
+        let sign = || Request::SignRequest(sign_request(ED25519_PUB, b"anything", 0));
+
+        // remembering on, and a requester that can be told from another
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone())
+            .await
+            .with_approvals(remembering())
+            .with_peer(known);
+        agent.handle(sign()).await.unwrap();
+        assert!(confirmer.0.lock().unwrap()[0].contains(said));
+
+        // remembering on, but nothing to tell this requester by
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone())
+            .await
+            .with_approvals(remembering());
+        agent.handle(sign()).await.unwrap();
+        assert!(!confirmer.0.lock().unwrap()[0].contains(said));
+
+        // remembering off
+        let confirmer = Arc::new(RecordingConfirmer::default());
+        let mut agent = agent_recording(confirmer.clone()).await.with_peer(known);
+        agent.handle(sign()).await.unwrap();
+        assert!(!confirmer.0.lock().unwrap()[0].contains(said));
+    }
+
     #[tokio::test]
     async fn a_verified_binding_tells_the_prompt_which_host_asked() {
         let confirmer = Arc::new(RecordingConfirmer::default());
@@ -2124,7 +2247,7 @@ mod tests {
         // not forwarded: no warning
         assert!(!prompts[0].contains("WARNING"), "{}", prompts[0]);
         // and which account there, from what is being signed
-        assert!(prompts[0].contains("\nLog in as: user\n"), "{}", prompts[0]);
+        assert!(prompts[0].contains(" as user?\n"), "{}", prompts[0]);
     }
 
     #[tokio::test]
@@ -2176,7 +2299,11 @@ mod tests {
             "{}",
             prompts[0]
         );
-        assert!(prompts[0].ends_with(" (unverified)"), "{}", prompts[0]);
+        assert!(
+            prompts[0].contains(" (unverified)\n\nDetails"),
+            "{}",
+            prompts[0]
+        );
     }
 
     /// How many times two identical requests for an unverified destination
@@ -2378,7 +2505,7 @@ mod tests {
             .await
             .unwrap();
         let prompts = confirmer.0.lock().unwrap();
-        assert!(!prompts[0].contains("SSH session:"), "{}", prompts[0]);
+        assert!(!prompts[0].contains("Sign in to"), "{}", prompts[0]);
         assert!(!prompts[0].contains("WARNING"), "{}", prompts[0]);
     }
 
@@ -2565,7 +2692,7 @@ mod tests {
             .await
             .unwrap();
         let prompts = confirmer.0.lock().unwrap();
-        assert!(!prompts[0].contains("SSH session:"), "{}", prompts[0]);
+        assert!(!prompts[0].contains("Sign in to"), "{}", prompts[0]);
     }
 
     #[tokio::test]
